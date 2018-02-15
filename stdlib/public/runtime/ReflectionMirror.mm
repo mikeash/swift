@@ -74,7 +74,6 @@ unwrapExistential(const Metadata *T, OpaqueValue *Value) {
   // TODO: Should look through existential metatypes too, but it doesn't
   // really matter yet since we don't have any special mirror behavior for
   // concrete metatypes yet.
-  fprintf(stderr, "unwrapExistential(%p, %p)\n", T, Value);
   while (T->getKind() == MetadataKind::Existential) {
     auto existential
       = static_cast<const ExistentialTypeMetadata *>(T);
@@ -85,7 +84,6 @@ unwrapExistential(const Metadata *T, OpaqueValue *Value) {
 
     // Existential containers can end up nested in some cases due to generic
     // abstraction barriers.  Repeat in case we have a nested existential.
-    fprintf(stderr, "Nested %p %p\n", T, Value);
   }
   return std::make_tuple(T, Value);
 }
@@ -312,10 +310,6 @@ struct EnumImpl: ReflectionMirrorImpl {
       indirect = payload.isIndirect();
     }
 
-fprintf(stderr, "Examining type %p value %p\n", type, value);
-fprintf(stderr, "Info tag is %u\n", tag);
-fprintf(stderr, "Payload type is %p\n", payloadType);
-fprintf(stderr, "Indirect is %s\n", indirect ? "true" : "false");
     if (tagPtr)
       *tagPtr = tag;
     if (payloadTypePtr)
@@ -459,12 +453,10 @@ struct ClassImpl: ReflectionMirrorImpl {
 #if SWIFT_OBJC_INTEROP
   id quickLookObject() {
     id object = [*reinterpret_cast<const id *>(value) retain];
-    fprintf(stderr, "QuickLookObject %p\n", object);
     if ([object respondsToSelector:@selector(debugQuickLookObject)]) {
       id quickLookObject = [object debugQuickLookObject];
       [quickLookObject retain];
       [object release];
-      fprintf(stderr, "Getting debugQuickLookObject %p\n", quickLookObject);
       return quickLookObject;
     }
 
@@ -555,21 +547,18 @@ auto call(OpaqueValue *passedValue, const Metadata *T, const Metadata *passedTyp
       while (isa->isTypeMetadata() && isa->isArtificialSubclass()) {
         isa = isa->SuperClass;
       }
-      fprintf(stderr, "object %p passed type %p got isa %p\n", obj, passedType, isa);
       passedType = isa;
     }
 
   #if SWIFT_OBJC_INTEROP
     // If this is a pure ObjC class, reflect it using ObjC's runtime facilities.
     if (!static_cast<const ClassMetadata*>(passedType)->isTypeMetadata()) {
-      fprintf(stderr, "object %p type %p using ObjC impl\n", value, passedType);
       ObjCClassImpl impl;
       return call(&impl);
     }
   #endif
 
     // Otherwise, use the native Swift facilities.
-    fprintf(stderr, "object %p type %p using Swift impl\n", value, passedType);
     ClassImpl impl;
     return call(&impl);
   };
@@ -655,7 +644,6 @@ intptr_t swift_reflectionMirror_count(OpaqueValue *value,
                                       const Metadata *type,
                                       const Metadata *T) {
   auto c = call(value, T, type, [](ReflectionMirrorImpl *impl) { return impl->count(); });
-  fprintf(stderr, "Returning count %ld\n", c);
   return c;
 }
 
@@ -669,11 +657,9 @@ AnyReturn swift_reflectionMirror_subscript(OpaqueValue *value, const Metadata *t
                                            const char **outName,
                                            void (**outFreeFunc)(const char *),
                                            const Metadata *T) {
-  auto result = call(value, T, type, [&](ReflectionMirrorImpl *impl) {
+  return call(value, T, type, [&](ReflectionMirrorImpl *impl) {
     return impl->subscript(index, outName, outFreeFunc);
   });
-  fprintf(stderr, "Subscript of index %lu produced name %s\n", index, *outName);
-  return result;
 }
 #pragma clang diagnostic pop
 
