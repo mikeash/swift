@@ -1,14 +1,31 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
 
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_reflectionMirror_normalizedType")
-private func _getNormalizedType<T>(_: T, type: Any.Type) -> Any.Type
+internal func _getNormalizedType<T>(_: T, type: Any.Type) -> Any.Type
 
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_reflectionMirror_count")
-private func _getChildCount<T>(_: T, type: Any.Type) -> Int
+internal func _getChildCount<T>(_: T, type: Any.Type) -> Int
 
-private typealias NameFreeFunc = @convention(c) (UnsafePointer<CChar>?) -> Void
+internal typealias NameFreeFunc = @convention(c) (UnsafePointer<CChar>?) -> Void
 
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_reflectionMirror_subscript")
-private func _getChild<T>(
+internal func _getChild<T>(
   of: T,
   type: Any.Type,
   index: Int,
@@ -17,10 +34,14 @@ private func _getChild<T>(
 ) -> Any
 
 // Returns 'c' (class), 'e' (enum), 's' (struct), 't' (tuple), or '\0' (none)
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_reflectionMirror_displayStyle")
-private func _getDisplayStyle<T>(_: T) -> CChar
+internal func _getDisplayStyle<T>(_: T) -> CChar
 
-private func getChild<T>(of value: T, type: Any.Type, index: Int) -> (label: String?, value: Any) {
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
+internal func getChild<T>(of value: T, type: Any.Type, index: Int) -> (label: String?, value: Any) {
   var nameC: UnsafePointer<CChar>? = nil
   var freeFunc: NameFreeFunc? = nil
   
@@ -32,8 +53,10 @@ private func getChild<T>(of value: T, type: Any.Type, index: Int) -> (label: Str
 }
 
 #if _runtime(_ObjC)
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_reflectionMirror_quickLookObject")
-private func _getQuickLookObject<T>(_: T) -> AnyObject?
+internal func _getQuickLookObject<T>(_: T) -> AnyObject?
 
 @_inlineable // FIXME(sil-serialize-all)
 @_versioned // FIXME(sil-serialize-all)
@@ -87,7 +110,9 @@ internal func _getClassPlaygroundQuickLook(
 #endif
 
 extension Mirror {
-  public init(internalReflecting subject: Any,
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned
+  internal init(internalReflecting subject: Any,
   					  subjectType: Any.Type? = nil,
   					  customAncestor: Mirror? = nil)
 	{
@@ -134,7 +159,9 @@ extension Mirror {
     self._defaultDescendantRepresentation = .generated
   }
   
-  public static func quickLookObject(_ subject: Any) -> PlaygroundQuickLook? {
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned
+  internal static func quickLookObject(_ subject: Any) -> PlaygroundQuickLook? {
 #if _runtime(_ObjC)
     let object = _getQuickLookObject(subject)
     return object.flatMap(_getClassPlaygroundQuickLook)

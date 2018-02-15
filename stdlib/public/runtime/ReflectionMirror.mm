@@ -632,6 +632,8 @@ auto call(OpaqueValue *passedValue, const Metadata *T, const Metadata *passedTyp
 
 } // end anonymous namespace
 
+
+// func _getNormalizedType<T>(_: T, type: Any.Type) -> Any.Type
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 const Metadata *swift_reflectionMirror_normalizedType(OpaqueValue *value,
                                                       const Metadata *type,
@@ -639,6 +641,7 @@ const Metadata *swift_reflectionMirror_normalizedType(OpaqueValue *value,
   return call(value, T, type, [](ReflectionMirrorImpl *impl) { return impl->type; });
 }
 
+// func _getChildCount<T>(_: T, type: Any.Type) -> Int
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 intptr_t swift_reflectionMirror_count(OpaqueValue *value,
                                       const Metadata *type,
@@ -651,6 +654,13 @@ intptr_t swift_reflectionMirror_count(OpaqueValue *value,
 // it an indirect return ABI for compatibility with Swift.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+// func _getChild<T>(
+//   of: T,
+//   type: Any.Type,
+//   index: Int,
+//   outName: UnsafeMutablePointer<UnsafePointer<CChar>?>,
+//   outFreeFunc: UnsafeMutablePointer<NameFreeFunc?>
+// ) -> Any
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 AnyReturn swift_reflectionMirror_subscript(OpaqueValue *value, const Metadata *type,
                                            intptr_t index,
@@ -663,16 +673,19 @@ AnyReturn swift_reflectionMirror_subscript(OpaqueValue *value, const Metadata *t
 }
 #pragma clang diagnostic pop
 
+// func _getDisplayStyle<T>(_: T) -> CChar
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 char swift_reflectionMirror_displayStyle(OpaqueValue *value, const Metadata *T) {
   return call(value, T, nullptr, [](ReflectionMirrorImpl *impl) { return impl->displayStyle(); });
 }
 
+// func _getEnumCaseName<T>(_ value: T) -> UnsafePointer<CChar>?
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 const char *swift_EnumCaseName(OpaqueValue *value, const Metadata *T) {
   return call(value, T, nullptr, [](ReflectionMirrorImpl *impl) { return impl->enumCaseName(); });
 }
 
+// func _opaqueSummary(_ metadata: Any.Type) -> UnsafePointer<CChar>?
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 const char *swift_OpaqueSummary(const Metadata *T) {
   switch (T->getKind()) {
@@ -708,6 +721,7 @@ const char *swift_OpaqueSummary(const Metadata *T) {
 }
 
 #if SWIFT_OBJC_INTEROP
+// func _getQuickLookObject<T>(_: T) -> AnyObject?
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 id swift_reflectionMirror_quickLookObject(OpaqueValue *value, const Metadata *T) {
   return call(value, T, nullptr, [](ReflectionMirrorImpl *impl) { return impl->quickLookObject(); });
