@@ -182,7 +182,8 @@ struct TupleImpl: ReflectionMirrorImpl {
   }
   
   intptr_t count() {
-    return 0;
+    auto Tuple = static_cast<const TupleTypeMetadata *>(type);
+    return Tuple->NumElements;
   }
   
   AnyReturn subscript(intptr_t i, const char **outName,
@@ -643,8 +644,9 @@ auto call(OpaqueValue *passedValue, const Metadata *T, const Metadata *passedTyp
 
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE
 const Metadata *swift_reflectionMirror_normalizedType(OpaqueValue *value,
+                                                      const Metadata *type,
                                                       const Metadata *T) {
-  return call(value, T, nullptr, [](ReflectionMirrorImpl *impl) { return impl->type; });
+  return call(value, T, type, [](ReflectionMirrorImpl *impl) { return impl->type; });
 }
 
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERFACE

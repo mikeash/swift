@@ -1,6 +1,6 @@
 
 @_silgen_name("swift_reflectionMirror_normalizedType")
-private func _getNormalizedType<T>(_: T) -> Any.Type
+private func _getNormalizedType<T>(_: T, type: Any.Type) -> Any.Type
 
 @_silgen_name("swift_reflectionMirror_count")
 private func _getChildCount<T>(_: T, type: Any.Type) -> Int
@@ -87,17 +87,34 @@ internal func _getClassPlaygroundQuickLook(
 #endif
 
 extension Mirror {
-  public init(internalReflecting subject: Any, subjectType: Any.Type? = nil) {
-		let subjectType = subjectType ?? _getNormalizedType(subject)
+  public init(internalReflecting subject: Any,
+  					  subjectType: Any.Type? = nil,
+  					  customAncestor: Mirror? = nil)
+	{
+		let subjectType = subjectType ?? _getNormalizedType(subject, type: type(of: subject))
     
     let childCount = _getChildCount(subject, type: subjectType)
-    let children = (0 ..< childCount).lazy.map({ getChild(of: subject, type: subjectType, index: $0) })
+    let children = (0 ..< childCount).lazy.map({
+    	getChild(of: subject, type: subjectType, index: $0)
+    })
     self.children = Children(children)
     
     self._makeSuperclassMirror = {
       if let subjectClass = subjectType as? AnyClass,
          let superclass = _getSuperclass(subjectClass) {
-        return Mirror(internalReflecting: subject, subjectType: superclass)
+        // Handle custom ancestors. If we've hit the custom ancestor's subject type,
+        // or descendants are suppressed, return it. Otherwise continue reflecting.
+				if let customAncestor = customAncestor {
+					if superclass == customAncestor.subjectType {
+						return customAncestor
+					}
+					if customAncestor._defaultDescendantRepresentation == .suppressed {
+						return customAncestor
+					}
+				}
+				return Mirror(internalReflecting: subject,
+											subjectType: superclass,
+											customAncestor: customAncestor)
       } else {
         return nil
       }

@@ -179,7 +179,17 @@ public struct Mirror {
           Mirror(internalReflecting: subject, subjectType: superclass)
         }
       case .customized(let makeAncestor):
-        return makeAncestor
+        return {
+          let ancestor = makeAncestor()
+          if superclass == ancestor.subjectType
+            || ancestor._defaultDescendantRepresentation == .suppressed {
+            return ancestor
+          } else {
+            return Mirror(internalReflecting: subject,
+                          subjectType: superclass,
+                          customAncestor: ancestor)
+          }
+        }
       case .suppressed:
         break
       }
