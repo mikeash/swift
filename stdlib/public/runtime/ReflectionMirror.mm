@@ -540,8 +540,9 @@ auto call(OpaqueValue *passedValue, const Metadata *T, const Metadata *passedTyp
   auto call = [&](ReflectionMirrorImpl *impl) {
     impl->type = type;
     impl->value = value;
+    auto result = f(impl);
     T->vw_destroy(passedValue);
-    return f(impl);
+    return result;
   };
   
   auto callClass = [&] {
