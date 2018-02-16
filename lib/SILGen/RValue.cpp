@@ -570,6 +570,7 @@ static void assignRecursive(SILGenFunction &SGF, SILLocation loc,
 void RValue::assignInto(SILGenFunction &SGF, SILLocation loc,
                         SILValue destAddr) && {
   assert(isComplete() && "rvalue is not complete");
+  assert(isPlusOne(SGF) && "Can not assign borrowed RValues");
   ArrayRef<ManagedValue> srcValues = values;
   assignRecursive(SGF, loc, type, srcValues, destAddr);
   assert(srcValues.empty() && "didn't claim all elements!");
@@ -787,20 +788,13 @@ void RValue::verify(SILGenFunction &SGF) const & {
 }
 
 bool RValue::isPlusOne(SILGenFunction &SGF) const & {
-  return llvm::all_of(values, [&SGF](ManagedValue mv) -> bool {
-    // Ignore trivial values and objects with trivial value ownership kind.
-    if (mv.getType().isTrivial(SGF.F.getModule()) ||
-        (mv.getType().isObject() &&
-         mv.getOwnershipKind() == ValueOwnershipKind::Trivial))
-      return true;
-    return mv.hasCleanup();
-  });
+  return llvm::all_of(
+      values, [&SGF](ManagedValue mv) -> bool { return mv.isPlusOne(SGF); });
 }
 
 bool RValue::isPlusZero(SILGenFunction &SGF) const & {
-  return llvm::none_of(values, [](ManagedValue mv) -> bool {
-    return mv.hasCleanup();
-  });
+  return llvm::none_of(values,
+                       [](ManagedValue mv) -> bool { return mv.isPlusZero(); });
 }
 
 const TypeLowering &RValue::getTypeLowering(SILGenFunction &SGF) const & {

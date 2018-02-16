@@ -1957,6 +1957,10 @@ void ValueDecl::setInterfaceType(Type type) {
   TypeAndAccess.setPointer(type);
 }
 
+bool ValueDecl::hasValidSignature() const {
+  return hasInterfaceType() && !isBeingValidated();
+}
+
 Optional<ObjCSelector> ValueDecl::getObjCRuntimeName() const {
   if (auto func = dyn_cast<AbstractFunctionDecl>(this))
     return func->getObjCSelector();
@@ -5684,3 +5688,20 @@ UnifiedStatsReporter::getStatsTracer(StringRef EventName, const Decl *D) {
     // Return inert tracer object.
     return FrontendStatsTracer();
 }
+
+TypeOrExtensionDecl::TypeOrExtensionDecl(NominalTypeDecl *D) : Decl(D) {}
+TypeOrExtensionDecl::TypeOrExtensionDecl(ExtensionDecl *D) : Decl(D) {}
+
+Decl *TypeOrExtensionDecl::getAsDecl() const {
+  if (auto NTD = Decl.dyn_cast<NominalTypeDecl *>())
+    return NTD;
+
+  return Decl.get<ExtensionDecl *>();
+}
+DeclContext *TypeOrExtensionDecl::getAsDeclContext() const {
+  return getAsDecl()->getInnermostDeclContext();
+}
+NominalTypeDecl *TypeOrExtensionDecl::getBaseNominal() const {
+  return getAsDeclContext()->getAsNominalTypeOrNominalTypeExtensionContext();
+}
+bool TypeOrExtensionDecl::isNull() const { return Decl.isNull(); }

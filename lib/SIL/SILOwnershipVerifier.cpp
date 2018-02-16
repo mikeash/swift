@@ -582,6 +582,7 @@ ACCEPTS_ANY_OWNERSHIP_INST(UncheckedTrivialBitCast)
 ACCEPTS_ANY_OWNERSHIP_INST(ExistentialMetatype)
 ACCEPTS_ANY_OWNERSHIP_INST(ValueMetatype)
 ACCEPTS_ANY_OWNERSHIP_INST(UncheckedOwnershipConversion)
+ACCEPTS_ANY_OWNERSHIP_INST(ValueToBridgeObject)
 #undef ACCEPTS_ANY_OWNERSHIP_INST
 
 // Trivial if trivial typed, otherwise must accept owned?
@@ -1008,6 +1009,9 @@ OwnershipUseCheckerResult OwnershipCompatibilityUseChecker::visitCallee(
     return {compatibleWithOwnership(ValueOwnershipKind::Owned),
             UseLifetimeConstraint::MustBeInvalidated};
   case ParameterConvention::Direct_Guaranteed:
+    if (SubstCalleeType->isNoEscape())
+      return {compatibleWithOwnership(ValueOwnershipKind::Trivial),
+        UseLifetimeConstraint::MustBeLive};
     return {compatibleWithOwnership(ValueOwnershipKind::Guaranteed),
             UseLifetimeConstraint::MustBeLive};
   }
@@ -1035,9 +1039,16 @@ OwnershipUseCheckerResult OwnershipCompatibilityUseChecker::visitEnumArgument(
   // The operand has a non-trivial ownership kind. It must match the argument
   // convention.
   auto ownership = getOwnershipKind();
-  auto lifetimeConstraint = (ownership == ValueOwnershipKind::Owned)
-                                ? UseLifetimeConstraint::MustBeInvalidated
-                                : UseLifetimeConstraint::MustBeLive;
+  UseLifetimeConstraint lifetimeConstraint;
+  if (ownership == ValueOwnershipKind::Owned) {
+    if (RequiredKind != ValueOwnershipKind::Owned) {
+      lifetimeConstraint = UseLifetimeConstraint::MustBeLive;
+    } else {
+      lifetimeConstraint = UseLifetimeConstraint::MustBeInvalidated;
+    }
+  } else {
+    lifetimeConstraint = UseLifetimeConstraint::MustBeLive;
+  }
   return {compatibleOwnershipKinds(ownership, RequiredKind),
           lifetimeConstraint};
 }
@@ -1181,6 +1192,16 @@ OwnershipCompatibilityUseChecker::visitStoreInst(StoreInst *I) {
 OwnershipUseCheckerResult
 OwnershipCompatibilityUseChecker::visitMarkDependenceInst(
     MarkDependenceInst *MDI) {
+
+  // Forward ownership if the mark_dependence instruction marks a dependence
+  // on a @noescape function type for an escaping function type.
+  if (getValue() == MDI->getValue())
+    if (auto ResFnTy = MDI->getType().getAs<SILFunctionType>())
+      if (auto BaseFnTy = MDI->getBase()->getType().getAs<SILFunctionType>())
+        if (!ResFnTy->isNoEscape() && BaseFnTy->isNoEscape())
+          return {compatibleWithOwnership(ValueOwnershipKind::Owned),
+                  UseLifetimeConstraint::MustBeInvalidated};
+
   // We always treat mark dependence as a use that keeps a value alive. We will
   // be introducing a begin_dependence/end_dependence version of this later.
   return {true, UseLifetimeConstraint::MustBeLive};
@@ -1354,6 +1375,7 @@ CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, Shl)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, Sizeof)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, StaticReport)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, Strideof)
+CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, StringObjectOr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, Sub)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, TakeArrayNoAlias)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, MustBeLive, TakeArrayBackToFront)
@@ -1408,6 +1430,7 @@ BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(
 BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(
     CastBitPatternFromBridgeObject)
 BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(ClassifyBridgeObject)
+BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(ValueToBridgeObject)
 BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(BridgeToRawPointer)
 BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(BridgeFromRawPointer)
 BUILTINS_THAT_SHOULD_HAVE_BEEN_LOWERED_TO_SILINSTS(CastReference)

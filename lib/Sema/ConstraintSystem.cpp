@@ -1074,7 +1074,7 @@ void ConstraintSystem::openGeneric(
 
   // Create the type variables for the generic parameters.
   for (auto gp : sig->getGenericParams()) {
-    auto contextTy = genericEnv->mapTypeIntoContext(gp);
+    auto contextTy = GenericEnvironment::mapTypeIntoContext(genericEnv, gp);
     if (auto *archetype = contextTy->getAs<ArchetypeType>())
       locatorPtr = getConstraintLocator(
           locator.withPathElement(LocatorPathElt(archetype)));
@@ -1830,8 +1830,6 @@ Type simplifyTypeImpl(ConstraintSystem &cs, Type type, Fn getFixedTypeFn) {
       // FIXME: It's kind of weird in general that we have to look
       // through lvalue, inout and IUO types here
       Type lookupBaseType = newBase->getWithoutSpecifierType();
-
-      auto *module = cs.DC->getParentModule();
 
       if (lookupBaseType->mayHaveMembers()) {
         auto subs = lookupBaseType->getContextSubstitutionMap(

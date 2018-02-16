@@ -14,6 +14,7 @@
 #include "Cleanup.h"
 #include "ExitableFullExpr.h"
 #include "Initialization.h"
+#include "LValue.h"
 #include "RValue.h"
 #include "SILGen.h"
 #include "Scope.h"
@@ -2156,9 +2157,13 @@ void PatternMatchEmission::emitEnumElementDispatch(
         SILValue boxedValue = SGF.B.createProjectBox(loc, origCMV.getValue(), 0);
         eltTL = &SGF.getTypeLowering(boxedValue->getType());
         if (eltTL->isLoadable()) {
+          UnenforcedAccess access;
+          SILValue accessAddress =
+            access.beginAccess(SGF, loc, boxedValue, SILAccessKind::Read);
           ManagedValue newLoadedBoxValue = SGF.B.createLoadBorrow(
-              loc, ManagedValue::forUnmanaged(boxedValue));
+            loc, ManagedValue::forUnmanaged(accessAddress));
           boxedValue = newLoadedBoxValue.getUnmanagedValue();
+          access.endAccess(SGF);
         }
 
         // The boxed value may be shared, so we always have to copy it.
@@ -2460,7 +2465,9 @@ void PatternMatchEmission::emitSharedCaseBlocks() {
 
         SILType ty = SGF.getLoweredType(V->getType());
 
-        SILValue value;
+        // Initialize mv at +1. We always pass values in at +1 for today into
+        // shared blocks.
+        ManagedValue mv;
         if (ty.isAddressOnly(SGF.F.getModule())) {
           // There's no basic block argument, since we don't allow basic blocks
           // to have address arguments.
@@ -2473,21 +2480,22 @@ void PatternMatchEmission::emitSharedCaseBlocks() {
           // been initialized on entry.
           auto found = Temporaries.find(V);
           assert(found != Temporaries.end());
-          value = found->second;
+          mv = SGF.emitManagedRValueWithCleanup(found->second);
         } else {
-          value = caseBB->getArgument(argIndex++);
+          SILValue arg = caseBB->getArgument(argIndex++);
+          assert(arg.getOwnershipKind() == ValueOwnershipKind::Owned ||
+                 arg.getOwnershipKind() == ValueOwnershipKind::Trivial);
+          mv = SGF.emitManagedRValueWithCleanup(arg);
         }
 
         if (V->isLet()) {
-          // Just emit a let with cleanup.
-          SGF.VarLocs[V].value = value;
-          SGF.enterDestroyCleanup(value);
+          // Just emit a let and leave the cleanup alone.
+          SGF.VarLocs[V].value = mv.getValue();
         } else {
           // The pattern variables were all emitted as lets and one got passed in,
           // now we finally alloc a box for the var and forward in the chosen value.
           SGF.VarLocs.erase(V);
           auto newVar = SGF.emitInitializationForVarDecl(V, V->isLet());
-          auto mv = ManagedValue::forUnmanaged(value);
           newVar->copyOrInitValueInto(SGF, V, mv, /*isInit*/ true);
           newVar->finishInitialization(SGF);
         }

@@ -92,6 +92,13 @@ public:
                                   SILType substFnTy, SubstitutionList subs,
                                   ArrayRef<ManagedValue> args,
                                   SILType closureTy);
+  ManagedValue createPartialApply(SILLocation loc, ManagedValue fn,
+                                  SILType substFnTy, SubstitutionList subs,
+                                  ArrayRef<ManagedValue> args,
+                                  SILType closureTy) {
+    return createPartialApply(loc, fn.getValue(), substFnTy, subs, args,
+                              closureTy);
+  }
 
   BuiltinInst *createBuiltin(SILLocation loc, Identifier name, SILType resultTy,
                              SubstitutionList subs, ArrayRef<SILValue> args);
@@ -306,6 +313,11 @@ public:
   ManagedValue createOpenExistentialBoxValue(SILLocation loc,
                                           ManagedValue original, SILType type);
 
+  using SILBuilder::createOpenExistentialMetatype;
+  ManagedValue createOpenExistentialMetatype(SILLocation loc,
+                                             ManagedValue value,
+                                             SILType openedType);
+
   /// Convert a @convention(block) value to AnyObject.
   ManagedValue createBlockToAnyObject(SILLocation loc, ManagedValue block,
                                       SILType type);
@@ -322,6 +334,7 @@ public:
   ManagedValue createConvertFunction(SILLocation loc, ManagedValue fn,
                                      SILType resultTy);
 
+  using SILBuilder::createStore;
   /// Forward \p value into \p address.
   ///
   /// This will forward value's cleanup (if it has one) into the equivalent
@@ -346,6 +359,10 @@ public:
   using SILBuilder::createBridgeObjectToRef;
   ManagedValue createBridgeObjectToRef(SILLocation loc, ManagedValue mv,
                                        SILType destType);
+
+  using SILBuilder::createRefToBridgeObject;
+  ManagedValue createRefToBridgeObject(SILLocation loc, ManagedValue mv,
+                                       SILValue bits);
 
   using SILBuilder::createBranch;
   BranchInst *createBranch(SILLocation Loc, SILBasicBlock *TargetBlock,

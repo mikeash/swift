@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Initialization.h"
+#include "LValue.h"
 #include "RValue.h"
 #include "SILGen.h"
 #include "SILGenDynamicCast.h"
@@ -192,15 +193,27 @@ void SingleBufferInitialization::
 copyOrInitValueIntoSingleBuffer(SILGenFunction &SGF, SILLocation loc,
                                 ManagedValue value, bool isInit,
                                 SILValue destAddr) {
+  // Emit an unchecked access around initialization of the local buffer to
+  // silence access marker verification.
+  //
+  // FIXME: This is not a good place for FormalEvaluationScope +
+  // UnenforcedFormalAccess.  However, there's no way to identify the buffer
+  // initialization sequence after SILGen, and no easy way to wrap the
+  // Initialization in an access during top-level expression evaluation.
+  FormalEvaluationScope scope(SGF);
   if (!isInit) {
     assert(value.getValue() != destAddr && "copying in place?!");
-    value.copyInto(SGF, destAddr, loc);
+    SILValue accessAddr =
+      UnenforcedFormalAccess::enter(SGF, loc, destAddr, SILAccessKind::Modify);
+    value.copyInto(SGF, accessAddr, loc);
     return;
   }
   
   // If we didn't evaluate into the initialization buffer, do so now.
   if (value.getValue() != destAddr) {
-    value.forwardInto(SGF, loc, destAddr);
+    SILValue accessAddr =
+      UnenforcedFormalAccess::enter(SGF, loc, destAddr, SILAccessKind::Modify);
+    value.forwardInto(SGF, loc, accessAddr);
   } else {
     // If we did evaluate into the initialization buffer, disable the
     // cleanup.
@@ -828,10 +841,14 @@ void EnumElementPatternInitialization::emitEnumMatch(
           SILValue boxedValue = SGF.B.createProjectBox(loc, mv.getValue(), 0);
           auto &boxedTL = SGF.getTypeLowering(boxedValue->getType());
           // SEMANTIC ARC TODO: Revisit this when the verifier is enabled.
-          if (boxedTL.isLoadable() || !SGF.silConv.useLoweredAddresses())
-            boxedValue = boxedTL.emitLoad(SGF.B, loc, boxedValue,
+          if (boxedTL.isLoadable() || !SGF.silConv.useLoweredAddresses()) {
+            UnenforcedAccess access;
+            SILValue accessAddress =
+              access.beginAccess(SGF, loc, boxedValue, SILAccessKind::Read);
+            boxedValue = boxedTL.emitLoad(SGF.B, loc, accessAddress,
                                           LoadOwnershipQualifier::Take);
-
+            access.endAccess(SGF);
+          }
           // We must treat the boxed value as +0 since it may be shared. Copy it
           // if nontrivial.
           //
@@ -1269,6 +1286,51 @@ CleanupHandle SILGenFunction::enterDeallocStackCleanup(SILValue temp) {
 CleanupHandle SILGenFunction::enterDestroyCleanup(SILValue valueOrAddr) {
   Cleanups.pushCleanup<ReleaseValueCleanup>(valueOrAddr);
   return Cleanups.getTopCleanup();
+}
+
+PostponedCleanup::PostponedCleanup(SILGenFunction &sgf, bool recursive)
+    : depth(sgf.Cleanups.innermostScope), SGF(sgf),
+      previouslyActiveCleanup(sgf.CurrentlyActivePostponedCleanup),
+      active(true), applyRecursively(recursive) {
+  SGF.CurrentlyActivePostponedCleanup = this;
+}
+
+PostponedCleanup::PostponedCleanup(SILGenFunction &sgf)
+    : depth(sgf.Cleanups.innermostScope), SGF(sgf),
+      previouslyActiveCleanup(sgf.CurrentlyActivePostponedCleanup),
+      active(true),
+      applyRecursively(previouslyActiveCleanup
+                           ? previouslyActiveCleanup->applyRecursively
+                           : false) {
+  SGF.CurrentlyActivePostponedCleanup = this;
+}
+
+PostponedCleanup::~PostponedCleanup() {
+  if (active) {
+    end();
+  }
+}
+
+void PostponedCleanup::end() {
+  if (previouslyActiveCleanup && applyRecursively &&
+      previouslyActiveCleanup->applyRecursively) {
+    previouslyActiveCleanup->deferredCleanups.append(deferredCleanups.begin(),
+                                                     deferredCleanups.end());
+  }
+
+  SGF.CurrentlyActivePostponedCleanup = previouslyActiveCleanup;
+  active = false;
+}
+
+void PostponedCleanup::postponeCleanup(CleanupHandle cleanup,
+                                       SILValue forValue) {
+  deferredCleanups.push_back(std::make_pair(cleanup, forValue));
+}
+
+void SILGenFunction::enterPostponedCleanup(SILValue forValue) {
+  auto handle = enterDestroyCleanup(forValue);
+  if (CurrentlyActivePostponedCleanup)
+    CurrentlyActivePostponedCleanup->postponeCleanup(handle, forValue);
 }
 
 namespace {

@@ -456,6 +456,8 @@ void SelectEnforcement::updateCapture(AddressCapture capture) {
       return;
     }
     switch (user->getKind()) {
+    case SILInstructionKind::ConvertEscapeToNoEscapeInst:
+    case SILInstructionKind::MarkDependenceInst:
     case SILInstructionKind::ConvertFunctionInst:
     case SILInstructionKind::BeginBorrowInst:
     case SILInstructionKind::CopyValueInst:
@@ -645,6 +647,10 @@ SourceAccess AccessEnforcementSelection::getSourceAccess(SILValue address) {
       //  
       // FIXME: When we have borrowed arguments, a "read" needs to be enforced
       // on the caller side.
+      return SourceAccess::getStaticAccess();
+
+    case SILArgumentConvention::Indirect_Out:
+      // We use an initialized 'out' argument as a parameter.
       return SourceAccess::getStaticAccess();
 
     default:
