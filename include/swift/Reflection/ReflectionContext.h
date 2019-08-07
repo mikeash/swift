@@ -703,6 +703,14 @@ public:
     }
   }
 
+  bool
+  projectEnumCase(RemoteAddress EnumAddress,
+                  const TypeRef *EnumTR,
+                  unsigned *CaseIndex,
+                  RemoteAddress *OutPayloadAddress) {
+    return false;
+  }
+
   /// Return a description of the layout of a value with the given type.
   const TypeInfo *getTypeInfo(const TypeRef *TR) {
     return getBuilder().getTypeConverter().getTypeInfo(TR);
