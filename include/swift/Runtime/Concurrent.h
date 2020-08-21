@@ -500,6 +500,8 @@ public:
     assert(ReaderCount.load(std::memory_order_acquire) == 0 &&
            "deallocating ConcurrentReadableArray with outstanding snapshots");
     deallocateFreeList();
+    if (auto *storage = Elements.load(std::memory_order_relaxed))
+      storage->deallocate();
   }
   
   void push_back(const ElemTy &elem) {
