@@ -1805,6 +1805,9 @@ public:
       }
     }
 
+    if (Invalid)
+      return nullptr;
+
     if (Cases.empty()) {
       return TC.makeTypeInfo<EmptyEnumTypeInfo>(Cases);
     }
