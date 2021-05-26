@@ -21,15 +21,20 @@
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 #define SWIFT_SILOPTIMIZER_PASSMANAGER_SILCOMBINER_H
 
+#include "swift/Basic/Defer.h"
+#include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILInstructionWorklist.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
+#include "swift/SILOptimizer/Analysis/NonLocalAccessBlockAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ProtocolConformanceAnalysis.h"
 #include "swift/SILOptimizer/Utils/CastOptimizer.h"
 #include "swift/SILOptimizer/Utils/Existential.h"
-#include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/OwnershipOptUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -37,105 +42,46 @@ namespace swift {
 
 class AliasAnalysis;
 
-/// This is the worklist management logic for SILCombine.
-class SILCombineWorklist {
-  llvm::SmallVector<SILInstruction *, 256> Worklist;
-  llvm::DenseMap<SILInstruction *, unsigned> WorklistMap;
-
-  void operator=(const SILCombineWorklist &RHS) = delete;
-  SILCombineWorklist(const SILCombineWorklist &Worklist) = delete;
-public:
-  SILCombineWorklist() {}
-
-  /// Returns true if the worklist is empty.
-  bool isEmpty() const { return Worklist.empty(); }
-
-  /// Add the specified instruction to the worklist if it isn't already in it.
-  void add(SILInstruction *I);
-
-  /// If the given ValueBase is a SILInstruction add it to the worklist.
-  void addValue(ValueBase *V) {
-    if (auto *I = V->getDefiningInstruction())
-      add(I);
-  }
-
-  /// Add the given list of instructions in reverse order to the worklist. This
-  /// routine assumes that the worklist is empty and the given list has no
-  /// duplicates.
-  void addInitialGroup(ArrayRef<SILInstruction *> List);
-
-  // If I is in the worklist, remove it.
-  void remove(SILInstruction *I) {
-    auto It = WorklistMap.find(I);
-    if (It == WorklistMap.end())
-      return; // Not in worklist.
-
-    // Don't bother moving everything down, just null out the slot. We will
-    // check before we process any instruction if it is null.
-    Worklist[It->second] = nullptr;
-    WorklistMap.erase(It);
-  }
-
-  /// Remove the top element from the worklist.
-  SILInstruction *removeOne() {
-    SILInstruction *I = Worklist.pop_back_val();
-    WorklistMap.erase(I);
-    return I;
-  }
-
-  /// When an instruction has been simplified, add all of its users to the
-  /// worklist, since additional simplifications of its users may have been
-  /// exposed.
-  void addUsersToWorklist(ValueBase *I) {
-    for (auto UI : I->getUses())
-      add(UI->getUser());
-  }
-
-  /// When an instruction has been simplified, add all of its users to the
-  /// worklist, since additional simplifications of its users may have been
-  /// exposed.
-  void addUsersOfAllResultsToWorklist(SILInstruction *I) {
-    for (auto result : I->getResults()) {
-      addUsersToWorklist(result);
-    }
-  }
-
-  /// Check that the worklist is empty and nuke the backing store for the map if
-  /// it is large.
-  void zap() {
-    assert(WorklistMap.empty() && "Worklist empty, but the map is not?");
-
-    // Do an explicit clear, this shrinks the map if needed.
-    WorklistMap.clear();
-  }
-};
-
 /// This is a class which maintains the state of the combiner and simplifies
 /// many operations such as removing/adding instructions and syncing them with
 /// the worklist.
 class SILCombiner :
     public SILInstructionVisitor<SILCombiner, SILInstruction *> {
+  SILFunctionTransform *parentTransform;
 
   AliasAnalysis *AA;
 
   DominanceAnalysis *DA;
 
-  // Determine the set of types a protocol conforms to in whole-module
-  // compilation mode.
+  /// Determine the set of types a protocol conforms to in whole-module
+  /// compilation mode.
   ProtocolConformanceAnalysis *PCA;
 
-  // Class hierarchy analysis needed to confirm no derived classes of a sole
-  // conforming class.
+  /// Class hierarchy analysis needed to confirm no derived classes of a sole
+  /// conforming class.
   ClassHierarchyAnalysis *CHA;
 
+  /// Non local access block analysis that we use when canonicalize object
+  /// lifetimes in OSSA.
+  NonLocalAccessBlockAnalysis *NLABA;
+
   /// Worklist containing all of the instructions primed for simplification.
-  SILCombineWorklist Worklist;
+  SmallSILInstructionWorklist<256> Worklist;
+
+  /// A cache of "dead end blocks" through which all paths it is known that the
+  /// program will terminate. This means that we are allowed to leak
+  /// objects.
+  DeadEndBlocks deadEndBlocks;
 
   /// Variable to track if the SILCombiner made any changes.
   bool MadeChange;
 
   /// If set to true then the optimizer is free to erase cond_fail instructions.
   bool RemoveCondFails;
+
+  /// Set to true if some alloc/dealloc_stack instruction are inserted and at
+  /// the end of the run stack nesting needs to be corrected.
+  bool invalidatedStackNesting = false;
 
   /// The current iteration of the SILCombine.
   unsigned Iteration;
@@ -146,40 +92,135 @@ class SILCombiner :
   /// Cast optimizer
   CastOptimizer CastOpt;
 
+  /// Centralized InstModCallback that we use for certain utility methods.
+  InstModCallbacks instModCallbacks;
+
+  /// Dead end blocks cache. SILCombine is already not allowed to mess with CFG
+  /// edges so it is safe to use this here.
+  DeadEndBlocks deBlocks;
+
+  /// External context struct used by \see ownershipRAUWHelper.
+  OwnershipFixupContext ownershipFixupContext;
+
 public:
-  SILCombiner(SILOptFunctionBuilder &FuncBuilder,
-              SILBuilder &B, AliasAnalysis *AA, DominanceAnalysis *DA,
+  SILCombiner(SILFunctionTransform *parentTransform,
+              SILOptFunctionBuilder &FuncBuilder, SILBuilder &B,
+              AliasAnalysis *AA, DominanceAnalysis *DA,
               ProtocolConformanceAnalysis *PCA, ClassHierarchyAnalysis *CHA,
-              bool removeCondFails)
-      : AA(AA), DA(DA), PCA(PCA), CHA(CHA), Worklist(), MadeChange(false),
-        RemoveCondFails(removeCondFails), Iteration(0), Builder(B),
-        CastOpt(FuncBuilder,
-                /* ReplaceInstUsesAction */
-                [&](SingleValueInstruction *I, ValueBase *V) {
-                  replaceInstUsesWith(*I, V);
-                },
-                /* EraseAction */
-                [&](SILInstruction *I) { eraseInstFromFunction(*I); }) {}
+              NonLocalAccessBlockAnalysis *NLABA, bool removeCondFails)
+      : parentTransform(parentTransform), AA(AA), DA(DA), PCA(PCA), CHA(CHA),
+        NLABA(NLABA), Worklist("SC"), deadEndBlocks(&B.getFunction()),
+        MadeChange(false), RemoveCondFails(removeCondFails), Iteration(0),
+        Builder(B), CastOpt(
+                        FuncBuilder, nullptr /*SILBuilderContext*/,
+                        /* ReplaceValueUsesAction */
+                        [&](SILValue Original, SILValue Replacement) {
+                          replaceValueUsesWith(Original, Replacement);
+                        },
+                        /* ReplaceInstUsesAction */
+                        [&](SingleValueInstruction *I, ValueBase *V) {
+                          replaceInstUsesWith(*I, V);
+                        },
+                        /* EraseAction */
+                        [&](SILInstruction *I) { eraseInstFromFunction(*I); }),
+        instModCallbacks(), deBlocks(&B.getFunction()),
+        ownershipFixupContext(instModCallbacks, deBlocks) {
+    instModCallbacks =
+        InstModCallbacks()
+            .onDelete([&](SILInstruction *instToDelete) {
+              // We allow for users in SILCombine to perform 2 stage deletion,
+              // so we need to split the erasing of instructions from adding
+              // operands to the worklist.
+              eraseInstFromFunction(
+                  *instToDelete, false /*do not add operands to the worklist*/);
+            })
+            .onNotifyWillBeDeleted([&](SILInstruction *instThatWillBeDeleted) {
+              Worklist.addOperandsToWorklist(*instThatWillBeDeleted);
+            })
+            .onCreateNewInst([&](SILInstruction *newlyCreatedInst) {
+              Worklist.add(newlyCreatedInst);
+            })
+            .onSetUseValue([&](Operand *use, SILValue newValue) {
+              use->set(newValue);
+              Worklist.add(use->getUser());
+            });
+  }
 
   bool runOnFunction(SILFunction &F);
 
   void clear() {
     Iteration = 0;
-    Worklist.zap();
+    Worklist.resetChecked();
     MadeChange = false;
+  }
+
+  /// A "syntactic" high level function that combines our insertPt with the main
+  /// builder's builder context.
+  ///
+  /// Since this is syntactic and we assume that our caller is passing in a
+  /// lambda that if we inline will be eliminated, we mark this function always
+  /// inline.
+  ///
+  /// What is nice about this formulation is it enables one to really concisely
+  /// create a SILBuilder that uses the SILCombiner's builder context but at a
+  /// different use point. Example:
+  ///
+  /// SILBuilderWithScope builder(insertPt);
+  /// builder.createInst1(insertPt->getLoc(), ...);
+  /// builder.createInst2(insertPt->getLoc(), ...);
+  /// builder.createInst3(insertPt->getLoc(), ...);
+  /// auto *finalValue = builder.createInst4(insertPt->getLoc(), ...);
+  ///
+  /// Thats a lot of typing! Instead, using this API, one can write:
+  ///
+  /// auto *finalValue = withBuilder(insertPt, [&](auto &b, auto l) {
+  ///   b.createInst1(l, ...);
+  ///   b.createInst2(l, ...);
+  ///   b.createInst3(l, ...);
+  ///   return b.createInst4(l, ...);
+  /// });
+  ///
+  /// Since this is meant to be just be syntactic, we always inline this method.
+  LLVM_ATTRIBUTE_ALWAYS_INLINE
+  SingleValueInstruction *
+  withBuilder(SILInstruction *insertPt,
+              llvm::function_ref<SingleValueInstruction * (SILBuilder &, SILLocation)> visitor) {
+    SILBuilderWithScope builder(insertPt, Builder);
+    return visitor(builder, insertPt->getLoc());
   }
 
   // Insert the instruction New before instruction Old in Old's parent BB. Add
   // New to the worklist.
-  SILInstruction *insertNewInstBefore(SILInstruction *New, SILInstruction &Old);
+  SILInstruction *insertNewInstBefore(SILInstruction *New,
+                                      SILInstruction &Old) {
+    return Worklist.insertNewInstBefore(New, Old);
+  }
 
   // This method is to be used when an instruction is found to be dead,
   // replaceable with another preexisting expression. Here we add all uses of I
   // to the worklist, replace all uses of I with the new value, then return I,
   // so that the combiner will know that I was modified.
-  void replaceInstUsesWith(SingleValueInstruction &I, ValueBase *V);
+  void replaceInstUsesWith(SingleValueInstruction &I, ValueBase *V) {
+    return Worklist.replaceInstUsesWith(I, V);
+  }
 
-  void replaceInstUsesPairwiseWith(SILInstruction *oldI, SILInstruction *newI);
+  /// Perform use->set(value) and add use->user to the worklist.
+  void setUseValue(Operand *use, SILValue value) {
+    use->set(value);
+    Worklist.add(use->getUser());
+  }
+
+  // This method is to be used when a value is found to be dead,
+  // replaceable with another preexisting expression. Here we add all
+  // uses of oldValue to the worklist, replace all uses of oldValue
+  // with newValue.
+  void replaceValueUsesWith(SILValue oldValue, SILValue newValue) {
+    Worklist.replaceValueUsesWith(oldValue, newValue);
+  }
+
+  void replaceInstUsesPairwiseWith(SILInstruction *oldI, SILInstruction *newI) {
+    Worklist.replaceInstUsesPairwiseWith(oldI, newI);
+  }
 
   // Some instructions can never be "trivially dead" due to side effects or
   // producing a void value. In those cases, since we cannot rely on
@@ -189,7 +230,16 @@ public:
   // by this method.
   SILInstruction *eraseInstFromFunction(SILInstruction &I,
                                         SILBasicBlock::iterator &InstIter,
-                                        bool AddOperandsToWorklist = true);
+                                        bool AddOperandsToWorklist = true) {
+    Worklist.eraseInstFromFunction(I, InstIter, AddOperandsToWorklist);
+    MadeChange = true;
+    // Dummy return, so the caller doesn't need to explicitly return nullptr.
+    return nullptr;
+  }
+
+  // Erases \p inst and all of its users, recursively.
+  // The caller has to make sure that all users are removable (e.g. dead).
+  void eraseInstIncludingUsers(SILInstruction *inst);
 
   SILInstruction *eraseInstFromFunction(SILInstruction &I,
                                         bool AddOperandsToWorklist = true) {
@@ -207,20 +257,26 @@ public:
   /// Instruction visitors.
   SILInstruction *visitReleaseValueInst(ReleaseValueInst *DI);
   SILInstruction *visitRetainValueInst(RetainValueInst *CI);
-  SILInstruction *visitReleaseValueAddrInst(ReleaseValueAddrInst *DI);
-  SILInstruction *visitRetainValueAddrInst(RetainValueAddrInst *CI);
   SILInstruction *visitPartialApplyInst(PartialApplyInst *AI);
   SILInstruction *visitApplyInst(ApplyInst *AI);
+  SILInstruction *visitBeginApplyInst(BeginApplyInst *BAI);
   SILInstruction *visitTryApplyInst(TryApplyInst *AI);
   SILInstruction *optimizeStringObject(BuiltinInst *BI);
   SILInstruction *visitBuiltinInst(BuiltinInst *BI);
   SILInstruction *visitCondFailInst(CondFailInst *CFI);
   SILInstruction *visitStrongRetainInst(StrongRetainInst *SRI);
+  SILInstruction *visitCopyValueInst(CopyValueInst *cvi);
+  SILInstruction *visitDestroyValueInst(DestroyValueInst *dvi);
   SILInstruction *visitRefToRawPointerInst(RefToRawPointerInst *RRPI);
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
-  SILInstruction *optimizeLoadFromStringLiteral(LoadInst *LI);
+
+  // NOTE: The load optimized in this method is a load [trivial].
+  SILInstruction *optimizeLoadFromStringLiteral(LoadInst *li);
+
   SILInstruction *visitLoadInst(LoadInst *LI);
+  SILInstruction *visitLoadBorrowInst(LoadBorrowInst *LI);
   SILInstruction *visitIndexAddrInst(IndexAddrInst *IA);
+  bool optimizeStackAllocatedEnum(AllocStackInst *AS);
   SILInstruction *visitAllocStackInst(AllocStackInst *AS);
   SILInstruction *visitAllocRefInst(AllocRefInst *AR);
   SILInstruction *visitSwitchEnumAddrInst(SwitchEnumAddrInst *SEAI);
@@ -228,6 +284,7 @@ public:
   SILInstruction *visitPointerToAddressInst(PointerToAddressInst *PTAI);
   SILInstruction *visitUncheckedAddrCastInst(UncheckedAddrCastInst *UADCI);
   SILInstruction *visitUncheckedRefCastInst(UncheckedRefCastInst *URCI);
+  SILInstruction *visitEndCOWMutationInst(EndCOWMutationInst *URCI);
   SILInstruction *visitUncheckedRefCastAddrInst(UncheckedRefCastAddrInst *URCI);
   SILInstruction *visitBridgeObjectToRefInst(BridgeObjectToRefInst *BORI);
   SILInstruction *visitUnconditionalCheckedCastInst(
@@ -251,23 +308,29 @@ public:
   SILInstruction *visitTupleExtractInst(TupleExtractInst *TEI);
   SILInstruction *visitFixLifetimeInst(FixLifetimeInst *FLI);
   SILInstruction *visitSwitchValueInst(SwitchValueInst *SVI);
-  SILInstruction *visitSelectValueInst(SelectValueInst *SVI);
   SILInstruction *
   visitCheckedCastAddrBranchInst(CheckedCastAddrBranchInst *CCABI);
   SILInstruction *
   visitCheckedCastBranchInst(CheckedCastBranchInst *CBI);
   SILInstruction *visitUnreachableInst(UnreachableInst *UI);
   SILInstruction *visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI);
-  SILInstruction *visitEnumInst(EnumInst *EI);
       
   SILInstruction *visitMarkDependenceInst(MarkDependenceInst *MDI);
   SILInstruction *visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *CBOI);
+  SILInstruction *visitGlobalValueInst(GlobalValueInst *globalValue);
   SILInstruction *visitConvertFunctionInst(ConvertFunctionInst *CFI);
   SILInstruction *
   visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *Cvt);
 
   /// Instruction visitor helpers.
   SILInstruction *optimizeBuiltinCanBeObjCClass(BuiltinInst *AI);
+
+  // Optimize the "isConcrete" builtin.
+  SILInstruction *optimizeBuiltinIsConcrete(BuiltinInst *I);
+
+  SILInstruction *optimizeBuiltinCOWBufferForReading(BuiltinInst *BI);
+  SILInstruction *optimizeBuiltinCOWBufferForReadingNonOSSA(BuiltinInst *BI);
+  SILInstruction *optimizeBuiltinCOWBufferForReadingOSSA(BuiltinInst *BI);
 
   // Optimize the "trunc_N1_M2" builtin. if N1 is a result of "zext_M1_*" and
   // the following holds true: N1 > M1 and M2>= M1
@@ -280,10 +343,23 @@ public:
   // the result bit.
   SILInstruction *optimizeBuiltinCompareEq(BuiltinInst *AI, bool NegateResult);
 
-  SILInstruction *tryOptimizeApplyOfPartialApply(PartialApplyInst *PAI);
-
   SILInstruction *optimizeApplyOfConvertFunctionInst(FullApplySite AI,
                                                      ConvertFunctionInst *CFI);
+
+  bool tryOptimizeKeypath(ApplyInst *AI);
+  bool tryOptimizeInoutKeypath(BeginApplyInst *AI);
+  bool tryOptimizeKeypathApplication(ApplyInst *AI, SILFunction *callee);
+  bool tryOptimizeKeypathOffsetOf(ApplyInst *AI, FuncDecl *calleeFn,
+                                  KeyPathInst *kp);
+  bool tryOptimizeKeypathKVCString(ApplyInst *AI, FuncDecl *calleeFn,
+                                  KeyPathInst *kp);
+
+  /// Sinks owned forwarding instructions to their uses if they do not have
+  /// non-debug non-consuming uses. Deletes any debug_values and destroy_values
+  /// when this is done. Returns true if we deleted svi and thus we should not
+  /// try to visit it.
+  bool trySinkOwnedForwardingInst(SingleValueInstruction *svi);
+
   // Optimize concatenation of string literals.
   // Constant-fold concatenation of string literals known at compile-time.
   SILInstruction *optimizeConcatenationOfStringLiterals(ApplyInst *AI);
@@ -292,14 +368,45 @@ public:
   bool optimizeIdentityCastComposition(ApplyInst *FInverse,
                                        StringRef FInverseName, StringRef FName);
 
-private:
-  FullApplySite rewriteApplyCallee(FullApplySite apply, SILValue callee);
+  /// Let \p user and \p value be two forwarding single value instructions  with
+  /// the property that \p value is the value that \p user forwards. In this
+  /// case, this helper routine will eliminate \p value if it can rewrite user
+  /// in terms of \p newValue. This is intended to handle cases where we have
+  /// completely different types so we need to actually create a new instruction
+  /// with a different result type.
+  ///
+  /// \param newValueGenerator Generator that produces the new value to
+  /// use. Conditionally called if we can perform the optimization.
+  SILInstruction *tryFoldComposedUnaryForwardingInstChain(
+      SingleValueInstruction *user, SingleValueInstruction *value,
+      function_ref<SILValue()> newValueGenerator);
 
-  bool canReplaceArg(FullApplySite Apply, const ConcreteExistentialInfo &CEI,
-                     unsigned ArgIdx);
+  InstModCallbacks &getInstModCallbacks() { return instModCallbacks; }
+
+private:
+  // Build concrete existential information using findInitExistential.
+  Optional<ConcreteOpenedExistentialInfo>
+  buildConcreteOpenedExistentialInfo(Operand &ArgOperand);
+
+  // Build concrete existential information using SoleConformingType.
+  Optional<ConcreteOpenedExistentialInfo>
+  buildConcreteOpenedExistentialInfoFromSoleConformingType(Operand &ArgOperand);
+
+  // Common utility function to build concrete existential information for all
+  // arguments of an apply instruction.
+  void buildConcreteOpenedExistentialInfos(
+      FullApplySite Apply,
+      llvm::SmallDenseMap<unsigned, ConcreteOpenedExistentialInfo> &COEIs,
+      SILBuilderContext &BuilderCtx);
+
+  bool canReplaceArg(FullApplySite Apply, const OpenedArchetypeInfo &OAI,
+                     const ConcreteExistentialInfo &CEI, unsigned ArgIdx);
+  SILValue canCastArg(FullApplySite Apply, const OpenedArchetypeInfo &OAI,
+                      const ConcreteExistentialInfo &CEI, unsigned ArgIdx);
+
   SILInstruction *createApplyWithConcreteType(
       FullApplySite Apply,
-      const llvm::SmallDenseMap<unsigned, ConcreteExistentialInfo> &CEIs,
+      const llvm::SmallDenseMap<unsigned, ConcreteOpenedExistentialInfo> &COEIs,
       SILBuilderContext &BuilderCtx);
 
   // Common utility function to replace the WitnessMethodInst using a
@@ -312,6 +419,7 @@ private:
   SILInstruction *
   propagateConcreteTypeOfInitExistential(FullApplySite Apply,
                                          WitnessMethodInst *WMI);
+
   SILInstruction *propagateConcreteTypeOfInitExistential(FullApplySite Apply);
 
   /// Propagate concrete types from ProtocolConformanceAnalysis.
@@ -327,7 +435,7 @@ private:
 
   typedef SmallVector<SILInstruction*, 4> UserListTy;
 
-  /// \brief Returns a list of instructions that project or perform reference
+  /// Returns a list of instructions that project or perform reference
   /// counting operations on \p Value or on its uses.
   /// \return return false if \p Value has other than ARC uses.
   static bool recursivelyCollectARCUsers(UserListTy &Uses, ValueBase *Value);
@@ -340,6 +448,10 @@ private:
   /// Returns true if the results of a try_apply are not used.
   static bool isTryApplyResultNotUsed(UserListTy &AcceptedUses,
                                       TryApplyInst *TAI);
+
+  bool hasOwnership() const {
+    return Builder.hasOwnership();
+  }
 };
 
 } // end namespace swift

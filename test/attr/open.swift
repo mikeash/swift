@@ -35,7 +35,7 @@ class ExternalSuperClassesMayBeOpen : ExternalOpenClass {}
 class NestedClassesOfPublicTypesAreOpen : ExternalStruct.OpenClass {}
 
 // This one is hard to diagnose.
-class NestedClassesOfInternalTypesAreNotOpen : ExternalInternalStruct.OpenClass {} // expected-error {{use of undeclared type 'ExternalInternalStruct'}}
+class NestedClassesOfInternalTypesAreNotOpen : ExternalInternalStruct.OpenClass {} // expected-error {{cannot find type 'ExternalInternalStruct' in scope}}
 
 class NestedPublicClassesOfOpenClassesAreNotOpen : ExternalOpenClass.PublicClass {} // expected-error {{cannot inherit from non-open class 'ExternalOpenClass.PublicClass' outside of its defining module}}
 
@@ -76,16 +76,16 @@ class SubClass : ExternalOpenClass {
   }
 }
 
-open class InvalidOpenSubClass : ExternalOpenClass {
-  public override func openMethod() {} // expected-error {{overriding instance method must be as accessible as the declaration it overrides}} {{3-9=open}}
-  public override var openProperty: Int { get{return 0} set{} } // expected-error {{overriding property must be as accessible as the declaration it overrides}} {{3-9=open}}
-  public override subscript(index: MarkerForOpenSubscripts) -> Int { // expected-error {{overriding subscript must be as accessible as the declaration it overrides}} {{3-9=open}}
+open class ValidOpenSubClass : ExternalOpenClass {
+  public override func openMethod() {}
+  public override var openProperty: Int { get{return 0} set{} }
+  public override subscript(index: MarkerForOpenSubscripts) -> Int {
     get { return 0 }
     set {}
   }
 }
 
-open class InvalidOpenSubClass2 : ExternalOpenClass {
+open class InvalidOpenSubClass : ExternalOpenClass {
   internal override func openMethod() {} // expected-error {{overriding instance method must be as accessible as the declaration it overrides}} {{3-11=open}}
   internal override var openProperty: Int { get{return 0} set{} } // expected-error {{overriding property must be as accessible as the declaration it overrides}} {{3-11=open}}
   internal override subscript(index: MarkerForOpenSubscripts) -> Int { // expected-error {{overriding subscript must be as accessible as the declaration it overrides}} {{3-11=open}}

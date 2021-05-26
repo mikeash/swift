@@ -35,7 +35,7 @@ using llvm::raw_ostream;
 #define KEY(NAME, CONTENT) UIdent sourcekitd::Key##NAME(CONTENT);
 #include "SourceKit/Core/ProtocolUIDs.def"
 
-/// \brief Order for the keys to use when emitting the debug description of
+/// Order for the keys to use when emitting the debug description of
 /// dictionaries.
 static UIdent *OrderedKeys[] = {
 #define KEY(NAME, CONTENT) &Key##NAME,
@@ -224,11 +224,11 @@ void sourcekitd::enableLogging(StringRef LoggerName) {
 static llvm::sys::Mutex GlobalInitMtx;
 static unsigned gInitRefCount = 0;
 
-void sourcekitd_initialize(void) {
+bool sourcekitd::initializeClient() {
   llvm::sys::ScopedLock L(GlobalInitMtx);
   ++gInitRefCount;
   if (gInitRefCount > 1)
-    return;
+    return false;
 
   static std::once_flag flag;
   std::call_once(flag, []() {
@@ -236,18 +236,15 @@ void sourcekitd_initialize(void) {
     sourcekitd::enableLogging("sourcekit");
   });
 
-  LOG_INFO_FUNC(High, "initializing");
-  sourcekitd::initialize();
+  return true;
 }
 
-void sourcekitd_shutdown(void) {
+bool sourcekitd::shutdownClient() {
   llvm::sys::ScopedLock L(GlobalInitMtx);
   --gInitRefCount;
   if (gInitRefCount > 0)
-    return;
-
-  LOG_INFO_FUNC(High, "shutting down");
-  sourcekitd::shutdown();
+    return false;
+  return true;
 }
 
 void
@@ -724,7 +721,7 @@ sourcekitd_object_t YAMLRequestParser::createObjFromNode(
     if (!Raw.getAsInteger(10, val))
       return sourcekitd_request_int64_create(val);
 
-    if (Raw.find(' ') != StringRef::npos)
+    if (Raw.contains(' '))
       return withError("Found space in non-string value", Value, Error);
 
     return sourcekitd_request_uid_create(
@@ -786,7 +783,7 @@ bool YAMLRequestParser::parseArray(sourcekitd_object_t Array,
 
 void YAMLRequestParser::initError(StringRef Desc, llvm::yaml::Node *Node,
                                   std::string &Error) {
-  Error = Desc;
+  Error = Desc.str();
   Error += " at: ";
   llvm::SMRange Range = Node->getSourceRange();
   StringRef Text(Range.Start.getPointer(),

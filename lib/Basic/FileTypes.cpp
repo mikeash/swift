@@ -70,6 +70,7 @@ bool file_types::isTextual(ID Id) {
   case file_types::TY_SIL:
   case file_types::TY_Dependencies:
   case file_types::TY_Assembly:
+  case file_types::TY_ASTDump:
   case file_types::TY_RawSIL:
   case file_types::TY_LLVM_IR:
   case file_types::TY_ObjCHeader:
@@ -77,9 +78,12 @@ bool file_types::isTextual(ID Id) {
   case file_types::TY_ImportedModules:
   case file_types::TY_TBD:
   case file_types::TY_ModuleTrace:
-  case file_types::TY_OptRecord:
-  case file_types::TY_SwiftParseableInterfaceFile:
-  case file_types::TY_SwiftParseableInterfaceDeps:
+  case file_types::TY_YAMLOptRecord:
+  case file_types::TY_SwiftModuleInterfaceFile:
+  case file_types::TY_PrivateSwiftModuleInterfaceFile:
+  case file_types::TY_SwiftOverlayFile:
+  case file_types::TY_JSONDependencies:
+  case file_types::TY_JSONFeatures:
     return true;
   case file_types::TY_Image:
   case file_types::TY_Object:
@@ -89,13 +93,19 @@ bool file_types::isTextual(ID Id) {
   case file_types::TY_RawSIB:
   case file_types::TY_SwiftModuleFile:
   case file_types::TY_SwiftModuleDocFile:
+  case file_types::TY_SwiftSourceInfoFile:
+  case file_types::TY_SwiftCrossImportDir:
+  case file_types::TY_SwiftModuleSummaryFile:
   case file_types::TY_LLVM_BC:
   case file_types::TY_SerializedDiagnostics:
   case file_types::TY_ClangModuleFile:
   case file_types::TY_SwiftDeps:
+  case file_types::TY_ExternalSwiftDeps:
   case file_types::TY_Nothing:
   case file_types::TY_Remapping:
   case file_types::TY_IndexData:
+  case file_types::TY_BitstreamOptRecord:
+  case file_types::TY_IndexUnitOutputPath:
     return false;
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID.");
@@ -118,6 +128,7 @@ bool file_types::isAfterLLVM(ID Id) {
   case file_types::TY_TBD:
   case file_types::TY_SIL:
   case file_types::TY_Dependencies:
+  case file_types::TY_ASTDump:
   case file_types::TY_RawSIL:
   case file_types::TY_ObjCHeader:
   case file_types::TY_AutolinkFile:
@@ -127,16 +138,25 @@ bool file_types::isAfterLLVM(ID Id) {
   case file_types::TY_RawSIB:
   case file_types::TY_SwiftModuleFile:
   case file_types::TY_SwiftModuleDocFile:
+  case file_types::TY_SwiftSourceInfoFile:
+  case file_types::TY_SwiftCrossImportDir:
+  case file_types::TY_SwiftModuleSummaryFile:
+  case file_types::TY_SwiftOverlayFile:
   case file_types::TY_SerializedDiagnostics:
   case file_types::TY_ClangModuleFile:
   case file_types::TY_SwiftDeps:
+  case file_types::TY_ExternalSwiftDeps:
   case file_types::TY_Nothing:
   case file_types::TY_Remapping:
   case file_types::TY_IndexData:
   case file_types::TY_ModuleTrace:
-  case file_types::TY_OptRecord:
-  case file_types::TY_SwiftParseableInterfaceFile:
-  case file_types::TY_SwiftParseableInterfaceDeps:
+  case file_types::TY_YAMLOptRecord:
+  case file_types::TY_BitstreamOptRecord:
+  case file_types::TY_SwiftModuleInterfaceFile:
+  case file_types::TY_PrivateSwiftModuleInterfaceFile:
+  case file_types::TY_JSONDependencies:
+  case file_types::TY_JSONFeatures:
+  case file_types::TY_IndexUnitOutputPath:
     return false;
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID.");
@@ -168,16 +188,26 @@ bool file_types::isPartOfSwiftCompilation(ID Id) {
   case file_types::TY_dSYM:
   case file_types::TY_SwiftModuleFile:
   case file_types::TY_SwiftModuleDocFile:
-  case file_types::TY_SwiftParseableInterfaceFile:
-  case file_types::TY_SwiftParseableInterfaceDeps:
+  case file_types::TY_SwiftModuleInterfaceFile:
+  case file_types::TY_PrivateSwiftModuleInterfaceFile:
+  case file_types::TY_SwiftSourceInfoFile:
+  case file_types::TY_SwiftCrossImportDir:
+  case file_types::TY_SwiftOverlayFile:
+  case file_types::TY_SwiftModuleSummaryFile:
   case file_types::TY_SerializedDiagnostics:
   case file_types::TY_ClangModuleFile:
   case file_types::TY_SwiftDeps:
+  case file_types::TY_ExternalSwiftDeps:
   case file_types::TY_Nothing:
+  case file_types::TY_ASTDump:
   case file_types::TY_Remapping:
   case file_types::TY_IndexData:
   case file_types::TY_ModuleTrace:
-  case file_types::TY_OptRecord:
+  case file_types::TY_YAMLOptRecord:
+  case file_types::TY_BitstreamOptRecord:
+  case file_types::TY_JSONDependencies:
+  case file_types::TY_JSONFeatures:
+  case file_types::TY_IndexUnitOutputPath:
     return false;
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID.");

@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -dump-ast > %t.ast 2>&1
+// RUN: %target-typecheck-verify-swift -dump-ast > %t.ast
 // RUN: %FileCheck %s < %t.ast
 
 // Test overriding of protocol members.
@@ -97,7 +97,7 @@ protocol P6: P0 {
 
 // Complain if 'override' is present but there is no overridden declaration.
 protocol P7: P0 {
-  // expected-error@+1{{method does not override any method from its superclass}}
+  // expected-error@+1{{method does not override any method from its parent protocol}}
   override func foo() -> Int
 
   // expected-error@+1{{property 'prop' with type 'Int' cannot override a property with type 'Self.A'}}

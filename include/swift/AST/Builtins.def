@@ -51,30 +51,98 @@ BUILTIN_CAST_OR_BITCAST_OPERATION(SExtOrBitCast,  "sextOrBitCast",  "n")
 #undef BUILTIN_CAST_OR_BITCAST_OPERATION
 
 /// Binary operations have type (T,T) -> T.
+///
+/// We define two different sorts of operations varying when T is static,
+/// specifically:
+///
+/// 1. Overloaded statically typed operations. E.x:
+///
+///       builtin "add_Vec4xInt32"(Vec4xInt32, Vec4xInt32) : Vec4xInt32.
+///
+/// 2. Polymorphic typed operations that are valid only in raw SIL. By the time
+///    diagnostic constant propagation runs, these must have as its operand a
+///    fully specialized type. If the builtin has a type that is not one of its
+///    overloaded types, diagnostic constant propagation will emit a diagnostic
+///    saying the builtin's type has not been fully resolved. Otherwise,
+///    diagnostic constant propagation will transform the builtin to the
+///    relevant static overloaded builtin form. E.x.:
+///
+///       builtin "add"(Self, Self) : Self // *error*
+///
+///         OR
+///
+///       builtin "generic_add"(Vec4xInt32, Vec4xInt32) : Vec4xInt32
+///         ->
+///       builtin "add_Vec4xInt32"(Vec4xInt32, Vec4xInt32) : Vec4xInt32
+///
+/// NOTE: If a polymorphic typed operation is not static by the time guaranteed
+/// constant propagation runs, we emit a diagnostic to inform the user (who is
+/// assumed to be an expert user) to tell them the value was unspecialized. The
+/// typical way this specialization occurs today is via transparent inlining
+/// since the transparent inliner devirtualizes and specializes as it goes. Of
+/// course this means mandatory inlining must /always/ occur before diagnostic
+/// constant propagation.
+///
+/// NOTE: Often times the builtin infrastructure wants to treat all
+/// binary operation builtins generic or not the same way. To ensure
+/// we support all use cases in the compiler, we do not declare the
+/// operations as part of this builtin since often times this macro is
+/// used to generic code. Instead, we stamp this out using the
+/// overloaded_static, polymorphic, and all suffixed operations.
 #ifndef BUILTIN_BINARY_OPERATION
-#define BUILTIN_BINARY_OPERATION(Id, Name, Attrs, Overload) \
-          BUILTIN(Id, Name, Attrs)
+#define BUILTIN_BINARY_OPERATION(Id, Name, Attrs) BUILTIN(Id, Name, Attrs)
 #endif
-BUILTIN_BINARY_OPERATION(Add,     "add",      "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(FAdd,    "fadd",     "n", FloatOrVector)
-BUILTIN_BINARY_OPERATION(And,     "and",      "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(AShr,    "ashr",     "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(LShr,    "lshr",     "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(Or,      "or",       "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(FDiv,    "fdiv",     "n", FloatOrVector)
-BUILTIN_BINARY_OPERATION(Mul,     "mul",      "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(FMul,    "fmul",     "n", FloatOrVector)
-BUILTIN_BINARY_OPERATION(SDiv,    "sdiv",     "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(ExactSDiv, "sdiv_exact", "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(Shl,     "shl",      "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(SRem,    "srem",     "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(Sub,     "sub",      "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(FSub,    "fsub",     "n", FloatOrVector)
-BUILTIN_BINARY_OPERATION(UDiv,    "udiv",     "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(ExactUDiv, "udiv_exact", "n", IntegerOrVector)
-BUILTIN_BINARY_OPERATION(URem,    "urem",     "n", Integer)
-BUILTIN_BINARY_OPERATION(FRem,    "frem",     "n", FloatOrVector)
-BUILTIN_BINARY_OPERATION(Xor,     "xor",      "n", IntegerOrVector)
+
+#ifdef BUILTIN_BINARY_OPERATION_GENERIC_HELPER_STR
+#error "Do not define BUILTIN_BINARY_OPERATION_GENERIC_HELPER_STR before including this .def file"
+#endif
+
+#define BUILTIN_BINARY_OPERATION_GENERIC_HELPER_STR(NAME) #NAME
+
+#ifndef BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC
+#define BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC(Id, Name, Attrs, Overload) \
+  BUILTIN_BINARY_OPERATION(Id, Name, Attrs)
+#endif
+
+#ifndef BUILTIN_BINARY_OPERATION_POLYMORPHIC
+#define BUILTIN_BINARY_OPERATION_POLYMORPHIC(Id, Name) \
+  BUILTIN_BINARY_OPERATION(Id, Name, "")
+#endif
+
+// TODO: This needs a better name. We stringify generic_ in *_{OVERLOADED_STATIC,POLYMORPHIC}
+#ifndef BUILTIN_BINARY_OPERATION_ALL
+#define BUILTIN_BINARY_OPERATION_ALL(Id, Name, Attrs, Overload) \
+  BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC(Id, BUILTIN_BINARY_OPERATION_GENERIC_HELPER_STR(Name), Attrs, Overload) \
+  BUILTIN_BINARY_OPERATION_POLYMORPHIC(Generic##Id, BUILTIN_BINARY_OPERATION_GENERIC_HELPER_STR(generic_##Name))
+#endif
+
+// NOTE: Here we need our name field to be bare. We stringify them as
+// appropriately in BUILTIN_BINARY_OPERATION_{OVERLOADED_STATIC,POLYMORPHIC}.
+BUILTIN_BINARY_OPERATION_ALL(Add,     add,      "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(FAdd,    fadd,     "n", FloatOrVector)
+BUILTIN_BINARY_OPERATION_ALL(And,     and,      "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(AShr,    ashr,     "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(LShr,    lshr,     "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(Or,      or,       "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(FDiv,    fdiv,     "n", FloatOrVector)
+BUILTIN_BINARY_OPERATION_ALL(Mul,     mul,      "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(FMul,    fmul,     "n", FloatOrVector)
+BUILTIN_BINARY_OPERATION_ALL(SDiv,    sdiv,     "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(ExactSDiv, sdiv_exact, "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(Shl,     shl,      "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(SRem,    srem,     "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(Sub,     sub,      "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(FSub,    fsub,     "n", FloatOrVector)
+BUILTIN_BINARY_OPERATION_ALL(UDiv,    udiv,     "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(ExactUDiv, udiv_exact, "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_ALL(URem,    urem,     "n", Integer)
+BUILTIN_BINARY_OPERATION_ALL(FRem,    frem,     "n", FloatOrVector)
+BUILTIN_BINARY_OPERATION_ALL(Xor,     xor,      "n", IntegerOrVector)
+BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC(Expect, "int_expect", "n", Integer)
+#undef BUILTIN_BINARY_OPERATION_ALL
+#undef BUILTIN_BINARY_OPERATION_POLYMORPHIC
+#undef BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC
+#undef BUILTIN_BINARY_OPERATION_GENERIC_HELPER_STR
 #undef BUILTIN_BINARY_OPERATION
 
 /// These builtins are analogous the similarly named llvm intrinsics. The
@@ -316,7 +384,8 @@ BUILTIN_SIL_OPERATION(EndUnpairedAccess, "endUnpairedAccess", Special)
 
 /// condfail(Int1) -> ()
 /// Triggers a runtime failure if the condition is true.
-BUILTIN_SIL_OPERATION(CondFail, "condfail", Special)
+/// This builtin is deprecated. Use condfail_message instead.
+BUILTIN_SIL_OPERATION(LegacyCondFail, "condfail", Special)
 
 /// fixLifetime(T) -> ()
 /// Fixes the lifetime of any heap references in a value.
@@ -360,6 +429,29 @@ BUILTIN_SIL_OPERATION(IsUnique, "isUnique", Special)
 /// BridgeObject to be treated as a native object by the runtime.
 BUILTIN_SIL_OPERATION(IsUnique_native, "isUnique_native", Special)
 
+/// beginCOWMutation<T : AnyObject>(inout T) -> Int1
+///
+/// Begins a copy-on-write mutation for a buffer reference which is passed as
+/// inout argument. It returns a true if the buffer is uniquely referenced.
+/// In this case the buffer may be mutated after calling this builtin.
+///
+/// The beginCOWMutation builtin is very similar to isUnique. It just translates
+/// to a different SIL instruction (begin_cow_mutation), which is the preferred
+/// representation of COW in SIL.
+BUILTIN_SIL_OPERATION(BeginCOWMutation, "beginCOWMutation", Special)
+
+/// beginCOWMutation_native<T : AnyObject>(inout T) -> Int1
+///
+/// Like beginCOWMutation, but it's assumed that T has native Swift reference
+/// counting.
+BUILTIN_SIL_OPERATION(BeginCOWMutation_native, "beginCOWMutation_native", Special)
+
+/// endCOWMutation<T : AnyObject>(inout T)
+///
+/// Ends a copy-on-write mutation for a buffer reference which is passed as
+/// inout argument. After calling this builtin, the buffer must not be mutated.
+BUILTIN_SIL_OPERATION(EndCOWMutation, "endCOWMutation", Special)
+
 /// bindMemory : <T> (Builtin.RawPointer, Builtin.Word, T.Type) -> ()
 BUILTIN_SIL_OPERATION(BindMemory, "bindMemory", Special)
 
@@ -374,6 +466,51 @@ BUILTIN_SIL_OPERATION(AllocWithTailElems, "allocWithTailElems", Special)
 ///
 /// Projects the first tail-allocated element of type E from a class C.
 BUILTIN_SIL_OPERATION(ProjectTailElems, "projectTailElems", Special)
+
+/// Unsafely convert a value of type T to an unowned value.
+///
+/// It has type (T, @inout @unowned(unsafe) T) -> (). The reason for the weird
+/// signature is to work around issues with results in SILGen builtin emission.
+BUILTIN_SIL_OPERATION(ConvertStrongToUnownedUnsafe, "convertStrongToUnownedUnsafe", Special)
+
+/// Unsafely convert a value of type @inout @unowned(unsafe) T to a loaded
+/// guaranteed T value that has a lifetime guaranteed by the passed in base
+/// value of type BaseTy.
+///
+/// It has type (@in_guaranteed BaseTy, @in_guaranteed @unowned (unsafe) T) -> @guaranteed T.
+///
+/// NOTE: Saying the result is a guaranteed T is a bit of a misnomer. We aren't
+/// emitting a builtin call, but are just emitting SIL directly.
+///
+/// NOTE: Even though the signature is as mentioned above, we actually tell the
+/// AST we have the signature:
+///
+///   <BaseT, T, U> (BaseT, T) -> U
+///
+/// We then perform the actual type checking in SILGen and assert on
+/// failure. This is an early, unsupported feature so this is sufficient for
+/// now.
+BUILTIN_SIL_OPERATION(ConvertUnownedUnsafeToGuaranteed, "convertUnownedUnsafeToGuaranteed", Special)
+
+/// applyDerivative
+BUILTIN_SIL_OPERATION(ApplyDerivative, "applyDerivative", Special)
+
+/// applyTranspose
+BUILTIN_SIL_OPERATION(ApplyTranspose, "applyTranspose", Special)
+
+/// withUnsafeContinuation<T> : (Builtin.RawUnsafeContinuation -> ()) async -> T
+///
+/// Unsafely capture the current continuation and pass it to the given
+/// function value. Returns a value of type T when the continuation is
+/// resumed.
+BUILTIN_SIL_OPERATION(WithUnsafeContinuation, "withUnsafeContinuation", Special)
+
+/// withUnsafeThrowingContinuation<T> : (Builtin.RawUnsafeContinuation -> ()) async throws -> T
+///
+/// Unsafely capture the current continuation and pass it to the given
+/// function value. Returns a value of type T or throws an error when
+/// the continuation is resumed.
+BUILTIN_SIL_OPERATION(WithUnsafeThrowingContinuation, "withUnsafeThrowingContinuation", Special)
 
 #undef BUILTIN_SIL_OPERATION
 
@@ -404,6 +541,10 @@ BUILTIN_RUNTIME_CALL(IsOptionalType, "isOptional", "")
           BUILTIN(Id, Name, Attrs)
 #endif
 
+/// condfail_message(Int1, RawPointer) -> ()
+/// Triggers a runtime failure if the condition is true.
+BUILTIN_MISC_OPERATION(CondFailMessage, "condfail_message", "", Special)
+
 /// Sizeof has type T.Type -> Int
 BUILTIN_MISC_OPERATION(Sizeof, "sizeof", "n", Special)
 
@@ -412,6 +553,14 @@ BUILTIN_MISC_OPERATION(Strideof, "strideof", "n", Special)
 
 /// IsPOD has type T.Type -> Bool
 BUILTIN_MISC_OPERATION(IsPOD, "ispod", "n", Special)
+
+/// IsConcrete has type (T.Type) -> Bool
+///
+/// If the meta type T is concrete, we can always transform this to `true` at
+/// any time in SIL. If it's generic, then we lower it to `false` right before
+/// IRGen in IRGenPrepare. This allows for the optimizer to specialize this at
+/// -O and eliminate conditional code.
+BUILTIN_MISC_OPERATION(IsConcrete, "isConcrete", "n", Special)
 
 /// IsBitwiseTakable has type T.Type -> Bool
 BUILTIN_MISC_OPERATION(IsBitwiseTakable, "isbitwisetakable", "n", Special)
@@ -423,9 +572,29 @@ BUILTIN_MISC_OPERATION(IsSameMetatype, "is_same_metatype", "n", Special)
 BUILTIN_MISC_OPERATION(Alignof, "alignof", "n", Special)
 
 /// AllocRaw has type (Int, Int) -> Builtin.RawPointer
+///
+/// Parameters: object size, object alignment.
+///
+/// This alignment is not a mask; the compiler decrements by one to provide
+/// a mask to the runtime.
+///
+/// If alignment == 0, then the runtime will use "aligned" allocation,
+/// and the memory will be aligned to _swift_MinAllocationAlignment.
 BUILTIN_MISC_OPERATION(AllocRaw, "allocRaw", "", Special)
 
 /// DeallocRaw has type (Builtin.RawPointer, Int, Int) -> ()
+///
+/// Parameters: object address, object size, object alignment.
+///
+/// This alignment is not a mask; the compiler decrements by one to provide
+/// a mask to the runtime.
+///
+/// If alignment == 0, then the runtime will use the "aligned" deallocation
+/// path, which assumes that "aligned" allocation was used.
+///
+/// Note that the alignment value provided to `deallocRaw` must be identical to
+/// the alignment value provided to `allocRaw` when the memory at this address
+/// was allocated.
 BUILTIN_MISC_OPERATION(DeallocRaw, "deallocRaw", "", Special)
 
 /// Fence has type () -> ().
@@ -446,11 +615,19 @@ BUILTIN_MISC_OPERATION(AtomicStore, "atomicstore", "", Special)
 /// AtomicRMW has type (Builtin.RawPointer, T) -> T.
 BUILTIN_MISC_OPERATION(AtomicRMW, "atomicrmw", "", IntegerOrRawPointer)
 
+/// convertTaskToJob : (Builtin.NativePointer) -> Builtin.Job
+///
+/// Convert a task pointer into a job pointer.
+BUILTIN_MISC_OPERATION(ConvertTaskToJob, "convertTaskToJob", "n", Special)
+
 /// ExtractElement has type (Vector<N, T>, Int32) -> T
 BUILTIN_MISC_OPERATION(ExtractElement, "extractelement", "n", Special)
 
 /// InsertElement has type (Vector<N, T>, T, Int32) -> Vector<N, T>.
 BUILTIN_MISC_OPERATION(InsertElement, "insertelement", "n", Special)
+
+// Shufflevector has type (VecN<T>, VecN<T>, VecM<Int32>) -> VecM<T>
+BUILTIN_MISC_OPERATION(ShuffleVector, "shufflevector", "n", Special)
 
 /// StaticReport has type (Builtin.Int1, Builtin.Int1, Builtin.RawPointer) -> ()
 BUILTIN_MISC_OPERATION(StaticReport, "staticReport", "", Special)
@@ -478,18 +655,8 @@ BUILTIN_MISC_OPERATION(SToSCheckedTrunc, "s_to_s_checked_trunc", "n", Special)
 BUILTIN_MISC_OPERATION(SToUCheckedTrunc, "s_to_u_checked_trunc", "n", Special)
 BUILTIN_MISC_OPERATION(UToUCheckedTrunc, "u_to_u_checked_trunc", "n", Special)
 
-/// Checked conversions for signed <-> unsigned integers of the same size.
-/// Returns a tuple containing the conversion result as well as
-/// the sign error / overflow bit.
-BUILTIN_MISC_OPERATION(SUCheckedConversion,
-                       "s_to_u_checked_conversion", "n", Special)
-BUILTIN_MISC_OPERATION(USCheckedConversion,
-                       "u_to_s_checked_conversion", "n", Special)
-
 /// IntToFPWithOverflow has type (Integer) -> Float
 BUILTIN_MISC_OPERATION(IntToFPWithOverflow, "itofp_with_overflow", "n", Special)
-
-// FIXME: shufflevector
 
 /// zeroInitializer has type <T> () -> T
 BUILTIN_MISC_OPERATION(ZeroInitializer, "zeroInitializer", "n", Special)
@@ -521,6 +688,12 @@ BUILTIN_MISC_OPERATION(AssignCopyArrayFrontToBack, "assignCopyArrayFrontToBack",
 BUILTIN_MISC_OPERATION(AssignCopyArrayBackToFront, "assignCopyArrayBackToFront", "", Special)
 BUILTIN_MISC_OPERATION(AssignTakeArray, "assignTakeArray", "", Special)
 
+/// COWBufferForReading has type <T: AnyObject> T -> T
+///
+/// Returns the buffer reference which is passed as argument.
+/// This builtin indicates to the optimizer that the buffer is not mutable.
+BUILTIN_MISC_OPERATION(COWBufferForReading, "COWBufferForReading", "n", Special)
+
 // unsafeGuaranteed has type <T: AnyObject> T -> (T, Builtin.Int8)
 BUILTIN_MISC_OPERATION(UnsafeGuaranteed, "unsafeGuaranteed", "", Special)
 
@@ -535,6 +708,143 @@ BUILTIN_MISC_OPERATION(Swift3ImplicitObjCEntrypoint, "swift3ImplicitObjCEntrypoi
 
 /// willThrow: Error -> ()
 BUILTIN_MISC_OPERATION(WillThrow, "willThrow", "", Special)
+
+/// poundAssert has type (Builtin.Int1, Builtin.RawPointer) -> ().
+BUILTIN_MISC_OPERATION(PoundAssert, "poundAssert", "", Special)
+
+// TypePtrAuthDiscriminator has type <T> (T.Type) -> Int64
+BUILTIN_MISC_OPERATION(TypePtrAuthDiscriminator, "typePtrAuthDiscriminator", "n", Special)
+
+//  int_instrprof_increment has type (Builtin.RawPointer, Builtin.Int64, Builtin.Int32, Builtin.Int32) -> ().
+BUILTIN_MISC_OPERATION(IntInstrprofIncrement, "int_instrprof_increment", "", Special)
+
+/// Initialize the default-actor instance in a default actor object.
+BUILTIN_MISC_OPERATION(InitializeDefaultActor, "initializeDefaultActor", "", Special)
+
+/// Destroy the default-actor instance in a default actor object.
+BUILTIN_MISC_OPERATION(DestroyDefaultActor, "destroyDefaultActor", "", Special)
+
+/// Resume a non-throwing continuation normally with the given result.
+BUILTIN_MISC_OPERATION(ResumeNonThrowingContinuationReturning,
+                       "resumeNonThrowingContinuationReturning", "", Special)
+
+/// Resume a throwing continuation normally with the given result.
+BUILTIN_MISC_OPERATION(ResumeThrowingContinuationReturning,
+                       "resumeThrowingContinuationReturning", "", Special)
+
+/// Resume a throwing continuation abnormally with the given error.
+BUILTIN_MISC_OPERATION(ResumeThrowingContinuationThrowing,
+                       "resumeThrowingContinuationThrowing", "", Special)
+
+/// Create a task group.
+BUILTIN_MISC_OPERATION(CreateTaskGroup,
+                       "createTaskGroup", "", Special)
+
+/// Destroy a task group.
+BUILTIN_MISC_OPERATION(DestroyTaskGroup,
+                       "destroyTaskGroup", "", Special)
+
+// BUILTIN_MISC_OPERATION_WITH_SILGEN - Miscellaneous operations that are
+// specially emitted during SIL generation.
+//
+// The intention is that this is meant for builtins that need a named
+// builtin representation so one can create a builtin instruction in
+// SIL, but that also need special SILGen behavior. If an operation
+// just emits custom SIL and does not need to be able to form a
+// builtin instruction, please use BUILTIN_SIL_OPERATION.
+#ifndef BUILTIN_MISC_OPERATION_WITH_SILGEN
+#define BUILTIN_MISC_OPERATION_WITH_SILGEN(Id, Name, Attrs, Overload) \
+  BUILTIN_MISC_OPERATION(Id, Name, Attrs, Overload)
+#endif
+
+// getCurrentExecutor: () async -> Builtin.Executor?
+//
+// Retrieve the ExecutorRef on which the current asynchronous
+// function is executing, or nil if the function isn't running
+// anywhere in particular.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(GetCurrentExecutor, "getCurrentExecutor", "", Special)
+
+// getCurrentAsyncTask: () -> Builtin.NativeObject
+//
+// Retrieve the pointer to the task in which the current asynchronous
+// function is executing.
+//
+// This is readnone because, within the world modeled by SIL, the
+// current async task of a thread never changes.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(GetCurrentAsyncTask, "getCurrentAsyncTask", "n", Special)
+
+/// cancelAsyncTask(): (Builtin.NativeObject) -> Void
+///
+/// Cancel the given asynchronous task.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(CancelAsyncTask, "cancelAsyncTask", "", Special)
+
+/// startAsyncLet()<T>: (
+///     __owned @Sendable @escaping () async throws -> T
+/// ) -> Builtin.RawPointer
+///
+/// Create, initialize and start a new async-let and associated task.
+/// Returns an AsyncLet* that must be passed to endAsyncLet for destruction.
+BUILTIN_MISC_OPERATION(StartAsyncLet, "startAsyncLet", "", Special)
+
+/// asyncLetEnd(): (Builtin.RawPointer) -> Void
+///
+/// Ends and destroys an async-let.
+/// The ClosureLifetimeFixup pass adds a second operand to the builtin to
+/// ensure that optimizations keep the stack-allocated closure arguments alive
+/// until the endAsyncLet.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(EndAsyncLet, "endAsyncLet", "", Special)
+
+/// createAsyncTaskFuture(): (
+///     Int, Builtin.NativeObject?, @escaping () async throws -> T
+/// ) -> Builtin.NativeObject
+///
+/// Create a new asynchronous task future, given flags, an (optional) parent
+/// task and a function to execute.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(CreateAsyncTaskFuture,
+    "createAsyncTaskFuture", "", Special)
+
+/// createAsyncTaskGroupFuture(): (
+///     Int, // flags
+///     Builtin.NativeObject?, // parent
+///     Builtin.RawPointer?, // group
+///     @escaping () async throws -> T
+/// ) -> Builtin.NativeObject
+///
+/// Create a new asynchronous task future, given flags, a parent task,
+/// task group and a function to execute.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(CreateAsyncTaskGroupFuture,
+    "createAsyncTaskGroupFuture", "", Special)
+
+/// globalStringTablePointer has type String -> Builtin.RawPointer.
+/// It returns an immortal, global string table pointer for strings constructed
+/// from string literals. We consider it effects as readnone meaning that it
+/// does not read any memory (note that even though it reads from a string, it
+/// is a pure value and therefore we can consider it as readnone).
+BUILTIN_MISC_OPERATION_WITH_SILGEN(GlobalStringTablePointer, "globalStringTablePointer", "n", Special)
+
+// autoDiffCreateLinearMapContext: (Builtin.Word) -> Builtin.NativeObject
+BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffCreateLinearMapContext, "autoDiffCreateLinearMapContext", "n", Special)
+
+// autoDiffProjectTopLevelSubcontext: (Builtin.NativeObject) -> Builtin.RawPointer
+BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffProjectTopLevelSubcontext, "autoDiffProjectTopLevelSubcontext", "n", Special)
+
+// autoDiffAllocateSubcontext: (Builtin.NativeObject, Builtin.Word) -> Builtin.RawPointer
+BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffAllocateSubcontext, "autoDiffAllocateSubcontext", "", Special)
+
+/// Build a Builtin.Executor value from an "ordinary" serial executor
+/// reference.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildOrdinarySerialExecutorRef,
+                                   "buildOrdinarySerialExecutorRef", "n", Special)
+
+/// Build a Builtin.Executor value from a default actor reference.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildDefaultActorExecutorRef,
+                                   "buildDefaultActorExecutorRef", "n", Special)
+
+/// Build a Builtin.Executor value for the main actor.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildMainActorExecutorRef,
+                                   "buildMainActorExecutorRef", "n", Special)
+
+#undef BUILTIN_MISC_OPERATION_WITH_SILGEN
 
 #undef BUILTIN_MISC_OPERATION
 
@@ -557,6 +867,7 @@ BUILTIN_SANITIZER_OPERATION(TSanInoutAccess, "tsanInoutAccess", "")
 BUILTIN_TYPE_CHECKER_OPERATION(TypeJoin, type_join)
 BUILTIN_TYPE_CHECKER_OPERATION(TypeJoinInout, type_join_inout)
 BUILTIN_TYPE_CHECKER_OPERATION(TypeJoinMeta, type_join_meta)
+BUILTIN_TYPE_CHECKER_OPERATION(TriggerFallbackDiagnostic, trigger_fallback_diagnostic)
 
 #undef BUILTIN_TYPE_CHECKER_OPERATION
 

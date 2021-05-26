@@ -1,8 +1,8 @@
-//===--- CollectionAlgorithms.swift.gyb -----------------------*- swift -*-===//
+//===--- CollectionAlgorithms.swift ---------------------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -36,7 +36,7 @@ extension BidirectionalCollection {
 // firstIndex(of:)/firstIndex(where:)
 //===----------------------------------------------------------------------===//
 
-extension Collection where Element : Equatable {
+extension Collection where Element: Equatable {
   /// Returns the first index where the specified value appears in the
   /// collection.
   ///
@@ -179,7 +179,7 @@ extension BidirectionalCollection {
   }
 }
 
-extension BidirectionalCollection where Element : Equatable {
+extension BidirectionalCollection where Element: Equatable {
   /// Returns the last index where the specified value appears in the
   /// collection.
   ///
@@ -277,7 +277,7 @@ extension MutableCollection {
   }  
 }
 
-extension MutableCollection where Self : BidirectionalCollection {
+extension MutableCollection where Self: BidirectionalCollection {
   /// Reorders the elements of the collection such that all the elements
   /// that match the given predicate are after all the elements that don't
   /// match.
@@ -318,47 +318,124 @@ extension MutableCollection where Self : BidirectionalCollection {
   public mutating func partition(
     by belongsInSecondPartition: (Element) throws -> Bool
   ) rethrows -> Index {
-    let maybeOffset = try _withUnsafeMutableBufferPointerIfSupported {
+    let maybeOffset = try withContiguousMutableStorageIfAvailable {
       (bufferPointer) -> Int in
-      let unsafeBufferPivot = try bufferPointer.partition(
+      let unsafeBufferPivot = try bufferPointer._partitionImpl(
         by: belongsInSecondPartition)
       return unsafeBufferPivot - bufferPointer.startIndex
     }
     if let offset = maybeOffset {
-      return index(startIndex, offsetBy: numericCast(offset))
+      return index(startIndex, offsetBy: offset)
+    } else {
+      return try _partitionImpl(by: belongsInSecondPartition)
     }
+  }
 
+  @inlinable
+  internal mutating func _partitionImpl(
+    by belongsInSecondPartition: (Element) throws -> Bool
+  ) rethrows -> Index {
     var lo = startIndex
     var hi = endIndex
+    while true {
+      // Invariants at this point:
+      //
+      // * `lo <= hi`
+      // * all elements in `startIndex ..< lo` belong in the first partition
+      // * all elements in `hi ..< endIndex` belong in the second partition
 
-    // 'Loop' invariants (at start of Loop, all are true):
-    // * lo < hi
-    // * predicate(self[i]) == false, for i in startIndex ..< lo
-    // * predicate(self[i]) == true, for i in hi ..< endIndex
+      // Find next element from `lo` that may not be in the right place.
+      while true {
+        guard lo < hi else { return lo }
+        if try belongsInSecondPartition(self[lo]) { break }
+        formIndex(after: &lo)
+      }
 
-    Loop: while true {
-      FindLo: repeat {
-        while lo < hi {
-          if try belongsInSecondPartition(self[lo]) { break FindLo }
-          formIndex(after: &lo)
-        }
-        break Loop
-      } while false
-
-      FindHi: repeat {
+      // Find next element down from `hi` that we can swap `lo` with.
+      while true {
         formIndex(before: &hi)
-        while lo < hi {
-          if try !belongsInSecondPartition(self[hi]) { break FindHi }
-          formIndex(before: &hi)
-        }
-        break Loop
-      } while false
+        guard lo < hi else { return lo }
+        if try !belongsInSecondPartition(self[hi]) { break }
+      }
 
       swapAt(lo, hi)
       formIndex(after: &lo)
     }
+  }
+}
 
-    return lo
+//===----------------------------------------------------------------------===//
+// _indexedStablePartition / _partitioningIndex
+//===----------------------------------------------------------------------===//
+
+extension MutableCollection {
+  /// Moves all elements at the indices satisfying `belongsInSecondPartition`
+  /// into a suffix of the collection, preserving their relative order, and
+  /// returns the start of the resulting suffix.
+  ///
+  /// - Complexity: O(*n* log *n*) where *n* is the number of elements.
+  /// - Precondition:
+  ///   `n == distance(from: range.lowerBound, to: range.upperBound)`
+  internal mutating func _indexedStablePartition(
+    count n: Int,
+    range: Range<Index>,
+    by belongsInSecondPartition: (Index) throws-> Bool
+  ) rethrows -> Index {
+    if n == 0 { return range.lowerBound }
+    if n == 1 {
+      return try belongsInSecondPartition(range.lowerBound)
+        ? range.lowerBound
+        : range.upperBound
+    }
+    let h = n / 2, i = index(range.lowerBound, offsetBy: h)
+    let j = try _indexedStablePartition(
+      count: h,
+      range: range.lowerBound..<i,
+      by: belongsInSecondPartition)
+    let k = try _indexedStablePartition(
+      count: n - h,
+      range: i..<range.upperBound,
+      by: belongsInSecondPartition)
+    return _rotate(in: j..<k, shiftingToStart: i)
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// _partitioningIndex(where:)
+//===----------------------------------------------------------------------===//
+
+extension Collection {
+  /// Returns the index of the first element in the collection that matches
+  /// the predicate.
+  ///
+  /// The collection must already be partitioned according to the predicate.
+  /// That is, there should be an index `i` where for every element in
+  /// `collection[..<i]` the predicate is `false`, and for every element
+  /// in `collection[i...]` the predicate is `true`.
+  ///
+  /// - Parameter predicate: A predicate that partitions the collection.
+  /// - Returns: The index of the first element in the collection for which
+  ///   `predicate` returns `true`.
+  ///
+  /// - Complexity: O(log *n*), where *n* is the length of this collection if
+  ///   the collection conforms to `RandomAccessCollection`, otherwise O(*n*).
+  internal func _partitioningIndex(
+    where predicate: (Element) throws -> Bool
+  ) rethrows -> Index {
+    var n = count
+    var l = startIndex
+    
+    while n > 0 {
+      let half = n / 2
+      let mid = index(l, offsetBy: half)
+      if try predicate(self[mid]) {
+        n = half
+      } else {
+        l = index(after: mid)
+        n -= half + 1
+      }
+    }
+    return l
   }
 }
 
@@ -420,7 +497,7 @@ extension Sequence {
   }
 }
 
-extension MutableCollection where Self : RandomAccessCollection {
+extension MutableCollection where Self: RandomAccessCollection {
   /// Shuffles the collection in place, using the given generator as a source
   /// for randomness.
   ///
@@ -445,16 +522,15 @@ extension MutableCollection where Self : RandomAccessCollection {
   public mutating func shuffle<T: RandomNumberGenerator>(
     using generator: inout T
   ) {
-    let count = self.count
     guard count > 1 else { return }
     var amount = count
     var currentIndex = startIndex
     while amount > 1 {
-      let random = generator.next(upperBound: UInt(amount))
+      let random = Int.random(in: 0 ..< amount, using: &generator)
       amount -= 1
       swapAt(
         currentIndex,
-        index(currentIndex, offsetBy: numericCast(random))
+        index(currentIndex, offsetBy: random)
       )
       formIndex(after: &currentIndex)
     }

@@ -25,7 +25,6 @@
 #include "swift/Basic/Sanitizers.h"
 #include "swift/Driver/Util.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <functional>
@@ -55,7 +54,7 @@ namespace driver {
   class JobAction;
   class ToolChain;
 
-/// \brief A class encapsulating information about the outputs the driver
+/// A class encapsulating information about the outputs the driver
 /// is expected to generate.
 class OutputInfo {
 public:
@@ -87,11 +86,28 @@ public:
     Immediate,
   };
 
+  enum class MSVCRuntime {
+    MultiThreaded,
+    MultiThreadedDebug,
+    MultiThreadedDLL,
+    MultiThreadedDebugDLL,
+  };
+
   /// The mode in which the driver should invoke the frontend.
   Mode CompilerMode = Mode::StandardCompile;
 
+  Optional<MSVCRuntime> RuntimeVariant = llvm::None;
+
   /// The output type which should be used for compile actions.
   file_types::ID CompilerOutputType = file_types::ID::TY_INVALID;
+
+  enum class LTOKind {
+    None,
+    LLVMThin,
+    LLVMFull,
+  };
+
+  LTOKind LTOVariant = LTOKind::None;
 
   /// Describes if and how the output of compile actions should be
   /// linked together.
@@ -149,7 +165,10 @@ public:
     Interactive,     // swift
     Batch,           // swiftc
     AutolinkExtract, // swift-autolink-extract
-    SwiftFormat      // swift-format
+    SwiftIndent,     // swift-indent
+    SymbolGraph,     // swift-symbolgraph
+    APIExtract,      // swift-api-extract
+    APIDigester      // swift-api-digester
   };
 
   class InputInfoMap;
@@ -165,6 +184,9 @@ private:
   /// The original path to the executable.
   std::string DriverExecutable;
 
+  // Extra args to pass to the driver executable
+  SmallVector<std::string, 2> DriverExecutableArgs;
+
   DriverKind driverKind = DriverKind::Interactive;
 
   /// Default target triple.
@@ -179,6 +201,11 @@ private:
   /// Indicates whether the driver should check that the input files exist.
   bool CheckInputFilesExist = true;
 
+  /// Indicates that this driver never actually executes any commands but is
+  /// just set up to retrieve the swift-frontend invocation that would be
+  /// executed during compilation.
+  bool IsDummyDriverForFrontendInvocation = false;
+
 public:
   Driver(StringRef DriverExecutable, StringRef Name,
          ArrayRef<const char *> Args, DiagnosticEngine &Diags);
@@ -191,7 +218,11 @@ public:
   const std::string &getSwiftProgramPath() const {
     return DriverExecutable;
   }
-  
+
+  ArrayRef<std::string> getSwiftProgramArgs() const {
+    return DriverExecutableArgs;
+  }
+
   DriverKind getDriverKind() const { return driverKind; }
   
   ArrayRef<const char *> getArgsWithoutProgramNameAndDriverMode(
@@ -200,6 +231,14 @@ public:
   bool getCheckInputFilesExist() const { return CheckInputFilesExist; }
 
   void setCheckInputFilesExist(bool Value) { CheckInputFilesExist = Value; }
+
+  bool isDummyDriverForFrontendInvocation() const {
+    return IsDummyDriverForFrontendInvocation;
+  }
+
+  void setIsDummyDriverForFrontendInvocation(bool Value) {
+    IsDummyDriverForFrontendInvocation = Value;
+  }
 
   /// Creates an appropriate ToolChain for a given driver, given the target
   /// specified in \p Args (or the default target). Sets the value of \c
@@ -223,13 +262,17 @@ public:
   /// Construct a compilation object for a given ToolChain and command line
   /// argument vector.
   ///
+  /// If \p AllowErrors is set to \c true, this method tries to build a
+  /// compilation even if there were errors.
+  ///
   /// \return A Compilation, or nullptr if none was built for the given argument
   /// vector. A null return value does not necessarily indicate an error
   /// condition; the diagnostics should be queried to determine if an error
   /// occurred.
   std::unique_ptr<Compilation>
   buildCompilation(const ToolChain &TC,
-                   std::unique_ptr<llvm::opt::InputArgList> ArgList);
+                   std::unique_ptr<llvm::opt::InputArgList> ArgList,
+                   bool AllowErrors = false);
 
   /// Parse the given list of strings into an InputArgList.
   std::unique_ptr<llvm::opt::InputArgList>
@@ -270,14 +313,12 @@ public:
   /// \param[out] TopLevelActions The main Actions to build Jobs for.
   /// \param TC the default host tool chain.
   /// \param OI The OutputInfo for which Actions should be generated.
-  /// \param OFM The OutputFileMap for the compilation; used to find any
-  /// cross-build information.
   /// \param OutOfDateMap If present, information used to decide which files
   /// need to be rebuilt.
   /// \param C The Compilation to which Actions should be added.
   void buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
                     const ToolChain &TC, const OutputInfo &OI,
-                    const OutputFileMap *OFM, const InputInfoMap *OutOfDateMap,
+                    const InputInfoMap *OutOfDateMap,
                     Compilation &C) const;
 
   /// Construct the OutputFileMap for the driver from the given arguments.
@@ -331,7 +372,6 @@ private:
                          CommandOutput *Output) const;
 
   void chooseSwiftModuleOutputPath(Compilation &C,
-                                   const OutputFileMap *OFM,
                                    const TypeToPathMap *OutputMap,
                                    StringRef workingDirectory,
                                    CommandOutput *Output) const;
@@ -341,10 +381,21 @@ private:
                                       StringRef workingDirectory,
                                       CommandOutput *Output) const;
 
-  void chooseParseableInterfacePath(Compilation &C, const JobAction *JA,
-                                    StringRef workingDirectory,
-                                    llvm::SmallString<128> &buffer,
-                                    CommandOutput *output) const;
+  void chooseSwiftSourceInfoOutputPath(Compilation &C,
+                                       const TypeToPathMap *OutputMap,
+                                       StringRef workingDirectory,
+                                       CommandOutput *Output) const;
+
+  void chooseModuleInterfacePath(Compilation &C, const JobAction *JA,
+                                 StringRef workingDirectory,
+                                 llvm::SmallString<128> &buffer,
+                                 file_types::ID fileType,
+                                 CommandOutput *output) const;
+
+  void chooseModuleSummaryPath(Compilation &C, const TypeToPathMap *OutputMap,
+                               StringRef workingDirectory,
+                               llvm::SmallString<128> &Buf,
+                               CommandOutput *Output) const;
 
   void chooseRemappingOutputPath(Compilation &C, const TypeToPathMap *OutputMap,
                                  CommandOutput *Output) const;

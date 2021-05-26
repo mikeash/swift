@@ -1,4 +1,7 @@
 Name: ImportAsMember
+Classes:
+- Name: IAMPrivateChild
+  SwiftName: IAMPrivateParent.Child
 Globals:
 - Name: IAMStruct1APINoteVar
   SwiftName: Struct1.newApiNoteVar
@@ -12,6 +15,8 @@ Functions:
 Typedefs:
 - Name: IAMStruct1APINoteType
   SwiftName: Struct1.NewApiNoteType
+- Name: IAMBadInnerIntAPINotes
+  SwiftName: IAMNonexistent.Inner2
 SwiftVersions:
 - Version: 3
   Globals:

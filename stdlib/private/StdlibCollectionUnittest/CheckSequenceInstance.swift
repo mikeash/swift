@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -77,7 +77,7 @@ public func checkSequence<
   resiliencyChecks: CollectionMisuseResiliencyChecks = .all,
   sameValue: (Expected.Element, Expected.Element) -> Bool
 ) where S.Element == Expected.Element {
-  let expectedCount: Int = numericCast(expected.count)
+  let expectedCount: Int = expected.count
   checkIterator(
     expected, sequence.makeIterator(), message(),
   stackTrace: stackTrace.pushIf(showFrame, file: file, line: line),
@@ -87,32 +87,6 @@ public func checkSequence<
   expectGE(
     expectedCount, sequence.underestimatedCount, message(),
       stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
-
-  // Test `_copyContents(initializing:)` if we can do so without destroying the
-  // sequence.
-  _ = sequence._preprocessingPass { () -> Void in
-    var count = 0
-    for _ in sequence { count += 1 }
-    let ptr = UnsafeMutablePointer<S.Element>.allocate(capacity: count)
-    let buf = UnsafeMutableBufferPointer(start: ptr, count: count)
-    var (remainders,writtenUpTo) = sequence._copyContents(initializing: buf)
-    expectTrue(remainders.next() == nil,
-      "_copyContents returned unwritten elements")
-    expectTrue(writtenUpTo == buf.endIndex,
-      "_copyContents failed to use entire buffer")
-    expectEqualSequence(expected, buf, message(),
-      stackTrace: stackTrace.pushIf(showFrame, file: file, line: line), sameValue: sameValue)
-    ptr.deinitialize(count: count)
-    ptr.deallocate()
-  }
-
-  // Test `_copyToContiguousArray()` if we can do so
-  // without destroying the sequence.
-  _ = sequence._preprocessingPass { () -> Void in
-    let copy = sequence._copyToContiguousArray()
-    expectEqualSequence(expected, copy, message(),
-      stackTrace: stackTrace.pushIf(showFrame, file: file, line: line), sameValue: sameValue)
-  }
 }
 
 public func checkSequence<
@@ -196,7 +170,7 @@ public func checkSequence<
   resiliencyChecks: CollectionMisuseResiliencyChecks = .all,
   sameValue: (Element, Element) -> Bool
 ) where S.Element == Element {
-  let expectedCount: Int = numericCast(expected.count)
+  let expectedCount: Int = expected.count
   checkIterator(
     expected, sequence.makeIterator(), message(),
     stackTrace: stackTrace.pushIf(showFrame, file: file, line: line),
@@ -206,32 +180,6 @@ public func checkSequence<
   expectGE(
     expectedCount, sequence.underestimatedCount, message(),
     stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
-
-  // Test `_copyContents(initializing:)` if we can do so without destroying the
-  // sequence.
-  _ = sequence._preprocessingPass { () -> Void in
-    var count = 0
-    for _ in sequence { count += 1 }
-    let ptr = UnsafeMutablePointer<S.Element>.allocate(capacity: count)
-    let buf = UnsafeMutableBufferPointer(start: ptr, count: count)
-    var (remainders,writtenUpTo) = sequence._copyContents(initializing: buf)
-    expectTrue(remainders.next() == nil,
-      "_copyContents returned unwritten elements")
-    expectTrue(writtenUpTo == buf.endIndex,
-      "_copyContents failed to use entire buffer")
-    expectEqualSequence(expected, buf, message(),
-    stackTrace: stackTrace.pushIf(showFrame, file: file, line: line), sameValue: sameValue)
-    ptr.deinitialize(count: count)
-    ptr.deallocate()
-  }
-
-  // Test `_copyToContiguousArray()` if we can do so
-  // without destroying the sequence.
-  _ = sequence._preprocessingPass { () -> Void in
-    let copy = sequence._copyToContiguousArray()
-    expectEqualSequence(expected, copy, message(),
-    stackTrace: stackTrace.pushIf(showFrame, file: file, line: line), sameValue: sameValue)
-  }
 }
 
 public func checkSequence<

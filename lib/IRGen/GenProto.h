@@ -40,12 +40,14 @@ namespace swift {
 namespace irgen {
   class Address;
   class DynamicMetadataRequest;
+  class EntryPointArgumentEmission;
   class Explosion;
   class FunctionPointer;
   class IRGenFunction;
   class IRGenModule;
   class MetadataPath;
   class MetadataResponse;
+  class NativeCCEntryPointArgumentEmission;
   class ProtocolInfo;
   class TypeInfo;
 
@@ -64,8 +66,7 @@ namespace irgen {
 
   /// Extract the method pointer from an archetype's witness table
   /// as a function value.
-  FunctionPointer emitWitnessMethodValue(IRGenFunction &IGF,
-                                         CanType baseTy,
+  FunctionPointer emitWitnessMethodValue(IRGenFunction &IGF, CanType baseTy,
                                          llvm::Value **baseMetadataCache,
                                          SILDeclRef member,
                                          ProtocolConformanceRef conformance);
@@ -121,9 +122,10 @@ namespace irgen {
 
   /// Collect any required metadata for a witness method from the end
   /// of the given parameter list.
-  void collectTrailingWitnessMetadata(IRGenFunction &IGF, SILFunction &fn,
-                                      Explosion &params,
-                                      WitnessMetadata &metadata);
+  void
+  collectTrailingWitnessMetadata(IRGenFunction &IGF, SILFunction &fn,
+                                 NativeCCEntryPointArgumentEmission &params,
+                                 WitnessMetadata &metadata);
 
   using GetParameterFn = llvm::function_ref<llvm::Value*(unsigned)>;
 
@@ -132,12 +134,11 @@ namespace irgen {
   ///
   /// \param witnessMetadata - can be omitted if the function is
   ///   definitely not a witness method
-  void emitPolymorphicParameters(IRGenFunction &IGF,
-                                 SILFunction &Fn,
-                                 Explosion &args,
+  void emitPolymorphicParameters(IRGenFunction &IGF, SILFunction &Fn,
+                                 EntryPointArgumentEmission &emission,
                                  WitnessMetadata *witnessMetadata,
                                  const GetParameterFn &getParameter);
- 
+
   void emitPolymorphicParametersFromArray(IRGenFunction &IGF,
                                           NominalTypeDecl *typeDecl,
                                           Address array,
@@ -157,7 +158,7 @@ namespace irgen {
                                 CanSILFunctionType &SubstFnType,
                                 Explosion &nativeParam, unsigned paramIndex);
 
-  /// \brief Load a reference to the protocol descriptor for the given protocol.
+  /// Load a reference to the protocol descriptor for the given protocol.
   ///
   /// For Swift protocols, this is a constant reference to the protocol
   /// descriptor symbol.
@@ -176,26 +177,6 @@ namespace irgen {
   llvm::Value *emitWitnessTableRef(IRGenFunction &IGF,
                                    CanType srcType,
                                    ProtocolConformanceRef conformance);
-
-  /// An entry in a list of known protocols.
-  class ProtocolEntry {
-    ProtocolDecl *Protocol;
-    const ProtocolInfo &Impl;
-
-  public:
-    explicit ProtocolEntry(ProtocolDecl *proto, const ProtocolInfo &impl)
-      : Protocol(proto), Impl(impl) {}
-
-    ProtocolDecl *getProtocol() const { return Protocol; }
-    const ProtocolInfo &getInfo() const { return Impl; }
-  };
-
-  using GetWitnessTableFn =
-    llvm::function_ref<llvm::Value*(unsigned originIndex)>;
-  llvm::Value *emitImpliedWitnessTableRef(IRGenFunction &IGF,
-                                          ArrayRef<ProtocolEntry> protos,
-                                          ProtocolDecl *target,
-                                    const GetWitnessTableFn &getWitnessTable);
 
   class MetadataSource {
   public:
@@ -256,9 +237,6 @@ namespace irgen {
   void enumerateGenericParamFulfillments(IRGenModule &IGM,
     CanSILFunctionType fnType,
     GenericParamFulfillmentCallback callback);
-
-  bool isDependentConformance(const NormalProtocolConformance *conformance);
-
 } // end namespace irgen
 } // end namespace swift
 

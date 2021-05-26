@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -96,9 +96,9 @@
 ///   `Stride` type's implementations. If a type conforming to `Strideable` is
 ///   its own `Stride` type, it must provide concrete implementations of the
 ///   two operators to avoid infinite recursion.
-public protocol Strideable : Comparable {
+public protocol Strideable: Comparable {
   /// A type that represents the distance between two values.
-  associatedtype Stride : SignedNumeric, Comparable
+  associatedtype Stride: SignedNumeric, Comparable
 
   /// Returns the distance from this value to the given value, expressed as a 
   /// stride.
@@ -121,7 +121,7 @@ public protocol Strideable : Comparable {
   /// the addition operator (`+`) instead of this method.
   ///
   ///     func addOne<T: Strideable>(to x: T) -> T
-  ///         where T.Stride : ExpressibleByIntegerLiteral
+  ///         where T.Stride: ExpressibleByIntegerLiteral
   ///     {
   ///         return x.advanced(by: 1)
   ///     }
@@ -134,7 +134,9 @@ public protocol Strideable : Comparable {
   /// If this type's `Stride` type conforms to `BinaryInteger`, then for a
   /// value `x`, a distance `n`, and a value `y = x.advanced(by: n)`,
   /// `x.distance(to: y) == n`. Using this method with types that have a
-  /// noninteger `Stride` may result in an approximation.
+  /// noninteger `Stride` may result in an approximation. If the result of
+  /// advancing by `n` is not representable as a value of this type, then a
+  /// runtime error may occur.
   ///
   /// - Parameter n: The distance to advance this value.
   /// - Returns: A value that is offset from this value by `n`.
@@ -142,7 +144,58 @@ public protocol Strideable : Comparable {
   /// - Complexity: O(1)
   func advanced(by n: Stride) -> Self
 
-  /// `_step` is an implementation detail of Strideable; do not use it directly.
+  /// Returns the next result of striding by a specified distance.
+  ///
+  /// This method is an implementation detail of `Strideable`; do not call it
+  /// directly.
+  ///
+  /// While striding, `_step(after:from:by:)` is called at each step to
+  /// determine the next result. At the first step, the value of `current` is
+  /// `(index: 0, value: start)`. At each subsequent step, the value of
+  /// `current` is the result returned by this method in the immediately
+  /// preceding step.
+  ///
+  /// If the result of advancing by a given `distance` is not representable as a
+  /// value of this type, then a runtime error may occur.
+  ///
+  /// Implementing `_step(after:from:by:)` to Customize Striding Behavior
+  /// ===================================================================
+  ///
+  /// The default implementation of this method calls `advanced(by:)` to offset
+  /// `current.value` by a specified `distance`. No attempt is made to count the
+  /// number of prior steps, and the result's `index` is always `nil`.
+  ///
+  /// To avoid incurring runtime errors that arise from advancing past
+  /// representable bounds, a conforming type can signal that the result of
+  /// advancing by a given `distance` is not representable by using `Int.min` as
+  /// a sentinel value for the result's `index`. In that case, the result's
+  /// `value` must be either the minimum representable value of this type if
+  /// `distance` is less than zero or the maximum representable value of this
+  /// type otherwise. Fixed-width integer types make use of arithmetic
+  /// operations reporting overflow to implement this customization.
+  ///
+  /// A conforming type may use any positive value for the result's `index` as
+  /// an opaque state that is private to that type. For example, floating-point
+  /// types increment `index` with each step so that the corresponding `value`
+  /// can be computed by multiplying the number of steps by the specified
+  /// `distance`. Serially calling `advanced(by:)` would accumulate
+  /// floating-point rounding error at each step, which is avoided by this
+  /// customization.
+  ///
+  /// - Parameters:
+  ///   - current: The result returned by this method in the immediately
+  ///     preceding step while striding, or `(index: 0, value: start)` if there
+  ///     have been no preceding steps.
+  ///   - start: The starting value used for the striding sequence.
+  ///   - distance: The amount to step by with each iteration of the striding
+  ///     sequence.
+  /// - Returns: A tuple of `index` and `value`; `index` may be `nil`, any
+  ///   positive value as an opaque state private to the conforming type, or
+  ///   `Int.min` to signal that the notional result of advancing by `distance`
+  ///   is unrepresentable, and `value` is the next result after `current.value`
+  ///   while striding from `start` by `distance`.
+  ///
+  /// - Complexity: O(1)
   static func _step(
     after current: (index: Int?, value: Self),
     from start: Self, by distance: Self.Stride
@@ -171,7 +224,40 @@ extension Strideable {
   }
 }
 
-extension Strideable where Stride : FloatingPoint {
+extension Strideable where Self: FixedWidthInteger & SignedInteger {
+  @_alwaysEmitIntoClient
+  public static func _step(
+    after current: (index: Int?, value: Self),
+    from start: Self, by distance: Self.Stride
+  ) -> (index: Int?, value: Self) {
+    let value = current.value
+    let (partialValue, overflow) =
+      Self.bitWidth >= Self.Stride.bitWidth ||
+        (value < (0 as Self)) == (distance < (0 as Self.Stride))
+          ? value.addingReportingOverflow(Self(distance))
+          : (Self(Self.Stride(value) + distance), false)
+    return overflow
+      ? (.min, distance < (0 as Self.Stride) ? .min : .max)
+      : (nil, partialValue)
+  }
+}
+
+extension Strideable where Self: FixedWidthInteger & UnsignedInteger {
+  @_alwaysEmitIntoClient
+  public static func _step(
+    after current: (index: Int?, value: Self),
+    from start: Self, by distance: Self.Stride
+  ) -> (index: Int?, value: Self) {
+    let (partialValue, overflow) = distance < (0 as Self.Stride)
+      ? current.value.subtractingReportingOverflow(Self(-distance))
+      : current.value.addingReportingOverflow(Self(distance))
+    return overflow
+      ? (.min, distance < (0 as Self.Stride) ? .min : .max)
+      : (nil, partialValue)
+  }
+}
+
+extension Strideable where Stride: FloatingPoint {
   @inlinable // protocol-only
   public static func _step(
     after current: (index: Int?, value: Self),
@@ -186,7 +272,7 @@ extension Strideable where Stride : FloatingPoint {
   }
 }
 
-extension Strideable where Self : FloatingPoint, Self == Stride {
+extension Strideable where Self: FloatingPoint, Self == Stride {
   @inlinable // protocol-only
   public static func _step(
     after current: (index: Int?, value: Self),
@@ -203,8 +289,8 @@ extension Strideable where Self : FloatingPoint, Self == Stride {
 }
 
 /// An iterator for a `StrideTo` instance.
-@_fixed_layout
-public struct StrideToIterator<Element : Strideable> {
+@frozen
+public struct StrideToIterator<Element: Strideable> {
   @usableFromInline
   internal let _start: Element
 
@@ -246,8 +332,8 @@ extension StrideToIterator: IteratorProtocol {
 /// A sequence of values formed by striding over a half-open interval.
 ///
 /// Use the `stride(from:to:by:)` function to create `StrideTo` instances.
-@_fixed_layout
-public struct StrideTo<Element : Strideable> {
+@frozen
+public struct StrideTo<Element: Strideable> {
   @usableFromInline
   internal let _start: Element
 
@@ -290,13 +376,6 @@ extension StrideTo: Sequence {
   }
 
   @inlinable
-  public func _preprocessingPass<R>(
-    _ preprocess: () throws -> R
-  ) rethrows -> R? {
-    return try preprocess()
-  }
-
-  @inlinable
   public func _customContainsEquatableElement(
     _ element: Element
   ) -> Bool? {
@@ -315,8 +394,8 @@ extension StrideTo: CustomReflectable {
 
 // FIXME(conditional-conformances): This does not yet compile (SR-6474).
 #if false
-extension StrideTo : RandomAccessCollection
-where Element.Stride : BinaryInteger {
+extension StrideTo: RandomAccessCollection
+where Element.Stride: BinaryInteger {
   public typealias Index = Int
   public typealias SubSequence = Slice<StrideTo<Element>>
   public typealias Indices = Range<Int>
@@ -411,8 +490,8 @@ public func stride<T>(
 }
 
 /// An iterator for a `StrideThrough` instance.
-@_fixed_layout
-public struct StrideThroughIterator<Element : Strideable> {
+@frozen
+public struct StrideThroughIterator<Element: Strideable> {
   @usableFromInline
   internal let _start: Element
 
@@ -446,10 +525,13 @@ extension StrideThroughIterator: IteratorProtocol {
   public mutating func next() -> Element? {
     let result = _current.value
     if _stride > 0 ? result >= _end : result <= _end {
-      // This check is needed because if we just changed the above operators
-      // to > and <, respectively, we might advance current past the end
-      // and throw it out of bounds (e.g. above Int.max) unnecessarily.
-      if result == _end && !_didReturnEnd {
+      // Note the `>=` and `<=` operators above. When `result == _end`, the
+      // following check is needed to prevent advancing `_current` past the
+      // representable bounds of the `Strideable` type unnecessarily.
+      //
+      // If the `Strideable` type is a fixed-width integer, overflowed results
+      // are represented using a sentinel value for `_current.index`, `Int.min`.
+      if result == _end && !_didReturnEnd && _current.index != .min {
         _didReturnEnd = true
         return result
       }
@@ -465,7 +547,7 @@ extension StrideThroughIterator: IteratorProtocol {
 ///
 /// Use the `stride(from:through:by:)` function to create `StrideThrough` 
 /// instances.
-@_fixed_layout
+@frozen
 public struct StrideThrough<Element: Strideable> {
   @usableFromInline
   internal let _start: Element
@@ -505,13 +587,6 @@ extension StrideThrough: Sequence {
   }
 
   @inlinable
-  public func _preprocessingPass<R>(
-    _ preprocess: () throws -> R
-  ) rethrows -> R? {
-    return try preprocess()
-  }
-
-  @inlinable
   public func _customContainsEquatableElement(
     _ element: Element
   ) -> Bool? {
@@ -531,8 +606,8 @@ extension StrideThrough: CustomReflectable {
 
 // FIXME(conditional-conformances): This does not yet compile (SR-6474).
 #if false
-extension StrideThrough : RandomAccessCollection
-where Element.Stride : BinaryInteger {
+extension StrideThrough: RandomAccessCollection
+where Element.Stride: BinaryInteger {
   public typealias Index = ClosedRangeIndex<Int>
   public typealias SubSequence = Slice<StrideThrough<Element>>
 
@@ -654,3 +729,12 @@ public func stride<T>(
 ) -> StrideThrough<T> {
   return StrideThrough(_start: start, end: end, stride: stride)
 }
+
+extension StrideToIterator: Sendable
+  where Element: Sendable, Element.Stride: Sendable { }
+extension StrideTo: Sendable
+  where Element: Sendable, Element.Stride: Sendable { }
+extension StrideThroughIterator: Sendable
+  where Element: Sendable, Element.Stride: Sendable { }
+extension StrideThrough: Sendable
+  where Element: Sendable, Element.Stride: Sendable { }

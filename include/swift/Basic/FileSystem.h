@@ -23,7 +23,7 @@ namespace llvm {
   class Twine;
 }
 
-namespace clang {
+namespace llvm {
   namespace vfs {
     class FileSystem;
   }
@@ -56,11 +56,32 @@ namespace swift {
   std::error_code moveFileIfDifferent(const llvm::Twine &source,
                                       const llvm::Twine &destination);
 
+  enum class FileDifference : uint8_t {
+    /// The source and destination paths refer to the exact same file.
+    IdenticalFile,
+    /// The source and destination paths refer to separate files with identical
+    /// contents.
+    SameContents,
+    /// The source and destination paths refer to separate files with different
+    /// contents.
+    DifferentContents
+  };
+
+  /// Compares the files at \p source and \p destination to determine if they
+  /// are the exact same files, different files with the same contents, or
+  /// different files with different contents. If \p allowDestinationErrors is
+  /// set, file system errors relating to the \p destination file return a
+  /// \c DifferentFile result, rather than an error.
+  llvm::ErrorOr<FileDifference>
+  areFilesDifferent(const llvm::Twine &source, const llvm::Twine &destination,
+                    bool allowDestinationErrors);
+
   namespace vfs {
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>
-    getFileOrSTDIN(clang::vfs::FileSystem &FS,
+    getFileOrSTDIN(llvm::vfs::FileSystem &FS,
                    const llvm::Twine &Name, int64_t FileSize = -1,
-                   bool RequiresNullTerminator = true, bool IsVolatile = false);
+                   bool RequiresNullTerminator = true, bool IsVolatile = false,
+                   unsigned BADFRetry = 0);
   } // end namespace vfs
 
 } // end namespace swift

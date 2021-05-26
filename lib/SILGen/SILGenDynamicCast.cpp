@@ -101,10 +101,12 @@ namespace {
       ManagedValue result;
       if (Strategy == CastStrategy::Address) {
         result = SGF.B.createUnconditionalCheckedCastValue(
-            Loc, operand, origTargetTL.getLoweredType());
+            Loc, operand, SourceType,
+            origTargetTL.getLoweredType(), TargetType);
       } else {
         result = SGF.B.createUnconditionalCheckedCast(
-            Loc, operand, origTargetTL.getLoweredType());
+            Loc, operand,
+            origTargetTL.getLoweredType(), TargetType);
       }
 
       return RValue(SGF, Loc, TargetType,
@@ -147,7 +149,9 @@ namespace {
         // Opaque value mode
         operandValue = std::move(operand);
         SGF.B.createCheckedCastValueBranch(
-            Loc, operandValue, origTargetTL.getLoweredType(), trueBB, falseBB);
+            Loc, operandValue, SourceType,
+            origTargetTL.getLoweredType(), TargetType,
+            trueBB, falseBB);
       } else {
         // Tolerate being passed an address here.  It comes up during switch
         // emission.
@@ -162,14 +166,14 @@ namespace {
           operandValue = operandValue.borrow(SGF, Loc);
         }
         SGF.B.createCheckedCastBranch(Loc, /*exact*/ false, operandValue,
-                                      origTargetTL.getLoweredType(), trueBB,
-                                      falseBB, TrueCount, FalseCount);
+                                      origTargetTL.getLoweredType(), TargetType,
+                                      trueBB, falseBB, TrueCount, FalseCount);
       }
 
       // Emit the success block.
       SGF.B.setInsertionPoint(trueBB);
       {
-        FullExpr scope(SGF.Cleanups, CleanupLocation::get(Loc));
+        FullExpr scope(SGF.Cleanups, CleanupLocation(Loc));
 
         ManagedValue result;
         if (Strategy == CastStrategy::Address &&
@@ -181,7 +185,7 @@ namespace {
           // argument.
           ManagedValue argument;
           if (!shouldTakeOnSuccess(consumption)) {
-            argument = SGF.B.createGuaranteedPhiArgument(
+            argument = SGF.B.createGuaranteedTransformingTerminatorArgument(
                 origTargetTL.getLoweredType());
           } else {
             argument =
@@ -198,7 +202,7 @@ namespace {
       // Emit the failure block.
       SGF.B.setInsertionPoint(falseBB);
       {
-        FullExpr scope(SGF.Cleanups, CleanupLocation::get(Loc));
+        FullExpr scope(SGF.Cleanups, CleanupLocation(Loc));
 
         // If we have an address only type, do not handle the consumption
         // rules. These are handled for us by the user.
@@ -220,7 +224,7 @@ namespace {
         // the false case, our user must treat the taken value as a new value.
         if (shouldDestroyOnFailure(consumption)) {
           {
-            FullExpr argScope(SGF.Cleanups, CleanupLocation::get(Loc));
+            FullExpr argScope(SGF.Cleanups, CleanupLocation(Loc));
             SGF.B.createOwnedPhiArgument(operandValue.getType());
           }
           handleFalse(None);
@@ -232,7 +236,8 @@ namespace {
         switch (consumption) {
         case CastConsumptionKind::BorrowAlways:
         case CastConsumptionKind::CopyOnSuccess:
-          SGF.B.createGuaranteedPhiArgument(operandValue.getType());
+          SGF.B.createGuaranteedTransformingTerminatorArgument(
+              operandValue.getType());
           handleFalse(None);
           break;
         case CastConsumptionKind::TakeAlways:
@@ -346,16 +351,15 @@ static RValue emitCollectionDowncastExpr(SILGenFunction &SGF,
   auto fromCollection = sourceType->getCanonicalType();
   auto toCollection = destType->getCanonicalType();
   // Get the intrinsic function.
-  auto &ctx = SGF.getASTContext();
   FuncDecl *fn = nullptr;
-  if (fromCollection->getAnyNominal() == ctx.getArrayDecl()) {
+  if (fromCollection->isArray()) {
     fn = conditional ? SGF.SGM.getArrayConditionalCast(loc)
                      : SGF.SGM.getArrayForceCast(loc);
-  } else if (fromCollection->getAnyNominal() == ctx.getDictionaryDecl()) {
+  } else if (fromCollection->isDictionary()) {
     fn = (conditional
            ? SGF.SGM.getDictionaryDownCastConditional(loc)
            : SGF.SGM.getDictionaryDownCast(loc));
-  } else if (fromCollection->getAnyNominal() == ctx.getSetDecl()) {
+  } else if (fromCollection->isSet()) {
     fn = (conditional
            ? SGF.SGM.getSetDownCastConditional(loc)
            : SGF.SGM.getSetDownCast(loc));
@@ -480,7 +484,7 @@ RValue Lowering::emitConditionalCheckedCast(
   }
 
   // Prepare a jump destination here.
-  ExitableFullExpr scope(SGF, CleanupLocation::get(loc));
+  ExitableFullExpr scope(SGF, CleanupLocation(loc));
 
   auto operandCMV = ConsumableManagedValue::forOwned(operand);
   assert(operandCMV.getFinalConsumption() == CastConsumptionKind::TakeAlways);
@@ -536,7 +540,7 @@ RValue Lowering::emitConditionalCheckedCast(
     result = SGF.manageBufferForExprResult(resultBuffer, resultTL, C);
   } else {
     auto argument = contBlock->createPhiArgument(resultTL.getLoweredType(),
-                                                 ValueOwnershipKind::Owned);
+                                                 OwnershipKind::Owned);
     result = SGF.emitManagedRValueWithCleanup(argument, resultTL);
   }
 
@@ -570,7 +574,7 @@ SILValue Lowering::emitIsa(SILGenFunction &SGF, SILLocation loc,
   }
 
   // Prepare a jump destination here.
-  ExitableFullExpr scope(SGF, CleanupLocation::get(loc));
+  ExitableFullExpr scope(SGF, CleanupLocation(loc));
 
   auto i1Ty = SILType::getBuiltinIntegerType(1, SGF.getASTContext());
 
@@ -588,7 +592,7 @@ SILValue Lowering::emitIsa(SILGenFunction &SGF, SILLocation loc,
       });
 
   auto contBB = scope.exit();
-  auto isa = contBB->createPhiArgument(i1Ty, ValueOwnershipKind::Trivial);
+  auto isa = contBB->createPhiArgument(i1Ty, OwnershipKind::None);
   return isa;
 }
 

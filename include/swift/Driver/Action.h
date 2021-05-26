@@ -17,7 +17,6 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Driver/Util.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Chrono.h"
@@ -47,13 +46,15 @@ public:
     ModuleWrapJob,
     AutolinkExtractJob,
     REPLJob,
-    LinkJob,
+    DynamicLinkJob,
+    StaticLinkJob,
     GenerateDSYMJob,
     VerifyDebugInfoJob,
     GeneratePCHJob,
+    VerifyModuleInterfaceJob,
 
     JobFirst = CompileJob,
-    JobLast = GeneratePCHJob
+    JobLast = VerifyModuleInterfaceJob
   };
 
   static const char *getClassName(Kind AC);
@@ -126,16 +127,31 @@ public:
   }
 };
 
-class CompileJobAction : public JobAction {
+class IncrementalJobAction : public JobAction {
 public:
   struct InputInfo {
-    enum Status {
+    /// The status of an input known to the driver. These are used to affect
+    /// the scheduling decisions made during an incremental build.
+    ///
+    /// \Note The order of cases matters. They are ordered from least to
+    /// greatest impact on the incremental build schedule.
+    enum class Status {
+      /// The input to this job is up to date.
       UpToDate,
-      NeedsCascadingBuild,
+      /// The input to this job has changed in a way that requires this job to
+      /// be rerun, but not in such a way that it requires a cascading rebuild.
       NeedsNonCascadingBuild,
+      /// The input to this job has changed in a way that requires this job to
+      /// be rerun, and in such a way that all jobs dependent upon this one
+      /// must be scheduled as well.
+      NeedsCascadingBuild,
+      /// The input to this job was not known to the driver when it was last
+      /// run.
       NewlyAdded
     };
-    Status status = UpToDate;
+
+  public:
+    Status status = Status::UpToDate;
     llvm::sys::TimePoint<> previousModTime;
 
     InputInfo() = default;
@@ -143,35 +159,74 @@ public:
         : status(stat), previousModTime(time) {}
 
     static InputInfo makeNewlyAdded() {
-      return InputInfo(Status::NewlyAdded, llvm::sys::TimePoint<>::max());
+      return {Status::NewlyAdded, llvm::sys::TimePoint<>::max()};
+    }
+
+    static InputInfo makeNeedsCascadingRebuild() {
+      return {Status::NeedsCascadingBuild, llvm::sys::TimePoint<>::min()};
     }
   };
 
 private:
-  virtual void anchor();
+  virtual void anchor() override;
   InputInfo inputInfo;
 
 public:
-  CompileJobAction(file_types::ID OutputType)
-      : JobAction(Action::Kind::CompileJob, None, OutputType),
-        inputInfo() {}
+  IncrementalJobAction(Kind Kind, ArrayRef<const Action *> Inputs,
+                       file_types::ID Type, InputInfo info)
+      : JobAction(Kind, Inputs, Type), inputInfo(info) {}
 
-  CompileJobAction(Action *Input, file_types::ID OutputType, InputInfo info)
-      : JobAction(Action::Kind::CompileJob, Input, OutputType),
-        inputInfo(info) {}
-
+public:
   InputInfo getInputInfo() const {
     return inputInfo;
   }
 
+public:
+  static bool classof(const Action *A) {
+    return A->getKind() == Action::Kind::CompileJob ||
+           A->getKind() == Action::Kind::MergeModuleJob;
+  }
+};
+
+class CompileJobAction : public IncrementalJobAction {
+private:
+  virtual void anchor() override;
+
+public:
+  CompileJobAction(file_types::ID OutputType)
+      : IncrementalJobAction(Action::Kind::CompileJob, None, OutputType, {}) {}
+  CompileJobAction(Action *Input, file_types::ID OutputType, InputInfo info)
+      : IncrementalJobAction(Action::Kind::CompileJob, Input, OutputType,
+                             info) {}
+
   static bool classof(const Action *A) {
     return A->getKind() == Action::Kind::CompileJob;
+  }
+
+  /// Return a _single_ TY_Swift InputAction, if one exists;
+  /// if 0 or >1 such inputs exist, return nullptr.
+  const InputAction *findSingleSwiftInput() const {
+    auto Inputs = getInputs();
+    const InputAction *IA = nullptr;
+    for (auto const *I : Inputs) {
+      if (auto const *S = dyn_cast<InputAction>(I)) {
+        if (S->getType() == file_types::TY_Swift) {
+          if (IA == nullptr) {
+            IA = S;
+          } else {
+            // Already found one, two is too many.
+            return nullptr;
+          }
+        }
+      }
+    }
+    return IA;
   }
 };
 
 class InterpretJobAction : public JobAction {
 private:
-  virtual void anchor();
+  virtual void anchor() override;
 
 public:
   explicit InterpretJobAction()
@@ -185,7 +240,7 @@ public:
 
 class BackendJobAction : public JobAction {
 private:
-  virtual void anchor();
+  virtual void anchor() override;
   
   // In case of multi-threaded compilation, the compile-action produces multiple
   // output bitcode-files. For each bitcode-file a BackendJobAction is created.
@@ -200,7 +255,7 @@ public:
     return A->getKind() == Action::Kind::BackendJob;
   }
   
-  virtual size_t getInputIndex() const { return InputIndex; }
+  virtual size_t getInputIndex() const override { return InputIndex; }
 };
 
 class REPLJobAction : public JobAction {
@@ -211,7 +266,7 @@ public:
     RequireLLDB
   };
 private:
-  virtual void anchor();
+  virtual void anchor() override;
   Mode RequestedMode;
 public:
   REPLJobAction(Mode mode)
@@ -226,12 +281,12 @@ public:
   }
 };
 
-class MergeModuleJobAction : public JobAction {
-  virtual void anchor();
+class MergeModuleJobAction : public IncrementalJobAction {
+  virtual void anchor() override;
 public:
-  MergeModuleJobAction(ArrayRef<const Action *> Inputs)
-      : JobAction(Action::Kind::MergeModuleJob, Inputs,
-                  file_types::TY_SwiftModuleFile) {}
+  MergeModuleJobAction(ArrayRef<const Action *> Inputs, InputInfo input)
+      : IncrementalJobAction(Action::Kind::MergeModuleJob, Inputs,
+                             file_types::TY_SwiftModuleFile, input) {}
 
   static bool classof(const Action *A) {
     return A->getKind() == Action::Kind::MergeModuleJob;
@@ -239,7 +294,7 @@ public:
 };
 
 class ModuleWrapJobAction : public JobAction {
-  virtual void anchor();
+  virtual void anchor() override;
 public:
   ModuleWrapJobAction(ArrayRef<const Action *> Inputs)
       : JobAction(Action::Kind::ModuleWrapJob, Inputs,
@@ -251,7 +306,7 @@ public:
 };
 
 class AutolinkExtractJobAction : public JobAction {
-  virtual void anchor();
+  virtual void anchor() override;
 public:
   AutolinkExtractJobAction(ArrayRef<const Action *> Inputs)
       : JobAction(Action::Kind::AutolinkExtractJob, Inputs,
@@ -263,7 +318,7 @@ public:
 };
 
 class GenerateDSYMJobAction : public JobAction {
-  virtual void anchor();
+  virtual void anchor() override;
 public:
   explicit GenerateDSYMJobAction(const Action *Input)
       : JobAction(Action::Kind::GenerateDSYMJob, Input,
@@ -275,7 +330,7 @@ public:
 };
 
 class VerifyDebugInfoJobAction : public JobAction {
-  virtual void anchor();
+  virtual void anchor() override;
 public:
   explicit VerifyDebugInfoJobAction(const Action *Input)
       : JobAction(Action::Kind::VerifyDebugInfoJob, Input,
@@ -289,7 +344,7 @@ public:
 class GeneratePCHJobAction : public JobAction {
   std::string PersistentPCHDir;
 
-  virtual void anchor();
+  virtual void anchor() override;
 public:
   GeneratePCHJobAction(const Action *Input, StringRef persistentPCHDir)
       : JobAction(Action::Kind::GeneratePCHJob, Input,
@@ -305,21 +360,59 @@ public:
   }
 };
 
-class LinkJobAction : public JobAction {
-  virtual void anchor();
+class DynamicLinkJobAction : public JobAction {
+  virtual void anchor() override;
   LinkKind Kind;
+  bool ShouldPerformLTO;
 
 public:
-  LinkJobAction(ArrayRef<const Action *> Inputs, LinkKind K)
-      : JobAction(Action::Kind::LinkJob, Inputs, file_types::TY_Image),
-        Kind(K) {
-    assert(Kind != LinkKind::None);
+  DynamicLinkJobAction(ArrayRef<const Action *> Inputs, LinkKind K,
+                       bool ShouldPerformLTO)
+      : JobAction(Action::Kind::DynamicLinkJob, Inputs, file_types::TY_Image),
+        Kind(K), ShouldPerformLTO(ShouldPerformLTO) {
+    assert(Kind != LinkKind::None && Kind != LinkKind::StaticLibrary);
   }
 
   LinkKind getKind() const { return Kind; }
 
+  bool shouldPerformLTO() const { return ShouldPerformLTO; }
+
   static bool classof(const Action *A) {
-    return A->getKind() == Action::Kind::LinkJob;
+    return A->getKind() == Action::Kind::DynamicLinkJob;
+  }
+};
+
+class StaticLinkJobAction : public JobAction {
+  virtual void anchor() override;
+
+public:
+  StaticLinkJobAction(ArrayRef<const Action *> Inputs, LinkKind K)
+      : JobAction(Action::Kind::StaticLinkJob, Inputs, file_types::TY_Image) {
+    assert(K == LinkKind::StaticLibrary);
+  }
+
+  static bool classof(const Action *A) {
+    return A->getKind() == Action::Kind::StaticLinkJob;
+  }
+};
+
+class VerifyModuleInterfaceJobAction : public JobAction {
+  virtual void anchor() override;
+  file_types::ID inputType;
+
+public:
+  VerifyModuleInterfaceJobAction(const Action * ModuleEmitter,
+                                 file_types::ID inputType)
+    : JobAction(Action::Kind::VerifyModuleInterfaceJob, { ModuleEmitter },
+                file_types::TY_Nothing), inputType(inputType) {
+    assert(inputType == file_types::TY_SwiftModuleInterfaceFile ||
+           inputType == file_types::TY_PrivateSwiftModuleInterfaceFile);
+  }
+
+  file_types::ID getInputType() const { return inputType; }
+
+  static bool classof(const Action *A) {
+    return A->getKind() == Action::Kind::VerifyModuleInterfaceJob;
   }
 };
 

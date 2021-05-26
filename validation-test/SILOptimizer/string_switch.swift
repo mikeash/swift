@@ -3,7 +3,8 @@
 // RUN: %target-run %t.out
 // REQUIRES: swift_stdlib_no_asserts,optimized_stdlib
 // REQUIRES: stress_test
-// UNSUPPORTED: nonatomic_rc
+// REQUIRES: executable_test
+// UNSUPPORTED: single_threaded_runtime
 
 import StdlibUnittest
 

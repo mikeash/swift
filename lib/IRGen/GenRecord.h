@@ -18,6 +18,7 @@
 #ifndef SWIFT_IRGEN_GENRECORD_H
 #define SWIFT_IRGEN_GENRECORD_H
 
+#include "BitPatternBuilder.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "Explosion.h"
@@ -82,6 +83,10 @@ public:
   ElementLayout::Kind getKind() const {
     return Layout.getKind();
   }
+
+  bool hasFixedByteOffset() const {
+    return Layout.hasByteOffset();
+  }
   
   Size getFixedByteOffset() const {
     return Layout.getByteOffset();
@@ -141,6 +146,10 @@ public:
     size_t size = Impl::template totalSizeToAlloc<FieldImpl>(fields.size());
     void *buffer = ::operator new(size);
     return new(buffer) Impl(fields, std::forward<As>(args)...);
+  }
+
+  bool areFieldsABIAccessible() const {
+    return AreFieldsABIAccessible;
   }
 
   ArrayRef<FieldImpl> getFields() const {
@@ -234,11 +243,10 @@ public:
                           SILType T, bool isOutlined) const override {
     // If we're bitwise-takable, use memcpy.
     if (this->isBitwiseTakable(ResilienceExpansion::Maximal)) {
-      IGF.Builder.CreateMemCpy(dest.getAddress(),
-                               dest.getAlignment().getValue(),
-                               src.getAddress(),
-                               src.getAlignment().getValue(),
-                 asImpl().Impl::getSize(IGF, T));
+      IGF.Builder.CreateMemCpy(
+          dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+          src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+          asImpl().Impl::getSize(IGF, T));
       return;
     }
 
@@ -303,21 +311,17 @@ public:
   llvm::Value *withExtraInhabitantProvidingField(IRGenFunction &IGF,
          Address structAddr,
          SILType structType,
-         bool isOutlined,
+         llvm::Value *knownStructNumXI,
          llvm::Type *resultTy,
-         llvm::function_ref<llvm::Value* (const FieldImpl &field)> body,
-         llvm::function_ref<llvm::Value* ()> outline) const {
+         llvm::function_ref<llvm::Value* (const FieldImpl &field,
+                                          llvm::Value *numXI)> body) const {
     // If we know one field consistently provides extra inhabitants, delegate
     // to that field.
     if (auto field = asImpl().getFixedExtraInhabitantProvidingField(IGF.IGM)){
-      return body(*field);
+      return body(*field, knownStructNumXI);
     }
     
     // Otherwise, we have to figure out which field at runtime.
-    // The decision tree could be rather large, so invoke the value witness
-    // unless we're emitting the value witness.
-    if (!isOutlined)
-      return outline();
 
     // The number of extra inhabitants the instantiated type has can be used
     // to figure out which field the runtime chose. The runtime uses the same
@@ -351,7 +355,9 @@ public:
     // Loop through checking to see whether we picked the fixed candidate
     // (if any) or one of the unknown-layout fields.
     llvm::Value *instantiatedCount
-      = emitLoadOfExtraInhabitantCount(IGF, structType);
+      = (knownStructNumXI
+           ? knownStructNumXI
+           : emitLoadOfExtraInhabitantCount(IGF, structType));
     
     auto contBB = IGF.createBasicBlock("chose_field_for_xi");
     llvm::PHINode *contPhi = nullptr;
@@ -376,7 +382,7 @@ public:
         if (&field != fixedCandidate)
           continue;
         
-        fieldCount = llvm::ConstantInt::get(IGF.IGM.SizeTy, fixedCount);
+        fieldCount = IGF.IGM.getInt32(fixedCount);
       } else {
         auto fieldTy = field.getType(IGF.IGM, structType);
         // If this field has the same type as a field we already tested,
@@ -395,7 +401,7 @@ public:
       IGF.Builder.CreateCondBr(equalsCount, yesBB, noBB);
       
       IGF.Builder.emitBlock(yesBB);
-      auto value = body(field);
+      auto value = body(field, instantiatedCount);
       if (contPhi)
         contPhi->addIncoming(value, IGF.Builder.GetInsertBlock());
       IGF.Builder.CreateBr(contBB);
@@ -414,46 +420,6 @@ public:
     return contPhi;
   }
 
-  llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
-                                       Address structAddr,
-                                       SILType structType,
-                                       bool isOutlined) const override {
-    return withExtraInhabitantProvidingField(IGF, structAddr, structType,
-                                             isOutlined,
-                                             IGF.IGM.Int32Ty,
-      [&](const FieldImpl &field) -> llvm::Value* {
-        Address fieldAddr = asImpl().projectFieldAddress(
-                                            IGF, structAddr, structType, field);
-        return field.getTypeInfo().getExtraInhabitantIndex(IGF, fieldAddr,
-                                         field.getType(IGF.IGM, structType),
-                                         false /*not outlined for field*/);
-      },
-      [&]() -> llvm::Value * {
-        return emitGetExtraInhabitantIndexCall(IGF, structType, structAddr);
-      });
-  }
-
-  void storeExtraInhabitant(IRGenFunction &IGF,
-                            llvm::Value *index,
-                            Address structAddr,
-                            SILType structType,
-                            bool isOutlined) const override {
-    withExtraInhabitantProvidingField(IGF, structAddr, structType, isOutlined,
-                                      IGF.IGM.VoidTy,
-      [&](const FieldImpl &field) -> llvm::Value* {
-        Address fieldAddr = asImpl().projectFieldAddress(
-                                            IGF, structAddr, structType, field);
-        field.getTypeInfo().storeExtraInhabitant(IGF, index, fieldAddr,
-                                         field.getType(IGF.IGM, structType),
-                                         false /*not outlined for field*/);
-        return nullptr;
-      },
-      [&]() -> llvm::Value * {
-        emitStoreExtraInhabitantCall(IGF, structType, index, structAddr);
-        return nullptr;
-      });
-  }
-      
   const FieldImpl *
   getFixedExtraInhabitantProvidingField(IRGenModule &IGM) const {
     if (!ExtraInhabitantProvidingField.hasValue()) {
@@ -629,6 +595,28 @@ public:
     return 0;
   }
 
+  bool canValueWitnessExtraInhabitantsUpTo(IRGenModule &IGM,
+                                           unsigned index) const override {
+    if (auto field = asImpl().getFixedExtraInhabitantProvidingField(IGM)) {
+      // The non-extra-inhabitant-providing fields of the type must be
+      // trivial, because an enum may contain garbage values in those fields'
+      // storage which the value witness operation won't handle.
+      for (auto &otherField : asImpl().getFields()) {
+        if (field == &otherField)
+          continue;
+        auto &ti = otherField.getTypeInfo();
+        if (!ti.isPOD(ResilienceExpansion::Maximal)) {
+          return false;
+        }
+      }
+
+      return field->getTypeInfo()
+        .canValueWitnessExtraInhabitantsUpTo(IGM, index);
+    }
+    
+    return false;
+  }
+
   APInt getFixedExtraInhabitantValue(IRGenModule &IGM,
                                      unsigned bits,
                                      unsigned index) const override {
@@ -636,27 +624,59 @@ public:
     // inhabitants.
     auto &field = *asImpl().getFixedExtraInhabitantProvidingField(IGM);
     auto &fieldTI = cast<FixedTypeInfo>(field.getTypeInfo());
-    APInt fieldValue = fieldTI.getFixedExtraInhabitantValue(IGM, bits, index);
-    return fieldValue.shl(field.getFixedByteOffset().getValueInBits());
+    auto fieldSize = fieldTI.getFixedExtraInhabitantMask(IGM).getBitWidth();
+
+    auto value = BitPatternBuilder(IGM.Triple.isLittleEndian());
+    value.appendClearBits(field.getFixedByteOffset().getValueInBits());
+    value.append(fieldTI.getFixedExtraInhabitantValue(IGM, fieldSize, index));
+    value.padWithClearBitsTo(bits);
+    return value.build().getValue();
   }
 
   APInt getFixedExtraInhabitantMask(IRGenModule &IGM) const override {
     auto field = asImpl().getFixedExtraInhabitantProvidingField(IGM);
     if (!field)
       return APInt();
-    
+
     const FixedTypeInfo &fieldTI
       = cast<FixedTypeInfo>(field->getTypeInfo());
     auto targetSize = asImpl().getFixedSize().getValueInBits();
-    
+
     if (fieldTI.isKnownEmpty(ResilienceExpansion::Maximal))
       return APInt(targetSize, 0);
-    
-    APInt fieldMask = fieldTI.getFixedExtraInhabitantMask(IGM);
-    if (targetSize > fieldMask.getBitWidth())
-      fieldMask = fieldMask.zext(targetSize);
-    fieldMask = fieldMask.shl(field->getFixedByteOffset().getValueInBits());
-    return fieldMask;
+
+    auto mask = BitPatternBuilder(IGM.Triple.isLittleEndian());
+    mask.appendClearBits(field->getFixedByteOffset().getValueInBits());
+    mask.append(fieldTI.getFixedExtraInhabitantMask(IGM));
+    mask.padWithClearBitsTo(targetSize);
+    return mask.build().getValue();
+  }
+
+  llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
+                                       Address structAddr,
+                                       SILType structType,
+                                       bool isOutlined) const override {
+    auto field = *asImpl().getFixedExtraInhabitantProvidingField(IGF.IGM);
+    Address fieldAddr =
+      asImpl().projectFieldAddress(IGF, structAddr, structType, field);
+    auto &fieldTI = cast<FixedTypeInfo>(field.getTypeInfo());
+    return fieldTI.getExtraInhabitantIndex(IGF, fieldAddr,
+                                     field.getType(IGF.IGM, structType),
+                                     false /*not outlined for field*/);
+  }
+
+  void storeExtraInhabitant(IRGenFunction &IGF,
+                            llvm::Value *index,
+                            Address structAddr,
+                            SILType structType,
+                            bool isOutlined) const override {
+    auto field = *asImpl().getFixedExtraInhabitantProvidingField(IGF.IGM);
+    Address fieldAddr =
+      asImpl().projectFieldAddress(IGF, structAddr, structType, field);
+    auto &fieldTI = cast<FixedTypeInfo>(field.getTypeInfo());
+    fieldTI.storeExtraInhabitant(IGF, index, fieldAddr,
+                                 field.getType(IGF.IGM, structType),
+                                 false /*not outlined for field*/);
   }
 };
 
@@ -778,7 +798,7 @@ public:
                            Explosion &src,
                            unsigned startOffset) const override {
     for (auto &field : getFields()) {
-      if (field.getKind() != ElementLayout::Kind::Empty) {
+      if (!field.isEmpty()) {
         unsigned offset = field.getFixedByteOffset().getValueInBits()
           + startOffset;
         cast<LoadableTypeInfo>(field.getTypeInfo())
@@ -791,7 +811,7 @@ public:
                              Explosion &dest, unsigned startOffset)
                             const override {
     for (auto &field : getFields()) {
-      if (field.getKind() != ElementLayout::Kind::Empty) {
+      if (!field.isEmpty()) {
         unsigned offset = field.getFixedByteOffset().getValueInBits()
           + startOffset;
         cast<LoadableTypeInfo>(field.getTypeInfo())

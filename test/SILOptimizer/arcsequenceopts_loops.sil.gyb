@@ -1,7 +1,7 @@
 %# -*- mode: sil -*-
 // RUN: %empty-directory(%t)
 // RUN: %gyb %s > %t/arc-sequence-opts-loops.sil
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -arc-sequence-opts %t/arc-sequence-opts-loops.sil -enable-loop-arc=0 | %FileCheck %t/arc-sequence-opts-loops.sil
+// RUN: %target-sil-opt -enable-sil-verify-all -arc-sequence-opts %t/arc-sequence-opts-loops.sil -enable-loop-arc=0 | %FileCheck %t/arc-sequence-opts-loops.sil
 
 %# Ignore the following admonition; it applies to the resulting .sil
 %# test file only.
@@ -52,10 +52,12 @@ bb1:
   strong_release %0 : $Builtin.NativeObject
 % end
 // CHECK-NEXT: cond_br
-  cond_br undef, bb1, bb2
+  cond_br undef, bb2, bb3
 
-// CHECK: bb2:
 bb2:
+  br bb1
+// CHECK: bb3:
+bb3:
 % if i & 8:
 // CHECK-NEXT: strong_release
   strong_release %0 : $Builtin.NativeObject
@@ -109,10 +111,13 @@ bb2:
 // CHECK-NEXT: strong_release
   strong_release %0 : $Builtin.NativeObject
 % end
-  cond_br undef, bb1, bb3
+  cond_br undef, bb3, bb4
 
-// CHECK: bb3:
 bb3:
+  br bb1
+
+// CHECK: bb4:
+bb4:
 % if i & 2:
 // CHECK-NEXT: strong_release
   strong_release %0 : $Builtin.NativeObject

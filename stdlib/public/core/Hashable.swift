@@ -101,11 +101,14 @@
 ///         print("New tap detected at (\(nextTap.x), \(nextTap.y)).")
 ///     }
 ///     // Prints "New tap detected at (0, 1).")
-public protocol Hashable : Equatable {
+public protocol Hashable: Equatable {
   /// The hash value.
   ///
   /// Hash values are not guaranteed to be equal across different executions of
   /// your program. Do not save hash values to use during a future execution.
+  ///
+  /// - Important: `hashValue` is deprecated as a `Hashable` requirement. To
+  ///   conform to `Hashable`, implement the `hash(into:)` requirement instead.
   var hashValue: Int { get }
 
   /// Hashes the essential components of this value by feeding them into the
@@ -148,7 +151,7 @@ public func _hashValue<H: Hashable>(for value: H) -> Int {
 
 // Called by the SwiftValue implementation.
 @_silgen_name("_swift_stdlib_Hashable_isEqual_indirect")
-internal func Hashable_isEqual_indirect<T : Hashable>(
+internal func Hashable_isEqual_indirect<T: Hashable>(
   _ lhs: UnsafePointer<T>,
   _ rhs: UnsafePointer<T>
 ) -> Bool {
@@ -157,7 +160,7 @@ internal func Hashable_isEqual_indirect<T : Hashable>(
 
 // Called by the SwiftValue implementation.
 @_silgen_name("_swift_stdlib_Hashable_hashValue_indirect")
-internal func Hashable_hashValue_indirect<T : Hashable>(
+internal func Hashable_hashValue_indirect<T: Hashable>(
   _ value: UnsafePointer<T>
 ) -> Int {
   return value.pointee.hashValue

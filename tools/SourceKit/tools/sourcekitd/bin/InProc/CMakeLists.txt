@@ -1,12 +1,17 @@
-set(EXPORTED_SYMBOL_FILE "${SOURCEKITD_SOURCE_DIR}/bin/sourcekitd.exports")
+if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+  set(EXPORTED_SYMBOL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/sourcekitdInProc-darwin.exports")
+else()
+  set(EXPORTED_SYMBOL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/sourcekitdInProc.exports")
+endif()
 
 option(SOURCEKITD_BUILD_STATIC_INPROC
   "Build sourcekitdInProc as a static library (in addition to a shared one)" OFF)
 
+swift_is_installing_component(sourcekit-inproc SOURCEKIT_INSTALLING_INPROC)
+
 set(sourcekitdInProc_args
   sourcekitdInProc.cpp
-  LINK_LIBS SourceKitSwiftLang sourcekitdAPI
-  LLVM_COMPONENT_DEPENDS support coverage
+  LLVM_LINK_COMPONENTS support coverage
 )
 
 if (SOURCEKIT_INSTALLING_INPROC)
@@ -18,6 +23,11 @@ if (SOURCEKIT_INSTALLING_INPROC)
       INSTALL_IN_COMPONENT sourcekit-inproc
     )
     set_property(TARGET sourcekitdInProc APPEND_STRING PROPERTY LINK_FLAGS " -fapplication-extension")
+    if (SOURCEKIT_DEPLOYMENT_OS MATCHES "^macosx")
+      add_definitions(-DSOURCEKIT_VERSIONED_FRAMEWORK_BUNDLE)
+    else()
+      add_definitions(-DSOURCEKIT_UNVERSIONED_FRAMEWORK_BUNDLE)
+    endif()
   else()
     add_sourcekit_library(sourcekitdInProc
       ${sourcekitdInProc_args}
@@ -36,6 +46,9 @@ else()
     SHARED
   )
 endif()
+target_link_libraries(sourcekitdInProc PRIVATE
+  SourceKitSwiftLang
+  sourcekitdAPI)
 
 # While it is possible to build this as a static library,
 # to get the runtime paths correct, it must be linked into a binary
@@ -46,6 +59,9 @@ if (SOURCEKITD_BUILD_STATIC_INPROC)
       ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
     ${sourcekitdInProc_args}
   )
+  target_link_libraries(sourcekitdInProc_Static PRIVATE
+    SourceKitSwiftLang
+    sourcekitdAPI)
 endif()
 
 if (SOURCEKIT_BUILT_STANDALONE)

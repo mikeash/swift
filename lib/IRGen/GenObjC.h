@@ -17,6 +17,7 @@
 #ifndef SWIFT_IRGEN_GENOBJC_H
 #define SWIFT_IRGEN_GENOBJC_H
 
+#include "swift/SIL/SILDeclRef.h"
 
 namespace llvm {
   class Type;
@@ -87,6 +88,10 @@ namespace irgen {
   Callee getObjCMethodCallee(IRGenFunction &IGF, const ObjCMethod &method,
                              llvm::Value *selfValue, CalleeInfo &&info);
 
+  /// Prepare a callee for an Objective-C method with the `objc_direct` attribute.
+  Callee getObjCDirectMethodCallee(CalleeInfo &&info, const FunctionPointer &fn,
+                                   llvm::Value *selfValue);
+
   /// Emit a partial application of an Objective-C method to its 'self'
   /// argument.
   void emitObjCPartialApplication(IRGenFunction &IGF,
@@ -105,59 +110,51 @@ namespace irgen {
   llvm::Value *emitObjCAutoreleaseReturnValue(IRGenFunction &IGF,
                                               llvm::Value *value);
 
+  struct ObjCMethodDescriptor {
+    llvm::Constant *selectorRef = nullptr;
+    llvm::Constant *typeEncoding = nullptr;
+    llvm::Constant *impl = nullptr;
+    SILFunction *silFunction = nullptr;
+  };
+
   /// Build the components of an Objective-C method descriptor for the given
   /// method or constructor implementation.
-  void emitObjCMethodDescriptorParts(IRGenModule &IGM,
-                                     AbstractFunctionDecl *method,
-                                     bool extendedEncoding,
-                                     bool concrete,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor
+  emitObjCMethodDescriptorParts(IRGenModule &IGM,
+                                AbstractFunctionDecl *method,
+                                bool concrete);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// property's method implementations.
-  void emitObjCGetterDescriptorParts(IRGenModule &IGM,
-                                     VarDecl *property,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCGetterDescriptorParts(IRGenModule &IGM,
+                                                     VarDecl *property);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// subscript's method implementations.
-  void emitObjCGetterDescriptorParts(IRGenModule &IGM,
-                                     SubscriptDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCGetterDescriptorParts(IRGenModule &IGM,
+                                                     SubscriptDecl *property);
 
-  void emitObjCGetterDescriptorParts(IRGenModule &IGM,
-                                     AbstractStorageDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  /// Build the components of an Objective-C method descriptor if the abstract
+  /// storage refers to a property or a subscript.
+  ObjCMethodDescriptor
+  emitObjCGetterDescriptorParts(IRGenModule &IGM,
+                                AbstractStorageDecl *subscript);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// property's method implementations.
-  void emitObjCSetterDescriptorParts(IRGenModule &IGM,
-                                     VarDecl *property,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCSetterDescriptorParts(IRGenModule &IGM,
+                                                     VarDecl *property);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// subscript's method implementations.
-  void emitObjCSetterDescriptorParts(IRGenModule &IGM,
-                                     SubscriptDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCSetterDescriptorParts(IRGenModule &IGM,
+                                                     SubscriptDecl *property);
 
-  void emitObjCSetterDescriptorParts(IRGenModule &IGM,
-                                     AbstractStorageDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  /// Build the components of an Objective-C method descriptor if the abstract
+  /// storage refers to a property or a subscript.
+  ObjCMethodDescriptor
+  emitObjCSetterDescriptorParts(IRGenModule &IGM,
+                                AbstractStorageDecl *subscript);
 
   /// Build an Objective-C method descriptor for the given method,
   /// constructor, or destructor implementation.

@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2019 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -26,7 +26,7 @@
 #define NOMINMAX
 #include <windows.h>
 #else
-#if !defined(__HAIKU__)
+#if !defined(__HAIKU__) && !defined(__wasi__)
 #include <sys/errno.h>
 #else
 #include <errno.h>
@@ -36,46 +36,28 @@
 #endif
 #include <climits>
 #include <clocale>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#if defined(__CYGWIN__) || defined(_WIN32) || defined(__HAIKU__)
 #include <sstream>
-#include <cmath>
-#elif defined(__ANDROID__)
+#if defined(__OpenBSD__) || defined(__ANDROID__) || defined(__linux__) || defined(__wasi__) || defined(_WIN32)
 #include <locale.h>
-
-#include <android/api-level.h>
-
-#if __ANDROID_API__ < 21 // Introduced in Android API 21 - L
-static inline long double swift_strtold_l(const char *nptr, char **endptr,
-                                          locale_t) {
-  return strtod(nptr, endptr);
-}
-#define strtold_l swift_strtold_l
+#if defined(_WIN32)
+#define locale_t _locale_t
 #endif
-
-#if __ANDROID_API__ < 26 // Introduced in Android API 26 - O
-static double swift_strtod_l(const char *nptr, char **endptr, locale_t loc) {
-  return strtod(nptr, endptr);
-}
-static float swift_strtof_l(const char *nptr, char **endptr, locale_t loc) {
-  return strtof(nptr, endptr);
-}
-#define strtod_l swift_strtod_l
-#define strtof_l swift_strtof_l
-#endif
-#elif defined(__linux__)
-#include <locale.h>
 #else
 #include <xlocale.h>
 #endif
 #include <limits>
 #include <thread>
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/Compiler.h"
+
+#if defined(__ANDROID__)
+#include <android/api-level.h>
+#endif
+
 #include "swift/Runtime/Debug.h"
 #include "swift/Runtime/SwiftDtoa.h"
 #include "swift/Basic/Lazy.h"
@@ -83,6 +65,8 @@ static float swift_strtof_l(const char *nptr, char **endptr, locale_t loc) {
 #include "../SwiftShims/LibcShims.h"
 #include "../SwiftShims/RuntimeShims.h"
 #include "../SwiftShims/RuntimeStubs.h"
+
+#include "llvm/ADT/StringExtras.h"
 
 static uint64_t uint64ToStringImpl(char *Buffer, uint64_t Value,
                                    int64_t Radix, bool Uppercase,
@@ -155,8 +139,20 @@ static inline locale_t getCLocale() {
   // as C locale.
   return nullptr;
 }
-#elif defined(__CYGWIN__) || defined(_WIN32) || defined(__HAIKU__)
+#elif defined(__CYGWIN__) || defined(__HAIKU__)
 // In Cygwin, getCLocale() is not used.
+#elif defined(_WIN32)
+static _locale_t makeCLocale() {
+  _locale_t CLocale = _create_locale(LC_ALL, "C");
+  if (!CLocale) {
+    swift::crash("makeCLocale: _create_locale() returned a null pointer");
+  }
+  return CLocale;
+}
+
+static _locale_t getCLocale() {
+  return SWIFT_LAZY_CONSTANT(makeCLocale());
+}
 #else
 static locale_t makeCLocale() {
   locale_t CLocale = newlocale(LC_ALL_MASK, "C", nullptr);
@@ -171,123 +167,55 @@ static locale_t getCLocale() {
 }
 #endif
 
-#if !SWIFT_DTOA_FLOAT80_SUPPORT
-#if defined(__APPLE__)
-#define swift_snprintf_l snprintf_l
-#elif defined(__CYGWIN__) || defined(_WIN32) || defined(__HAIKU__)
-// swift_snprintf_l() is not used.
-#else
-static int swift_snprintf_l(char *Str, size_t StrSize, locale_t Locale,
-                            const char *Format, ...) {
-  if (Locale == nullptr) {
-    Locale = getCLocale();
-  }
-  locale_t OldLocale = uselocale(Locale);
-
-  va_list Args;
-  va_start(Args, Format);
-  int Result = std::vsnprintf(Str, StrSize, Format, Args);
-  va_end(Args);
-
-  uselocale(OldLocale);
-
-  return Result;
+// TODO: replace this with a float16 implementation instead of calling _float.
+// Argument type will have to stay float, though; only the formatting changes.
+// Note, return type is __swift_ssize_t, not uint64_t as with the other
+// formatters. We'd use this type there if we could, but it's ABI so we can't
+// go back and change it.
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
+__swift_ssize_t swift_float16ToString(char *Buffer, size_t BufferLength,
+                                      float Value, bool Debug) {
+  __fp16 v = Value;
+  return swift_dtoa_optimal_binary16_p(&v, Buffer, BufferLength);
 }
-#endif
-
-template <typename T>
-static uint64_t swift_floatingPointToString(char *Buffer, size_t BufferLength,
-                                            T Value, const char *Format, 
-                                            bool Debug) {
-  if (BufferLength < 32)
-    swift::crash("swift_floatingPointToString: insufficient buffer size");
-
-  int Precision = std::numeric_limits<T>::digits10;
-  if (Debug) {
-    Precision = std::numeric_limits<T>::max_digits10;
-  }
-
-#if defined(__CYGWIN__) || defined(_WIN32) || defined(__HAIKU__)
-  // Cygwin does not support uselocale(), but we can use the locale feature 
-  // in stringstream object.
-  std::ostringstream ValueStream;
-  ValueStream.width(0);
-  ValueStream.precision(Precision);
-  ValueStream.imbue(std::locale::classic());
-  ValueStream << Value;
-  std::string ValueString(ValueStream.str());
-  size_t i = ValueString.length();
-
-  if (i < BufferLength) {
-    std::copy(ValueString.begin(), ValueString.end(), Buffer);
-    Buffer[i] = '\0';
-  } else {
-    swift::crash("swift_floatingPointToString: insufficient buffer size");
-  }
-#else
-  // Pass a null locale to use the C locale.
-  int i = swift_snprintf_l(Buffer, BufferLength, /*Locale=*/nullptr, Format,
-                           Precision, Value);
-
-  if (i < 0)
-    swift::crash(
-        "swift_floatingPointToString: unexpected return value from sprintf");
-  if (size_t(i) >= BufferLength)
-    swift::crash("swift_floatingPointToString: insufficient buffer size");
-#endif
-
-  // Add ".0" to a float that (a) is not in scientific notation, (b) does not
-  // already have a fractional part, (c) is not infinite, and (d) is not a NaN
-  // value.
-  if (strchr(Buffer, 'e') == nullptr && strchr(Buffer, '.') == nullptr &&
-      strchr(Buffer, 'n') == nullptr) {
-    Buffer[i++] = '.';
-    Buffer[i++] = '0';
-  }
-
-  return i;
-}
-#endif
 
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
 uint64_t swift_float32ToString(char *Buffer, size_t BufferLength,
                                float Value, bool Debug) {
-  return swift_format_float(Value, Buffer, BufferLength);
+  return swift_dtoa_optimal_float(Value, Buffer, BufferLength);
 }
 
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
 uint64_t swift_float64ToString(char *Buffer, size_t BufferLength,
                                double Value, bool Debug) {
-  return swift_format_double(Value, Buffer, BufferLength);
+  return swift_dtoa_optimal_double(Value, Buffer, BufferLength);
 }
 
+// We only support float80 on platforms that use that exact format for 'long double'
+// This should match the conditionals in Runtime.swift
+#if !defined(_WIN32) && !defined(__ANDROID__) && (defined(__i386__) || defined(__i686__) || defined(__x86_64__))
 SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_API
 uint64_t swift_float80ToString(char *Buffer, size_t BufferLength,
                                long double Value, bool Debug) {
-#if SWIFT_DTOA_FLOAT80_SUPPORT
-  return swift_format_float80(Value, Buffer, BufferLength);
-#else
-  // Use this when 'long double' is not true Float80
-  return swift_floatingPointToString<long double>(Buffer, BufferLength, Value,
-                                                  "%0.*Lg", Debug);
-#endif
-
+  // SwiftDtoa.cpp automatically enables float80 on platforms that use it for 'long double'
+  return swift_dtoa_optimal_float80_p(&Value, Buffer, BufferLength);
 }
+#endif
 
 /// \param[out] LinePtr Replaced with the pointer to the malloc()-allocated
 /// line.  Can be NULL if no characters were read. This buffer should be
-/// freed by the caller if this function returns a positive value.
+/// freed by the caller.
 ///
 /// \returns Size of character data returned in \c LinePtr, or -1
 /// if an error occurred, or EOF was reached.
 __swift_ssize_t
-swift::swift_stdlib_readLine_stdin(unsigned char **LinePtr) {
+swift_stdlib_readLine_stdin(unsigned char **LinePtr) {
 #if defined(_WIN32)
   if (LinePtr == nullptr)
     return -1;
 
-  ssize_t Capacity = 0;
-  ssize_t Pos = 0;
+  __swift_ssize_t Capacity = 0;
+  __swift_ssize_t Pos = 0;
   unsigned char *ReadBuf = nullptr;
 
   _lock_file(stdin);
@@ -329,7 +257,11 @@ swift::swift_stdlib_readLine_stdin(unsigned char **LinePtr) {
   return Pos;
 #else
   size_t Capacity = 0;
-  return getline((char **)LinePtr, &Capacity, stdin);
+  int result;
+  do {
+    result = getline((char **)LinePtr, &Capacity, stdin);
+  } while (result < 0 && errno == EINTR);
+  return result;
 #endif
 }
 
@@ -339,54 +271,104 @@ swift::swift_stdlib_readLine_stdin(unsigned char **LinePtr) {
 
 static bool swift_stringIsSignalingNaN(const char *nptr) {
   if (nptr[0] == '+' || nptr[0] == '-') {
-    nptr++;
+    ++nptr;
   }
 
   return strcasecmp(nptr, "snan") == 0;
 }
 
-#if defined(__CYGWIN__) || defined(_WIN32) || defined(__HAIKU__)
-// Cygwin does not support uselocale(), but we can use the locale feature 
-// in stringstream object.
+// This implementation should only be used on platforms without the
+// relevant strto* functions, such as Cygwin or Haiku.
+// Note that using this currently causes test failures.
 template <typename T>
-static const char *_swift_stdlib_strtoX_clocale_impl(
-    const char *nptr, T *outResult) {
-  if (swift_stringIsSignalingNaN(nptr)) {
-    *outResult = std::numeric_limits<T>::signaling_NaN();
-    return nptr + std::strlen(nptr);
-  }
-  
+T _swift_strto(const char *nptr, char **endptr) {
   std::istringstream ValueStream(nptr);
   ValueStream.imbue(std::locale::classic());
   T ParsedValue;
   ValueStream >> ParsedValue;
-  *outResult = ParsedValue;
 
   std::streamoff pos = ValueStream.tellg();
   if (ValueStream.eof())
     pos = static_cast<std::streamoff>(strlen(nptr));
-  if (pos <= 0)
-    return nullptr;
+  if (pos <= 0) {
+    errno = ERANGE;
+    return 0.0;
+  }
 
-  return nptr + pos;
+  return ParsedValue;
 }
 
-const char *swift::_swift_stdlib_strtold_clocale(
-    const char *nptr, void *outResult) {
-  return _swift_stdlib_strtoX_clocale_impl(
-    nptr, static_cast<long double*>(outResult));
-}
+#if defined(__OpenBSD__) || defined(_WIN32) || defined(__CYGWIN__) || defined(__HAIKU__)
+#define NEED_SWIFT_STRTOD_L
+#define strtod_l swift_strtod_l
+#define NEED_SWIFT_STRTOF_L
+#define strtof_l swift_strtof_l
+#define NEED_SWIFT_STRTOLD_L
+#define strtold_l swift_strtold_l
+#elif defined(__ANDROID__)
+#if __ANDROID_API__ < 21 // Introduced in Android API 21 - L
+#define NEED_SWIFT_STRTOLD_L
+#define strtold_l swift_strtold_l
+#endif
 
-const char *swift::_swift_stdlib_strtod_clocale(
-    const char * nptr, double *outResult) {
-  return _swift_stdlib_strtoX_clocale_impl(nptr, outResult);
-}
+#if __ANDROID_API__ < 26 // Introduced in Android API 26 - O
+#define NEED_SWIFT_STRTOD_L
+#define strtod_l swift_strtod_l
+#define NEED_SWIFT_STRTOF_L
+#define strtof_l swift_strtof_l
+#endif
+#endif
 
-const char *swift::_swift_stdlib_strtof_clocale(
-    const char * nptr, float *outResult) {
-  return _swift_stdlib_strtoX_clocale_impl(nptr, outResult);
-}
+#if defined(NEED_SWIFT_STRTOD_L)
+static double swift_strtod_l(const char *nptr, char **endptr, locale_t loc) {
+#if defined(_WIN32)
+  return _strtod_l(nptr, endptr, getCLocale());
+#elif defined(__CYGWIN__) || defined(__HAIKU__)
+  return _swift_strto<double>(nptr, endptr);
 #else
+  return strtod(nptr, endptr);
+#endif
+}
+#endif
+
+#if defined(NEED_SWIFT_STRTOF_L)
+static float swift_strtof_l(const char *nptr, char **endptr, locale_t loc) {
+#if defined(_WIN32)
+  return _strtof_l(nptr, endptr, getCLocale());
+#elif defined(__CYGWIN__) || defined(__HAIKU__)
+  return _swift_strto<float>(nptr, endptr);
+#else
+  return strtof(nptr, endptr);
+#endif
+}
+#endif
+
+#if defined(NEED_SWIFT_STRTOLD_L)
+static long double swift_strtold_l(const char *nptr, char **endptr,
+                                   locale_t loc) {
+#if defined(_WIN32)
+  return _strtod_l(nptr, endptr, getCLocale());
+#elif defined(__ANDROID__)
+  return strtod(nptr, endptr);
+#elif defined(__CYGWIN__) || defined(__HAIKU__)
+  return _swift_strto<long double>(nptr, endptr);
+#else
+  return strtold(nptr, endptr);
+#endif
+}
+#endif
+
+#undef NEED_SWIFT_STRTOD_L
+#undef NEED_SWIFT_STRTOF_L
+#undef NEED_SWIFT_STRTOLD_L
+
+static inline void _swift_set_errno(int to) {
+#if defined(_WIN32)
+  _set_errno(0);
+#else
+  errno = 0;
+#endif
+}
 
 // We can't return Float80, but we can receive a pointer to one, so
 // switch the return type and the out parameter on strtold.
@@ -403,56 +385,66 @@ static const char *_swift_stdlib_strtoX_clocale_impl(
   }
   
   char *EndPtr;
-  errno = 0;
+  _swift_set_errno(0);
   const auto result = posixImpl(nptr, &EndPtr, getCLocale());
   *outResult = result;
-  if (result == huge || result == -huge || result == 0.0 || result == -0.0) {
-      if (errno == ERANGE)
-          EndPtr = nullptr;
-  }
   return EndPtr;
 }
     
-const char *swift::_swift_stdlib_strtold_clocale(
+const char *_swift_stdlib_strtold_clocale(
   const char * nptr, void *outResult) {
   return _swift_stdlib_strtoX_clocale_impl(
     nptr, static_cast<long double*>(outResult), HUGE_VALL, strtold_l);
 }
 
-const char *swift::_swift_stdlib_strtod_clocale(
+const char *_swift_stdlib_strtod_clocale(
     const char * nptr, double *outResult) {
   return _swift_stdlib_strtoX_clocale_impl(
     nptr, outResult, HUGE_VAL, strtod_l);
 }
 
-const char *swift::_swift_stdlib_strtof_clocale(
+const char *_swift_stdlib_strtof_clocale(
     const char * nptr, float *outResult) {
   return _swift_stdlib_strtoX_clocale_impl(
     nptr, outResult, HUGE_VALF, strtof_l);
 }
-#endif
 
-void swift::_swift_stdlib_flockfile_stdout() {
+const char *_swift_stdlib_strtof16_clocale(
+    const char * nptr, __fp16 *outResult) {
+  float tmp;
+  const char *result = _swift_stdlib_strtof_clocale(nptr, &tmp);
+  *outResult = tmp;
+  return result;
+}
+
+void _swift_stdlib_flockfile_stdout() {
 #if defined(_WIN32)
   _lock_file(stdout);
+#elif defined(__wasi__)
+  // WebAssembly/WASI doesn't support file locking yet https://bugs.swift.org/browse/SR-12097
 #else
   flockfile(stdout);
 #endif
 }
 
-void swift::_swift_stdlib_funlockfile_stdout() {
+void _swift_stdlib_funlockfile_stdout() {
 #if defined(_WIN32)
   _unlock_file(stdout);
+#elif defined(__wasi__)
+  // WebAssembly/WASI doesn't support file locking yet https://bugs.swift.org/browse/SR-12097
 #else
   funlockfile(stdout);
 #endif
 }
 
-int swift::_swift_stdlib_putc_stderr(int C) {
+int _swift_stdlib_putc_stderr(int C) {
   return putc(C, stderr);
 }
 
-size_t swift::_swift_stdlib_getHardwareConcurrency() {
+size_t _swift_stdlib_getHardwareConcurrency() {
+#ifdef SWIFT_STDLIB_SINGLE_THREADED_RUNTIME
+  return 1;
+#else
   return std::thread::hardware_concurrency();
+#endif
 }
-

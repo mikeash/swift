@@ -28,6 +28,9 @@
 #include "Explosion.h"
 #include "GenCall.h"
 #include "GenCast.h"
+#include "GenConcurrency.h"
+#include "GenPointerAuth.h"
+#include "GenIntegerLiteral.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "LoadableTypeInfo.h"
@@ -118,8 +121,16 @@ getLoweredTypeAndTypeInfo(IRGenModule &IGM, Type unloweredType) {
 /// emitBuiltinCall - Emit a call to a builtin function.
 void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
                             Identifier FnId, SILType resultType,
+                            ArrayRef<SILType> argTypes,
                             Explosion &args, Explosion &out,
                             SubstitutionMap substitutions) {
+  if (Builtin.ID == BuiltinValueKind::COWBufferForReading) {
+    // Just forward the incoming argument.
+    assert(args.size() == 1 && "Expecting one incoming argument");
+    out = std::move(args);
+    return;
+  }
+
   if (Builtin.ID == BuiltinValueKind::UnsafeGuaranteedEnd) {
     // Just consume the incoming argument.
     assert(args.size() == 1 && "Expecting one incoming argument");
@@ -178,6 +189,13 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     return;
   }
 
+  if (Builtin.ID == BuiltinValueKind::IsConcrete) {
+    (void)args.claimAll();
+    auto isConcrete = !substitutions.getReplacementTypes()[0]->hasArchetype();
+    out.add(llvm::ConstantInt::get(IGF.IGM.Int1Ty, isConcrete));
+    return;
+  }
+
   if (Builtin.ID == BuiltinValueKind::IsBitwiseTakable) {
     (void)args.claimAll();
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
@@ -195,7 +213,147 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     return;
   }
 
+  // getCurrentAsyncTask has no arguments.
+  if (Builtin.ID == BuiltinValueKind::GetCurrentAsyncTask) {
+    auto task = IGF.getAsyncTask();
+    out.add(IGF.Builder.CreateBitCast(task, IGF.IGM.RefCountedPtrTy));
+    return;
+  }
+
+  // emitGetCurrentExecutor has no arguments.
+  if (Builtin.ID == BuiltinValueKind::GetCurrentExecutor) {
+    emitGetCurrentExecutor(IGF, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::StartAsyncLet) {
+    auto taskFunction = args.claimNext();
+    auto taskContext = args.claimNext();
+
+    auto asyncLet = emitBuiltinStartAsyncLet(
+        IGF,
+        taskFunction,
+        taskContext,
+        substitutions
+        );
+
+    out.add(asyncLet);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::EndAsyncLet) {
+    emitEndAsyncLet(IGF, args.claimNext());
+    // Ignore a second operand which is inserted by ClosureLifetimeFixup and
+    // only used for dependency tracking.
+    (void)args.claimAll();
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::CreateTaskGroup) {
+    out.add(emitCreateTaskGroup(IGF));
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::DestroyTaskGroup) {
+    emitDestroyTaskGroup(IGF, args.claimNext());
+    return;
+  }
+
   // Everything else cares about the (rvalue) argument.
+
+  if (Builtin.ID == BuiltinValueKind::CancelAsyncTask) {
+    emitTaskCancel(IGF, args.claimNext());
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::CreateAsyncTaskFuture ||
+      Builtin.ID == BuiltinValueKind::CreateAsyncTaskGroupFuture) {
+
+    auto flags = args.claimNext();
+    auto taskGroup =
+        (Builtin.ID == BuiltinValueKind::CreateAsyncTaskGroupFuture)
+        ? args.claimNext()
+        : nullptr;
+    auto futureResultType =
+        ((Builtin.ID == BuiltinValueKind::CreateAsyncTaskFuture) ||
+         (Builtin.ID == BuiltinValueKind::CreateAsyncTaskGroupFuture))
+          ? args.claimNext()
+          : nullptr;
+    auto taskFunction = args.claimNext();
+    auto taskContext = args.claimNext();
+
+    auto newTaskAndContext = emitTaskCreate(
+        IGF, flags, taskGroup, futureResultType, taskFunction, taskContext,
+        substitutions);
+
+    // Cast back to NativeObject/RawPointer.
+    auto newTask = IGF.Builder.CreateExtractValue(newTaskAndContext, { 0 });
+    newTask = IGF.Builder.CreateBitCast(newTask, IGF.IGM.RefCountedPtrTy);
+    auto newContext = IGF.Builder.CreateExtractValue(newTaskAndContext, { 1 });
+    newContext = IGF.Builder.CreateBitCast(newContext, IGF.IGM.Int8PtrTy);
+    out.add(newTask);
+    out.add(newContext);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::ConvertTaskToJob) {
+    auto task = args.claimNext();
+    // The job object starts at the beginning of the task.
+    auto job = IGF.Builder.CreateBitCast(task, IGF.IGM.SwiftJobPtrTy);
+    out.add(job);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::InitializeDefaultActor ||
+      Builtin.ID == BuiltinValueKind::DestroyDefaultActor) {
+    auto fn = Builtin.ID == BuiltinValueKind::InitializeDefaultActor
+                ? IGF.IGM.getDefaultActorInitializeFn()
+                : IGF.IGM.getDefaultActorDestroyFn();
+    auto actor = args.claimNext();
+    actor = IGF.Builder.CreateBitCast(actor, IGF.IGM.RefCountedPtrTy);
+    auto call = IGF.Builder.CreateCall(fn, {actor});
+    call->setCallingConv(IGF.IGM.SwiftCC);
+    call->setDoesNotThrow();
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::ResumeThrowingContinuationReturning ||
+      Builtin.ID == BuiltinValueKind::ResumeNonThrowingContinuationReturning) {
+    auto continuation = args.claimNext();
+    auto valueTy = argTypes[1];
+    auto valuePtr = args.claimNext();
+    bool throwing =
+      (Builtin.ID == BuiltinValueKind::ResumeThrowingContinuationReturning);
+    IGF.emitResumeAsyncContinuationReturning(continuation, valuePtr, valueTy,
+                                             throwing);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::ResumeThrowingContinuationThrowing) {
+    auto continuation = args.claimNext();
+    auto error = args.claimNext();
+    IGF.emitResumeAsyncContinuationThrowing(continuation, error);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::BuildMainActorExecutorRef) {
+    emitBuildMainActorExecutorRef(IGF, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::BuildDefaultActorExecutorRef) {
+    auto actor = args.claimNext();
+    emitBuildDefaultActorExecutorRef(IGF, actor, out);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::BuildOrdinarySerialExecutorRef) {
+    auto actor = args.claimNext();
+    auto type = substitutions.getReplacementTypes()[0]->getCanonicalType();
+    auto conf = substitutions.getConformances()[0];
+    emitBuildOrdinarySerialExecutorRef(IGF, actor, type, conf, out);
+    return;
+  }
 
   // If this is an LLVM IR intrinsic, lower it to an intrinsic call.
   const IntrinsicInfo &IInfo = IGF.getSILModule().getIntrinsicInfo(FnId);
@@ -203,7 +361,7 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
 
   // Emit non-mergeable traps only.
   if (IGF.Builder.isTrapIntrinsic(IID)) {
-    IGF.Builder.CreateNonMergeableTrap(IGF.IGM);
+    IGF.Builder.CreateNonMergeableTrap(IGF.IGM, StringRef());
     return;
   }
 
@@ -255,15 +413,25 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     replacement.add(NameGEP);
     replacement.add(args.claimAll());
     args = std::move(replacement);
+  }
 
-    if (Opts.EmitProfileCoverageMapping) {
-      // Update the associated coverage mapping: it's now safe to emit, because
-      // a symtab entry for this function is guaranteed (r://39146527).
-      auto &coverageMaps = SILMod.getCoverageMaps();
-      auto CovMapIt = coverageMaps.find(PGOFuncName);
-      if (CovMapIt != coverageMaps.end())
-        CovMapIt->second->setSymtabEntryGuaranteed();
+  // Implement the ptrauth builtins as no-ops when the Clang
+  // intrinsics are disabled.
+  if ((IID == llvm::Intrinsic::ptrauth_sign ||
+       IID == llvm::Intrinsic::ptrauth_auth ||
+       IID == llvm::Intrinsic::ptrauth_resign ||
+       IID == llvm::Intrinsic::ptrauth_strip) &&
+      !IGF.IGM.getClangASTContext().getLangOpts().PointerAuthIntrinsics) {
+    out.add(args.claimNext()); // Return the input pointer.
+    (void) args.claimNext();   // Ignore the key.
+    if (IID != llvm::Intrinsic::ptrauth_strip) {
+      (void) args.claimNext(); // Ignore the discriminator.
     }
+    if (IID == llvm::Intrinsic::ptrauth_resign) {
+      (void) args.claimNext(); // Ignore the new key.
+      (void) args.claimNext(); // Ignore the new discriminator.
+    }
+    return;
   }
 
   if (IID != llvm::Intrinsic::not_intrinsic) {
@@ -306,13 +474,22 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
   if (Builtin.ID == BuiltinValueKind::id) \
     return emitCastOrBitCastBuiltin(IGF, resultType, out, args, \
                                     BuiltinValueKind::id);
-  
-#define BUILTIN_BINARY_OPERATION(id, name, attrs, overload) \
-  if (Builtin.ID == BuiltinValueKind::id) { \
-    llvm::Value *lhs = args.claimNext(); \
-    llvm::Value *rhs = args.claimNext(); \
-    llvm::Value *v = IGF.Builder.Create##id(lhs, rhs); \
-    return out.add(v); \
+
+#define BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC(id, name, attrs, overload)  \
+  if (Builtin.ID == BuiltinValueKind::id) {                                    \
+    llvm::Value *lhs = args.claimNext();                                       \
+    llvm::Value *rhs = args.claimNext();                                       \
+    llvm::Value *v = IGF.Builder.Create##id(lhs, rhs);                         \
+    return out.add(v);                                                         \
+  }
+#define BUILTIN_BINARY_OPERATION_POLYMORPHIC(id, name)                         \
+  if (Builtin.ID == BuiltinValueKind::id) {                                    \
+    /* This builtin must be guarded so that dynamically it is never called. */ \
+    IGF.emitTrap("invalid use of polymorphic builtin", /*Unreachable*/ false); \
+    auto returnValue = llvm::UndefValue::get(IGF.IGM.Int8PtrTy);               \
+    /* Consume the arguments of the builtin. */                                \
+    (void)args.claimAll();                                                     \
+    return out.add(returnValue);                                               \
   }
 
 #define BUILTIN_RUNTIME_CALL(id, name, attrs)                                  \
@@ -353,6 +530,19 @@ if (Builtin.ID == BuiltinValueKind::id) { \
 #define BUILTIN(ID, Name, Attrs)  // Ignore the rest.
 #include "swift/AST/Builtins.def"
 
+  if (Builtin.ID == BuiltinValueKind::GlobalStringTablePointer) {
+    // This builtin should be used only on strings constructed from a
+    // string literal. If we ever get to the point of executing this builtin
+    // at run time, it implies an incorrect use of the builtin and must result
+    // in a trap.
+    IGF.emitTrap("invalid use of globalStringTablePointer",
+                 /*Unreachable=*/false);
+    auto returnValue = llvm::UndefValue::get(IGF.IGM.Int8PtrTy);
+    // Consume the arguments of the builtin.
+    (void)args.claimAll();
+    return out.add(returnValue);
+  }
+
   if (Builtin.ID == BuiltinValueKind::WillThrow) {
     // willThrow is emitted like a Swift function call with the error in
     // the error return register. We also have to pass a fake context
@@ -360,10 +550,10 @@ if (Builtin.ID == BuiltinValueKind::id) { \
   
     auto *fn = cast<llvm::Function>(IGF.IGM.getWillThrowFn());
     auto error = args.claimNext();
-    auto errorBuffer = IGF.getErrorResultSlot(
-               SILType::getPrimitiveObjectType(IGF.IGM.Context.getErrorDecl()
-                                                  ->getDeclaredType()
-                                                  ->getCanonicalType()));
+    auto errorBuffer = IGF.getCalleeErrorResultSlot(
+        SILType::getPrimitiveObjectType(IGF.IGM.Context.getErrorDecl()
+                                            ->getDeclaredInterfaceType()
+                                            ->getCanonicalType()));
     IGF.Builder.CreateStore(error, errorBuffer);
     
     auto context = llvm::UndefValue::get(IGF.IGM.Int8PtrTy);
@@ -396,7 +586,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
   if (Builtin.ID == BuiltinValueKind::AssumeTrue) {
     llvm::Value *v = args.claimNext();
     if (v->getType() == IGF.IGM.Int1Ty) {
-      IGF.Builder.CreateIntrinsicCall(llvm::Intrinsic::ID::assume, v);
+      IGF.Builder.CreateIntrinsicCall(llvm::Intrinsic::assume, v);
     }
     return;
   }
@@ -497,15 +687,15 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     bool isWeak = false, isVolatile = false, isSingleThread = false;
     if (NextPart != Parts.end() && *NextPart == "weak") {
       isWeak = true;
-      NextPart++;
+      ++NextPart;
     }
     if (NextPart != Parts.end() && *NextPart == "volatile") {
       isVolatile = true;
-      NextPart++;
+      ++NextPart;
     }
     if (NextPart != Parts.end() && *NextPart == "singlethread") {
       isSingleThread = true;
-      NextPart++;
+      ++NextPart;
     }
     assert(NextPart == Parts.end() && "Mismatch with sema");
 
@@ -635,7 +825,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     // If the type is floating-point, then we need to bitcast to integer.
     auto valueTy = origValueTy;
     if (valueTy->isFloatingPointTy()) {
-      valueTy = llvm::IntegerType::get(IGF.IGM.LLVMContext,
+      valueTy = llvm::IntegerType::get(IGF.IGM.getLLVMContext(),
                                        valueTy->getPrimitiveSizeInBits());
     }
 
@@ -686,14 +876,34 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     out.add(IGF.Builder.CreateInsertElement(vector, newValue, index));
     return;
   }
+  
+  if (Builtin.ID == BuiltinValueKind::ShuffleVector) {
+    using namespace llvm;
+
+    auto dict0 = args.claimNext();
+    auto dict1 = args.claimNext();
+    auto index = args.claimNext();
+    out.add(IGF.Builder.CreateShuffleVector(dict0, dict1, index));
+    return;
+  }
 
   if (Builtin.ID == BuiltinValueKind::SToSCheckedTrunc ||
       Builtin.ID == BuiltinValueKind::UToUCheckedTrunc ||
       Builtin.ID == BuiltinValueKind::SToUCheckedTrunc) {
+    bool Signed = (Builtin.ID == BuiltinValueKind::SToSCheckedTrunc);
+
+    auto FromType = Builtin.Types[0]->getCanonicalType();
+    auto ToTy = cast<llvm::IntegerType>(
+      IGF.IGM.getStorageTypeForLowered(Builtin.Types[1]->getCanonicalType()));
+
+    // Handle the arbitrary-precision truncate specially.
+    if (isa<BuiltinIntegerLiteralType>(FromType)) {
+      emitIntegerLiteralCheckedTrunc(IGF, args, ToTy, Signed, out);
+      return;
+    }
+
     auto FromTy =
-      IGF.IGM.getStorageTypeForLowered(Builtin.Types[0]->getCanonicalType());
-    auto ToTy =
-      IGF.IGM.getStorageTypeForLowered(Builtin.Types[1]->getCanonicalType());
+      IGF.IGM.getStorageTypeForLowered(FromType);
 
     // Compute the result for SToSCheckedTrunc_IntFrom_IntTo(Arg):
     //   Res = trunc_IntTo(Arg)
@@ -709,7 +919,6 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     //   return (Res, OverflowFlag)
     llvm::Value *Arg = args.claimNext();
     llvm::Value *Res = IGF.Builder.CreateTrunc(Arg, ToTy);
-    bool Signed = (Builtin.ID == BuiltinValueKind::SToSCheckedTrunc);
     llvm::Value *Ext = Signed ? IGF.Builder.CreateSExt(Res, FromTy) :
                                 IGF.Builder.CreateZExt(Res, FromTy);
     llvm::Value *OverflowCond = IGF.Builder.CreateICmpEQ(Arg, Ext);
@@ -748,40 +957,15 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     return out.add(OverflowFlag);
   }
 
-  if (Builtin.ID == BuiltinValueKind::SUCheckedConversion ||
-      Builtin.ID == BuiltinValueKind::USCheckedConversion) {
-    auto Ty =
-      IGF.IGM.getStorageTypeForLowered(Builtin.Types[0]->getCanonicalType());
-
-    // Report a sign error if the input parameter is a negative number, when
-    // interpreted as signed.
-    llvm::Value *Arg = args.claimNext();
-    llvm::Value *Zero = llvm::ConstantInt::get(Ty, 0);
-    llvm::Value *OverflowFlag = IGF.Builder.CreateICmpSLT(Arg, Zero);
-
-    // Return the tuple: (the result (same as input), the overflow flag).
-    out.add(Arg);
-    return out.add(OverflowFlag);
-  }
-
   // We are currently emitting code for '_convertFromBuiltinIntegerLiteral',
   // which will call the builtin and pass it a non-compile-time-const parameter.
   if (Builtin.ID == BuiltinValueKind::IntToFPWithOverflow) {
-    auto ToTy =
+    assert(Builtin.Types[0]->is<BuiltinIntegerLiteralType>());
+    auto toType =
       IGF.IGM.getStorageTypeForLowered(Builtin.Types[1]->getCanonicalType());
-    llvm::Value *Arg = args.claimNext();
-    unsigned bitSize = Arg->getType()->getScalarSizeInBits();
-    if (bitSize > 64) {
-      // TODO: the integer literal bit size is 2048, but we only have a 64-bit
-      // conversion function available (on all platforms).
-      Arg = IGF.Builder.CreateTrunc(Arg, IGF.IGM.Int64Ty);
-    } else if (bitSize < 64) {
-      // Just for completeness. IntToFPWithOverflow is currently only used to
-      // convert 2048 bit integer literals.
-      Arg = IGF.Builder.CreateSExt(Arg, IGF.IGM.Int64Ty);
-    }
-    llvm::Value *V = IGF.Builder.CreateSIToFP(Arg, ToTy);
-    return out.add(V);
+    auto result = emitIntegerLiteralToFP(IGF, args, toType);
+    out.add(result);
+    return;
   }
 
   if (Builtin.ID == BuiltinValueKind::Once
@@ -801,6 +985,8 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     
     // If we know the platform runtime's "done" value, emit the check inline.
     llvm::BasicBlock *doneBB = nullptr;
+    
+    llvm::BasicBlock *beforeBB = IGF.Builder.GetInsertBlock();
 
     if (auto ExpectedPred = IGF.IGM.TargetInfo.OnceDonePredicateValue) {
       auto PredValue = IGF.Builder.CreateLoad(PredPtr,
@@ -808,11 +994,15 @@ if (Builtin.ID == BuiltinValueKind::id) { \
       auto ExpectedPredValue = llvm::ConstantInt::getSigned(IGF.IGM.OnceTy,
                                                             *ExpectedPred);
       auto PredIsDone = IGF.Builder.CreateICmpEQ(PredValue, ExpectedPredValue);
+      PredIsDone = IGF.Builder.CreateExpect(PredIsDone,
+                                     llvm::ConstantInt::get(IGF.IGM.Int1Ty, 1));
       
       auto notDoneBB = IGF.createBasicBlock("once_not_done");
       doneBB = IGF.createBasicBlock("once_done");
       
       IGF.Builder.CreateCondBr(PredIsDone, doneBB, notDoneBB);
+      
+      IGF.Builder.SetInsertPoint(&IGF.CurFn->back());
       IGF.Builder.emitBlock(notDoneBB);
     }
     
@@ -824,6 +1014,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     // If we emitted the "done" check inline, join the branches.
     if (auto ExpectedPred = IGF.IGM.TargetInfo.OnceDonePredicateValue) {
       IGF.Builder.CreateBr(doneBB);
+      IGF.Builder.SetInsertPoint(beforeBB);
       IGF.Builder.emitBlock(doneBB);
       // We can assume the once predicate is in the "done" state now.
       auto PredValue = IGF.Builder.CreateLoad(PredPtr,
@@ -966,7 +1157,18 @@ if (Builtin.ID == BuiltinValueKind::id) { \
 
   if (Builtin.ID == BuiltinValueKind::TSanInoutAccess) {
     auto address = args.claimNext();
-    IGF.emitTSanInoutAccessCall(address);
+
+    // The tsanInoutAccess builtin takes a single argument, the address
+    // of the accessed storage
+    SILType accessedType = argTypes[0];
+
+    // Empty types (such as structs without stored properties) have a
+    // meaningless value for their address. We not should call into the
+    // TSan runtime to check for data races on accesses on such addresses.
+    if (!IGF.IGM.getTypeInfo(accessedType)
+        .isKnownEmpty(ResilienceExpansion::Maximal)) {
+      IGF.emitTSanInoutAccessCall(address);
+    }
     return;
   }
 
@@ -1000,11 +1202,23 @@ if (Builtin.ID == BuiltinValueKind::id) { \
                                /*constant*/ false,
                                llvm::GlobalValue::PrivateLinkage,
                                llvm::ConstantAggregateZero::get(flagStorageTy));
-    flag->setAlignment(IGF.IGM.getAtomicBoolAlignment().getValue());
+    flag->setAlignment(
+        llvm::MaybeAlign(IGF.IGM.getAtomicBoolAlignment().getValue()));
     entrypointArgs[6] = llvm::ConstantExpr::getBitCast(flag, IGF.IGM.Int8PtrTy);
 
     IGF.Builder.CreateCall(IGF.IGM.getSwift3ImplicitObjCEntrypointFn(),
                            entrypointArgs);
+    return;
+  }
+  
+  if (Builtin.ID == BuiltinValueKind::TypePtrAuthDiscriminator) {
+    (void)args.claimAll();
+    Type valueTy = substitutions.getReplacementTypes()[0];
+    
+    // The type should lower statically to a SILFunctionType.
+    auto loweredTy = IGF.IGM.getLoweredType(valueTy).castTo<SILFunctionType>();
+    
+    out.add(PointerAuthEntity(loweredTy).getTypeDiscriminator(IGF.IGM));
     return;
   }
 
@@ -1018,6 +1232,28 @@ if (Builtin.ID == BuiltinValueKind::id) { \
         IGF.Builder.CreateBitCast(metatypeRHS, IGF.IGM.Int8PtrTy);
 
     out.add(IGF.Builder.CreateICmpEQ(metatypeLHSCasted, metatypeRHSCasted));
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::AutoDiffCreateLinearMapContext) {
+    auto topLevelSubcontextSize = args.claimNext();
+    out.add(emitAutoDiffCreateLinearMapContext(IGF, topLevelSubcontextSize)
+                .getAddress());
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::AutoDiffProjectTopLevelSubcontext) {
+    Address allocatorAddr(args.claimNext(), IGF.IGM.getPointerAlignment());
+    out.add(
+        emitAutoDiffProjectTopLevelSubcontext(IGF, allocatorAddr).getAddress());
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::AutoDiffAllocateSubcontext) {
+    Address allocatorAddr(args.claimNext(), IGF.IGM.getPointerAlignment());
+    auto size = args.claimNext();
+    out.add(
+        emitAutoDiffAllocateSubcontext(IGF, allocatorAddr, size).getAddress());
     return;
   }
 

@@ -78,7 +78,7 @@ public:
 
 Lazy<CtorTesterSet> ConstructedTesters;
 
-/// \brief A test class that tries to check that construction and destruction
+/// A test class that tries to check that construction and destruction
 /// occur correctly.
 class CtorTester {
   friend class CtorTesterSet;
@@ -458,6 +458,19 @@ TYPED_TEST(BlotMapVectorTest, EraseTest2) {
 // Test insert() method
 TYPED_TEST(BlotMapVectorTest, InsertTest) {
   this->Map.insert(std::make_pair(this->getKey(), this->getValue()));
+  EXPECT_EQ(1u, this->Map.size());
+  EXPECT_EQ(this->getValue(), this->Map[this->getKey()]);
+  EXPECT_EQ(1u, this->Map.size());
+  this->NumExpectedLiveTesters = 1;
+}
+
+// Test try_emplace() method
+TYPED_TEST(BlotMapVectorTest, TryEmplaceTest) {
+  this->Map.try_emplace(this->getKey(), this->getValue());
+  EXPECT_EQ(1u, this->Map.size());
+  EXPECT_EQ(this->getValue(), this->Map[this->getKey()]);
+  EXPECT_EQ(1u, this->Map.size());
+  this->Map.try_emplace(this->getKey(), this->getValue());
   EXPECT_EQ(1u, this->Map.size());
   EXPECT_EQ(this->getValue(), this->Map[this->getKey()]);
   EXPECT_EQ(1u, this->Map.size());

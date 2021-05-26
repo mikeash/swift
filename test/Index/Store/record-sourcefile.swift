@@ -9,7 +9,7 @@
 // CHECK: struct/Swift | S1 | s:4file2S1V | <no-cgname> | Def,Ref,RelCont -
 // CHECK: instance-method/acc-get/Swift | getter:property | s:4file2S1V8propertySivg | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelRec,RelCall,RelAcc,RelCont - 
 // CHECK: instance-property/Swift | property | [[property_USR:s:4file2S1V8propertySivp]] | <no-cgname> | Def,Ref,Read,RelChild,RelCont -
-// CHECK: static-method/acc-get/Swift | getter:staticProperty | s:4file2S1V14staticPropertySivg | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelRec,RelCall,RelAcc,RelCont -
+// CHECK: static-method/acc-get/Swift | getter:staticProperty | s:4file2S1V14staticPropertySivgZ | <no-cgname> | Def,Ref,Call,Impl,RelChild,RelRec,RelCall,RelAcc,RelCont -
 // CHECK: static-property/Swift | staticProperty | s:{{.*}} | <no-cgname> | Def,Ref,Read,RelChild,RelCont -
 // CHECK: instance-property/Swift | computedPropertyGetSet | s:{{.*}} | <no-cgname> | Def,RelChild -
 // CHECK: struct/Swift | Int | s:Si | <no-cgname> | Ref -
@@ -30,7 +30,7 @@
 // CHECK: type-alias/Swift | TA | s:{{.*}} | <no-cgname> | Def,RelChild -
 // CHECK: class/Swift | C1 | s:{{.*}} | <no-cgname> | Def,Ref,RelBase,RelCont -
 // CHECK: instance-method/Swift | method() | s:{{.*}} | <no-cgname> | Def,Ref,Call,Dyn,RelChild,RelRec,RelCall,RelCont -
-// CHECK: class/Swift | C2 | s:{{.*}} | <no-cgname> | Def -
+// CHECK: class/Swift | C2 | s:{{.*}} | <no-cgname> | Def,Ref - RelChild,RelBase
 // CHECK: instance-method/Swift | method() | s:{{.*}} | <no-cgname> | Def,Dyn,RelChild,RelOver -
 // CHECK: function/Swift | takeC1(x:) | s:{{.*}} | <no-cgname> | Def -
 // CHECK: instance-method(test)/Swift | testFoo() | s:{{.*}} | <no-cgname> | Def,Dyn,RelChild -
@@ -151,3 +151,6 @@ class MyTestCase: XCTestCase {
 // CHECK-NEXT: RelChild | s:4file10MyTestCaseC
   func testFoo() { test1() }
 }
+
+// CHECK: [[@LINE+1]]:11 | class/Swift | s:4file2C2C | Ref | rel: 0
+extension C2 {}

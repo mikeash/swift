@@ -13,9 +13,9 @@ struct DidSetWillSetTests: ForceAccessors {
   }
 
   var a: Int {
-    // CHECK-LABEL: sil private @$s10properties010DidSetWillC5TestsV1a{{[_0-9a-zA-Z]*}}vw
+    // CHECK-LABEL: sil private [ossa] @$s10properties010DidSetWillC5TestsV1a{{[_0-9a-zA-Z]*}}vw
     willSet(newA) {
-      // CHECK: bb0(%0 : @trivial $Int, %1 : @trivial $*DidSetWillSetTests):
+      // CHECK: bb0(%0 : $Int, %1 : $*DidSetWillSetTests):
 
       a = zero  // reassign, but don't infinite loop, as accessing on 'self'.
 
@@ -59,7 +59,7 @@ struct DidSetWillSetTests: ForceAccessors {
       // CHECK-NEXT: end_access [[WRITE]] : $*DidSetWillSetTests
     }
 
-    // CHECK-LABEL: sil private @$s10properties010DidSetWillC5TestsV1a{{[_0-9a-zA-Z]*}}vW
+    // CHECK-LABEL: sil private [ossa] @$s10properties010DidSetWillC5TestsV1a{{[_0-9a-zA-Z]*}}vW
     didSet {
       (self).a = zero  // reassign, but don't infinite loop, as accessing on 'self'.
 
@@ -70,7 +70,7 @@ struct DidSetWillSetTests: ForceAccessors {
       // CHECK-NEXT: [[READ:%.*]] = begin_access [read] [dynamic] [[ZEROADDR]] : $*Int
       // CHECK-NEXT: [[ZERO:%.*]] = load [trivial] [[READ]]
       // CHECK-NEXT: end_access [[READ]] : $*Int
-      // CHECK-NEXT: [[WRITE:%.*]] = begin_access [modify] [unknown] %1
+      // CHECK-NEXT: [[WRITE:%.*]] = begin_access [modify] [unknown] %0
       // CHECK-NEXT: [[AADDR:%.*]] = struct_element_addr [[WRITE]] : $*DidSetWillSetTests, #DidSetWillSetTests.a
       // CHECK-NEXT: assign [[ZERO]] to [[AADDR]]
 
@@ -107,7 +107,7 @@ struct DidSetWillSetTests: ForceAccessors {
 
       // CHECK: [[BOX:%.*]] = alloc_box ${ var DidSetWillSetTests }, var, name "other"
       // CHECK-NEXT: [[BOXADDR:%.*]] = project_box [[BOX]] : ${ var DidSetWillSetTests }, 0
-      // CHECK-NEXT: [[READ_SELF:%.*]] = begin_access [read] [unknown] %1 : $*DidSetWillSetTests
+      // CHECK-NEXT: [[READ_SELF:%.*]] = begin_access [read] [unknown] %0 : $*DidSetWillSetTests
       // CHECK-NEXT: copy_addr [[READ_SELF]] to [initialization] [[BOXADDR]] : $*DidSetWillSetTests
       // CHECK-NEXT: end_access [[READ_SELF]] : $*DidSetWillSetTests
 

@@ -142,8 +142,8 @@ static bool canonicalizeInputFunction(Function &F, ARCEntryPointBuilder &B,
         // Have not encountered a strong retain/release. keep it in the
         // unknown retain/release list for now. It might get replaced
         // later.
-        if (NativeRefs.find(ArgVal) == NativeRefs.end()) {
-           UnknownObjectRetains[ArgVal].push_back(&CI);
+        if (!NativeRefs.contains(ArgVal)) {
+          UnknownObjectRetains[ArgVal].push_back(&CI);
         } else {
           B.setInsertPoint(&CI);
           B.createRetain(ArgVal, &CI);
@@ -189,7 +189,7 @@ static bool canonicalizeInputFunction(Function &F, ARCEntryPointBuilder &B,
         // Have not encountered a strong retain/release. keep it in the
         // unknown retain/release list for now. It might get replaced
         // later.
-        if (NativeRefs.find(ArgVal) == NativeRefs.end()) {
+        if (!NativeRefs.contains(ArgVal)) {
           UnknownObjectReleases[ArgVal].push_back(&CI);
         } else {
           B.setInsertPoint(&CI);
@@ -413,7 +413,7 @@ static bool performLocalRetainMotion(CallInst &Retain, BasicBlock &BB,
   BasicBlock::iterator BBI = Retain.getIterator(),
                        BBE = BB.getTerminator()->getIterator();
 
-  bool isObjCRetain = Retain.getCalledFunction()->getName() == "objc_retain";
+  bool isObjCRetain = Retain.getIntrinsicID() == llvm::Intrinsic::objc_retain;
 
   bool MadeProgress = false;
 
@@ -718,7 +718,7 @@ static bool performStoreOnlyObjectElimination(CallInst &Allocation,
       // it is perfectly fine to delete this instruction if all uses of the
       // instruction are also eliminable.
 
-      if (I->mayHaveSideEffects() || isa<TerminatorInst>(I))
+      if (I->mayHaveSideEffects() || I->isTerminator())
         return false;
       break;
 

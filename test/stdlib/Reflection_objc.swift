@@ -3,34 +3,38 @@
 // RUN: %target-clang %S/Inputs/Mirror/Mirror.mm -c -o %t/Mirror.mm.o -g
 // RUN: %target-build-swift -parse-stdlib %s -module-name Reflection -I %S/Inputs/Mirror/ -Xlinker %t/Mirror.mm.o -o %t/a.out
 // RUN: %target-codesign %t/a.out
-// RUN: %S/timeout.sh 360 %target-run %t/a.out %S/Inputs/shuffle.jpg | %FileCheck %s
-// REQUIRES: executable_test
+// RUN: %{python} %S/../Inputs/timeout.py 360 %target-run %t/a.out %S/Inputs/shuffle.jpg | %FileCheck %s
 // FIXME: timeout wrapper is necessary because the ASan test runs for hours
+
+// REQUIRES: executable_test
+// REQUIRES: objc_interop
+
+// rdar://problem/75006694
+// XFAIL: OS=macosx && CPU=arm64
 
 //
 // DO NOT add more tests to this file.  Add them to test/1_stdlib/Runtime.swift.
 //
 
-// XFAIL: linux
 
 import Swift
 import Foundation
 import simd
 
-#if os(macOS)
+#if canImport(AppKit)
 import AppKit
 
 typealias OSImage = NSImage
 typealias OSColor = NSColor
 typealias OSBezierPath = NSBezierPath
-#endif
-
-#if os(iOS) || os(tvOS) || os(watchOS)
+#elseif canImport(UIKit)
 import UIKit
 
 typealias OSImage = UIImage
 typealias OSColor = UIColor
 typealias OSBezierPath = UIBezierPath
+#else
+#error("Platform does not support UIKit or AppKit!")
 #endif
 
 // Check ObjC mirror implementation.
@@ -286,10 +290,9 @@ testQLO(HasStringQLO.self)
 // CHECK-NEXT: HasStringQLO overboard
 // CHECK-NEXT: CanaryBase overboard
 
-// simd types get no reflection info, so should have no mirror children
 let x = float4(0)
 print("float4 has \(Mirror(reflecting: x).children.count) children")
-// CHECK-NEXT: float4 has 0 children
+// CHECK-NEXT: float4 has 1 children
 
 // CHECK-LABEL: and now our song is done
 print("and now our song is done")

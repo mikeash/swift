@@ -1,6 +1,7 @@
 from __future__ import print_function
 import sys  # noqa: I201
-from kinds import SYNTAX_BASE_KINDS, kind_to_type, lowercase_first_word
+
+from .kinds import SYNTAX_BASE_KINDS, kind_to_type, lowercase_first_word
 
 
 def error(msg):
@@ -18,7 +19,8 @@ class Node(object):
 
     def __init__(self, name, description=None, kind=None, traits=None,
                  children=None, element=None, element_name=None,
-                 element_choices=None, omit_when_empty=False):
+                 element_choices=None, omit_when_empty=False, 
+                 elements_separated_by_newline=False):
         self.syntax_kind = name
         self.swift_syntax_kind = lowercase_first_word(name)
         self.name = kind_to_type(self.syntax_kind)
@@ -38,11 +40,15 @@ class Node(object):
 
         self.omit_when_empty = omit_when_empty
         self.collection_element = element or ""
+        # For SyntaxCollections make sure that the element_name is set.
+        assert(not self.is_syntax_collection() or element_name or
+               (element and element != 'Syntax'))
         # If there's a preferred name for the collection element that differs
         # from its supertype, use that.
         self.collection_element_name = element_name or self.collection_element
         self.collection_element_type = kind_to_type(self.collection_element)
         self.collection_element_choices = element_choices or []
+        self.elements_separated_by_newline = elements_separated_by_newline
 
     def is_base(self):
         """
@@ -78,7 +84,14 @@ class Node(object):
 
     def shall_be_omitted_when_empty(self):
         """
-        Returns 'True' if this node shall not be created while parsing if it 
+        Returns 'True' if this node shall not be created while parsing if it
         has no children.
         """
         return self.omit_when_empty
+
+    def is_token(self):
+        """
+        Returns true if this child has a token kind.
+        """
+        return 'Token' in self.syntax_kind or \
+            'Token' in self.collection_element

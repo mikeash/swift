@@ -87,9 +87,9 @@
 #ifndef SWIFT_SYNTAX_TRIVIA_H
 #define SWIFT_SYNTAX_TRIVIA_H
 
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/OwnedString.h"
 #include "swift/Basic/JSONSerialization.h"
-#include "swift/Basic/ByteTreeSerialization.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/YAMLTraits.h"
@@ -99,8 +99,6 @@
 namespace swift {
 namespace syntax {
 
-class AbsolutePosition;
-
 /// The kind of source trivia, such as spaces, newlines, or comments.
 enum class TriviaKind {
 % for trivia in TRIVIAS:
@@ -108,6 +106,8 @@ enum class TriviaKind {
   ${trivia.name},
 % end
 };
+
+bool isCommentTriviaKind(TriviaKind kind);
 
 /// A contiguous stretch of a single kind of trivia. The constituent part of
 /// a `Trivia` collection.
@@ -150,6 +150,8 @@ public:
 % end
 % end
 
+  static TriviaPiece fromText(TriviaKind kind, StringRef text);
+
   /// Return kind of the trivia.
   TriviaKind getKind() const { return Kind; }
 
@@ -174,9 +176,9 @@ public:
     llvm_unreachable("unhandled kind");
   }
 
-  bool isComment() const;
-
-  void accumulateAbsolutePosition(AbsolutePosition &Pos) const;
+  bool isComment() const {
+    return isCommentTriviaKind(getKind());
+  }
   
   /// Try to compose this and Next to one TriviaPiece.
   /// It returns true if it is succeeded.
@@ -293,7 +295,7 @@ struct Trivia {
   void appendOrSquash(const TriviaPiece &Next);
 
   /// Dump a debug representation of this Trivia collection to standard error.
-  void dump() const;
+  SWIFT_DEBUG_DUMP;
 
   /// Dump a debug representation of this Trivia collection to the provided
   /// stream and indentation level.
@@ -374,52 +376,6 @@ private:
   }
 };
 } // namespace syntax
-
-namespace byteTree {
-
-template <>
-struct WrapperTypeTraits<syntax::TriviaKind> {
-  static uint8_t numericValue(const syntax::TriviaKind &Kind) {
-    switch (Kind) {
-% for trivia in TRIVIAS:
-  case syntax::TriviaKind::${trivia.name}: return ${trivia.serialization_code};
-% end
-    }
-    llvm_unreachable("unhandled kind");
-  }
-
-  static void write(ByteTreeWriter &Writer, const syntax::TriviaKind &Kind,
-                    unsigned Index) {
-    Writer.write(numericValue(Kind), Index);
-  }
-};
-
-template <>
-struct ObjectTraits<syntax::TriviaPiece> {
-  static unsigned numFields(const syntax::TriviaPiece &Trivia,
-                            UserInfoMap &UserInfo) {
-    return 2;
-  }
-
-  static void write(ByteTreeWriter &Writer, const syntax::TriviaPiece &Trivia,
-                    UserInfoMap &UserInfo) {
-    Writer.write(Trivia.getKind(), /*Index=*/0);
-    // Write the trivia's text or count depending on its kind
-    switch (Trivia.getKind()) {
-% for trivia in TRIVIAS:
-    case syntax::TriviaKind::${trivia.name}:
-% if trivia.is_collection():
-      Writer.write(static_cast<uint32_t>(Trivia.getCount()), /*Index=*/1);
-% else:
-      Writer.write(Trivia.getText(), /*Index=*/1);
-% end
-      break;
-% end
-    }
-  }
-};
-
-} // end namespace byteTree
 
 namespace json {
 /// Serialization traits for TriviaPiece.
@@ -510,6 +466,7 @@ struct MappingTraits<swift::syntax::TriviaPiece> {
     }
 % end
     }
+    llvm_unreachable("covered switch");
   }
 };
 

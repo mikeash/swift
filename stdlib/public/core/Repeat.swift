@@ -25,7 +25,7 @@
 ///     // "Humperdinck"
 ///     // "Humperdinck"
 ///     // "Humperdinck"
-@_fixed_layout
+@frozen
 public struct Repeated<Element> {
   /// The number of elements in this collection.
   public let count: Int
@@ -107,3 +107,5 @@ extension Repeated: RandomAccessCollection {
 public func repeatElement<T>(_ element: T, count n: Int) -> Repeated<T> {
   return Repeated(_repeating: element, count: n)
 }
+
+extension Repeated: Sendable where Element: Sendable { }

@@ -13,27 +13,27 @@ Class.firstMethod()
 
 // The methods should not be deserialized in the mandatory pipeline.
 
-// CHECK-LABEL: sil [serialized] @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ : $@convention(method) (@thick Class.Type) -> (){{$}}
+// CHECK-LABEL: sil @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ : $@convention(method) (@thick Class.Type) -> (){{$}}
 // OPT-LABEL: sil public_external @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ : $@convention(method) (@thick Class.Type) -> () {
 
-// CHECK-LABEL: sil [serialized] @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ : $@convention(method) (@thick Class.Type) -> (){{$}}
+// CHECK-LABEL: sil @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ : $@convention(method) (@thick Class.Type) -> (){{$}}
 // OPT-LABEL: sil public_external @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ : $@convention(method) (@thick Class.Type) -> () {
 
-// CHECK-LABEL: sil [serialized] @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ : $@convention(method) (@thick Class.Type) -> (){{$}}
+// CHECK-LABEL: sil @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ : $@convention(method) (@thick Class.Type) -> (){{$}}
 // OPT-LABEL: sil public_external @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ : $@convention(method) (@thick Class.Type) -> () {
 
 // Make sure we deserialized the vtable.
 
-// CHECK:      sil_vtable [serialized] Class {
-// CHECK-NEXT:   #Class.firstMethod!1: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ
-// CHECK-NEXT:   #Class.secondMethod!1: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ
-// CHECK-NEXT:   #Class.thirdMethod!1: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ
-// CHECK-NEXT:   #Class.deinit!deallocator.1: @$s28vtable_deserialization_input5ClassCfD
+// CHECK:      sil_vtable Class {
+// CHECK-NEXT:   #Class.firstMethod: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ
+// CHECK-NEXT:   #Class.secondMethod: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ
+// CHECK-NEXT:   #Class.thirdMethod: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ
+// CHECK-NEXT:   #Class.deinit!deallocator: @$s28vtable_deserialization_input5ClassCfD
 // CHECK-NEXT: }
 
 // OPT:      sil_vtable Class {
-// OPT-NEXT:   #Class.firstMethod!1: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ
-// OPT-NEXT:   #Class.secondMethod!1: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ
-// OPT-NEXT:   #Class.thirdMethod!1: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ
-// OPT-NEXT:   #Class.deinit!deallocator.1: @$s28vtable_deserialization_input5ClassCfD
+// OPT-NEXT:   #Class.firstMethod: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11firstMethodyyFZ
+// OPT-NEXT:   #Class.secondMethod: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC12secondMethodyyFZ
+// OPT-NEXT:   #Class.thirdMethod: (Class.Type) -> () -> () : @$s28vtable_deserialization_input5ClassC11thirdMethodyyFZ
+// OPT-NEXT:   #Class.deinit!deallocator: @$s28vtable_deserialization_input5ClassCfD
 // OPT-NEXT: }

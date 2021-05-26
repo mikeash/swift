@@ -13,18 +13,21 @@
 #include "swift/IDE/Utils.h"
 #include "swift/Basic/Edit.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/Basic/Platform.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/Driver/FrontendUtil.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Subsystems.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/CodeGen/ObjectFilePCHContainerOperations.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
 #include "clang/Lex/PreprocessorOptions.h"
-#include "clang/Serialization/ASTReader.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
+#include "clang/Serialization/ASTReader.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -104,16 +107,9 @@ ide::isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf,
   SourceManager SM;
   auto BufferID = SM.addNewSourceBuffer(std::move(MemBuf));
   ParserUnit Parse(SM, SFKind, BufferID);
-  Parser &P = Parse.getParser();
-
-  bool Done;
-  do {
-    P.parseTopLevel();
-    Done = P.Tok.is(tok::eof);
-  } while (!Done);
-
+  Parse.parse();
   SourceCompleteResult SCR;
-  SCR.IsComplete = !P.isInputIncomplete();
+  SCR.IsComplete = !Parse.getParser().isInputIncomplete();
 
   // Use the same code that was in the REPL code to track the indent level
   // for now. In the future we should get this from the Parser if possible.
@@ -194,6 +190,195 @@ ide::isSourceInputComplete(StringRef Text,SourceFileKind SFKind) {
                                     SFKind);
 }
 
+static FrontendInputsAndOutputs resolveSymbolicLinksInInputs(
+    FrontendInputsAndOutputs &inputsAndOutputs, StringRef UnresolvedPrimaryFile,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
+    std::string &Error) {
+  assert(FileSystem);
+
+  llvm::SmallString<128> PrimaryFile;
+  if (auto err = FileSystem->getRealPath(UnresolvedPrimaryFile, PrimaryFile))
+    PrimaryFile = UnresolvedPrimaryFile;
+
+  unsigned primaryCount = 0;
+  // FIXME: The frontend should be dealing with symlinks, maybe similar to
+  // clang's FileManager ?
+  FrontendInputsAndOutputs replacementInputsAndOutputs;
+  for (const InputFile &input : inputsAndOutputs.getAllInputs()) {
+    llvm::SmallString<128> newFilename;
+    if (auto err = FileSystem->getRealPath(input.getFileName(), newFilename))
+      newFilename = input.getFileName();
+    llvm::sys::path::native(newFilename);
+    bool newIsPrimary = input.isPrimary() ||
+                        (!PrimaryFile.empty() && PrimaryFile == newFilename);
+    if (newIsPrimary) {
+      ++primaryCount;
+    }
+    assert(primaryCount < 2 && "cannot handle multiple primaries");
+
+    replacementInputsAndOutputs.addInput(
+        InputFile(newFilename.str(), newIsPrimary, input.getBuffer()));
+  }
+
+  if (PrimaryFile.empty() || primaryCount == 1) {
+    return replacementInputsAndOutputs;
+  }
+
+  llvm::SmallString<64> Err;
+  llvm::raw_svector_ostream OS(Err);
+  OS << "'" << PrimaryFile << "' is not part of the input files";
+  Error = std::string(OS.str());
+  return replacementInputsAndOutputs;
+}
+
+static void disableExpensiveSILOptions(SILOptions &Opts) {
+  // Disable the sanitizers.
+  Opts.Sanitizers = {};
+
+  // Disable PGO and code coverage.
+  Opts.GenerateProfile = false;
+  Opts.EmitProfileCoverageMapping = false;
+  Opts.UseProfile = "";
+}
+
+namespace {
+class StreamDiagConsumer : public DiagnosticConsumer {
+  llvm::raw_ostream &OS;
+
+public:
+  StreamDiagConsumer(llvm::raw_ostream &OS) : OS(OS) {}
+
+  void handleDiagnostic(SourceManager &SM,
+                        const DiagnosticInfo &Info) override {
+    // FIXME: Print location info if available.
+    switch (Info.Kind) {
+    case DiagnosticKind::Error:
+      OS << "error: ";
+      break;
+    case DiagnosticKind::Warning:
+      OS << "warning: ";
+      break;
+    case DiagnosticKind::Note:
+      OS << "note: ";
+      break;
+    case DiagnosticKind::Remark:
+      OS << "remark: ";
+      break;
+    }
+    DiagnosticEngine::formatDiagnosticText(OS, Info.FormatString,
+                                           Info.FormatArgs);
+  }
+};
+} // end anonymous namespace
+
+bool ide::initCompilerInvocation(
+    CompilerInvocation &Invocation, ArrayRef<const char *> OrigArgs,
+    DiagnosticEngine &Diags, StringRef UnresolvedPrimaryFile,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
+    const std::string &runtimeResourcePath,
+    const std::string &diagnosticDocumentationPath, time_t sessionTimestamp,
+    std::string &Error) {
+  SmallVector<const char *, 16> Args;
+  // Make sure to put '-resource-dir' and '-diagnostic-documentation-path' at
+  // the top to allow overriding them with the passed in arguments.
+  Args.push_back("-resource-dir");
+  Args.push_back(runtimeResourcePath.c_str());
+  Args.push_back("-Xfrontend");
+  Args.push_back("-diagnostic-documentation-path");
+  Args.push_back("-Xfrontend");
+  Args.push_back(diagnosticDocumentationPath.c_str());
+  Args.append(OrigArgs.begin(), OrigArgs.end());
+
+  SmallString<32> ErrStr;
+  llvm::raw_svector_ostream ErrOS(ErrStr);
+  StreamDiagConsumer DiagConsumer(ErrOS);
+  Diags.addConsumer(DiagConsumer);
+
+  bool InvocationCreationFailed =
+      driver::getSingleFrontendInvocationFromDriverArguments(
+          Args, Diags,
+          [&](ArrayRef<const char *> FrontendArgs) {
+            return Invocation.parseArgs(FrontendArgs, Diags);
+          },
+          /*ForceNoOutputs=*/true);
+
+  // Remove the StreamDiagConsumer as it's no longer needed.
+  Diags.removeConsumer(DiagConsumer);
+
+  Error = std::string(ErrOS.str());
+  if (InvocationCreationFailed) {
+    return true;
+  }
+
+  std::string SymlinkResolveError;
+  Invocation.getFrontendOptions().InputsAndOutputs =
+      resolveSymbolicLinksInInputs(
+          Invocation.getFrontendOptions().InputsAndOutputs,
+          UnresolvedPrimaryFile, FileSystem, SymlinkResolveError);
+
+  // SourceKit functionalities want to proceed even if there are missing inputs.
+  Invocation.getFrontendOptions().InputsAndOutputs
+      .setShouldRecoverMissingInputs();
+
+  if (!SymlinkResolveError.empty()) {
+    // resolveSymbolicLinksInInputs fails if the unresolved primary file is not
+    // in the input files. We can't recover from that.
+    Error += SymlinkResolveError;
+    return true;
+  }
+
+  ClangImporterOptions &ImporterOpts = Invocation.getClangImporterOptions();
+  ImporterOpts.DetailedPreprocessingRecord = true;
+
+  assert(!Invocation.getModuleName().empty());
+
+  auto &LangOpts = Invocation.getLangOptions();
+  LangOpts.AttachCommentsToDecls = true;
+  LangOpts.DiagnosticsEditorMode = true;
+  LangOpts.CollectParsedToken = true;
+  if (LangOpts.PlaygroundTransform) {
+    // The playground instrumenter changes the AST in ways that disrupt the
+    // SourceKit functionality. Since we don't need the instrumenter, and all we
+    // actually need is the playground semantics visible to the user, like
+    // silencing the "expression resolves to an unused l-value" error, disable it.
+    LangOpts.PlaygroundTransform = false;
+  }
+
+  // Disable the index-store functionality for the sourcekitd requests.
+  auto &FrontendOpts = Invocation.getFrontendOptions();
+  FrontendOpts.IndexStorePath.clear();
+  ImporterOpts.IndexStorePath.clear();
+
+  // Force the action type to be -typecheck. This affects importing the
+  // SwiftONoneSupport module.
+  FrontendOpts.RequestedAction = FrontendOptions::ActionType::Typecheck;
+
+  // We don't care about LLVMArgs
+  FrontendOpts.LLVMArgs.clear();
+
+  // To save the time for module validation, consider the lifetime of ASTManager
+  // as a single build session.
+  // NOTE: Do this only if '-disable-modules-validate-system-headers' is *not*
+  //       explicitly enabled.
+  auto &SearchPathOpts = Invocation.getSearchPathOptions();
+  if (!SearchPathOpts.DisableModulesValidateSystemDependencies) {
+    // NOTE: 'SessionTimestamp - 1' because clang compares it with '<=' that may
+    //       cause unnecessary validations if they happens within one second
+    //       from the SourceKit startup.
+    ImporterOpts.ExtraArgs.push_back("-fbuild-session-timestamp=" +
+                                     std::to_string(sessionTimestamp - 1));
+    ImporterOpts.ExtraArgs.push_back(
+        "-fmodules-validate-once-per-build-session");
+
+    SearchPathOpts.DisableModulesValidateSystemDependencies = true;
+  }
+
+  // Disable expensive SIL options to reduce time spent in SILGen.
+  disableExpensiveSILOptions(Invocation.getSILOptions());
+
+  return false;
+}
+
 // Adjust the cc1 triple string we got from clang, to make sure it will be
 // accepted when it goes through the swift clang importer.
 static std::string adjustClangTriple(StringRef TripleStr) {
@@ -226,7 +411,8 @@ static std::string adjustClangTriple(StringRef TripleStr) {
     }
     break;
   }
-  OS << '-' << Triple.getVendorName() << '-' << Triple.getOSName();
+  OS << '-' << Triple.getVendorName() << '-' <<
+      Triple.getOSAndEnvironmentName();
   OS.flush();
   return Result;
 }
@@ -351,7 +537,7 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
     llvm::SmallString<64> Str;
     Str += "-fmodule-name=";
     Str += ClangInvok->getLangOpts()->CurrentModule;
-    CCArgs.push_back(Str.str());
+    CCArgs.push_back(std::string(Str.str()));
   }
 
   if (PPOpts.DetailedRecord) {
@@ -360,7 +546,7 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
 
   if (!ClangInvok->getFrontendOpts().Inputs.empty()) {
     Invok.getFrontendOptions().ImplicitObjCHeaderPath =
-      ClangInvok->getFrontendOpts().Inputs[0].getFile();
+        ClangInvok->getFrontendOpts().Inputs[0].getFile().str();
   }
 
   return false;
@@ -482,46 +668,6 @@ ide::replacePlaceholders(std::unique_ptr<llvm::MemoryBuffer> InputBuf,
     if (HadPlaceholder)
       *HadPlaceholder = true;
   });
-}
-
-static std::string getPlistEntry(const llvm::Twine &Path, StringRef KeyName) {
-  auto BufOrErr = llvm::MemoryBuffer::getFile(Path);
-  if (!BufOrErr) {
-    llvm::errs() << BufOrErr.getError().message() << '\n';
-    return {};
-  }
-
-  std::string Key = "<key>";
-  Key += KeyName;
-  Key += "</key>";
-
-  StringRef Lines = BufOrErr.get()->getBuffer();
-  while (!Lines.empty()) {
-    StringRef CurLine;
-    std::tie(CurLine, Lines) = Lines.split('\n');
-    if (CurLine.find(Key) != StringRef::npos) {
-      std::tie(CurLine, Lines) = Lines.split('\n');
-      unsigned Begin = CurLine.find("<string>") + strlen("<string>");
-      unsigned End = CurLine.find("</string>");
-      return CurLine.substr(Begin, End-Begin);
-    }
-  }
-
-  return {};
-}
-
-std::string ide::getSDKName(StringRef Path) {
-  std::string Name = getPlistEntry(llvm::Twine(Path)+"/SDKSettings.plist",
-                                   "CanonicalName");
-  if (Name.empty() && Path.endswith(".sdk")) {
-    Name = llvm::sys::path::filename(Path).drop_back(strlen(".sdk"));
-  }
-  return Name;
-}
-
-std::string ide::getSDKVersion(StringRef Path) {
-  return getPlistEntry(llvm::Twine(Path)+"/System/Library/CoreServices/"
-                       "SystemVersion.plist", "ProductBuildVersion");
 }
 
 // Modules failing to load are commented-out.
@@ -774,8 +920,8 @@ void ide::collectModuleNames(StringRef SDKPath,
                                std::vector<std::string> &Modules) {
   std::string SDKName = getSDKName(SDKPath);
   std::string lowerSDKName = StringRef(SDKName).lower();
-  bool isOSXSDK = StringRef(lowerSDKName).find("macosx") != StringRef::npos;
-  bool isDeviceOnly = StringRef(lowerSDKName).find("iphoneos") != StringRef::npos;
+  bool isOSXSDK = StringRef(lowerSDKName).contains("macosx");
+  bool isDeviceOnly = StringRef(lowerSDKName).contains("iphoneos");
   auto Mods = isOSXSDK ? getOSXModuleList() : getiOSModuleList();
   Modules.insert(Modules.end(), Mods.begin(), Mods.end());
   if (isDeviceOnly) {
@@ -803,8 +949,7 @@ DeclNameViewer::DeclNameViewer(StringRef Text): IsValid(true), HasParen(false) {
     return;
   if ((IsValid = Labels.back().empty())) {
     Labels.pop_back();
-    std::transform(Labels.begin(), Labels.end(), Labels.begin(),
-        [](StringRef Label) {
+    llvm::transform(Labels, Labels.begin(), [](StringRef Label) {
       return Label == "_" ? StringRef() : Label;
     });
   }
@@ -817,7 +962,7 @@ unsigned DeclNameViewer::commonPartsCount(DeclNameViewer &Other) const {
   unsigned Len = std::min(args().size(), Other.args().size());
   for (unsigned I = 0; I < Len; ++ I) {
     if (args()[I] == Other.args()[I])
-      Result ++;
+      ++Result;
     else
       return Result;
   }
@@ -856,7 +1001,7 @@ struct swift::ide::SourceEditJsonConsumer::Implementation {
   }
   void accept(SourceManager &SM, CharSourceRange Range,
               llvm::StringRef Text) {
-    AllEdits.push_back({SM, Range, Text});
+    AllEdits.push_back({SM, Range, Text.str()});
   }
 };
 
@@ -871,6 +1016,26 @@ accept(SourceManager &SM, RegionType Type, ArrayRef<Replacement> Replacements) {
     Impl.accept(SM, Replacement.Range, Replacement.Text);
   }
 }
+
+swift::ide::SourceEditTextConsumer::
+SourceEditTextConsumer(llvm::raw_ostream &OS) : OS(OS) { }
+
+void swift::ide::SourceEditTextConsumer::
+accept(SourceManager &SM, RegionType Type, ArrayRef<Replacement> Replacements) {
+  for (const auto &Replacement: Replacements) {
+    CharSourceRange Range = Replacement.Range;
+    unsigned BufID = SM.findBufferContainingLoc(Range.getStart());
+    auto Path(SM.getIdentifierForBuffer(BufID));
+    auto Start = SM.getLineAndColumnInBuffer(Range.getStart());
+    auto End = SM.getLineAndColumnInBuffer(Range.getEnd());
+
+    OS << "// " << Path.str() << " ";
+    OS << Start.first << ":" << Start.second << " -> ";
+    OS << End.first << ":" << End.second << "\n";
+    OS << Replacement.Text << "\n";
+  }
+}
+
 namespace {
 class ClangFileRewriterHelper {
   unsigned InterestedId;
@@ -960,23 +1125,9 @@ bool swift::ide::isFromClang(const Decl *D) {
 }
 
 ClangNode swift::ide::getEffectiveClangNode(const Decl *decl) {
-  // Directly...
-  if (auto clangNode = decl->getClangNode())
-    return clangNode;
-
-  // Or via the nested "Code" enum.
-  if (auto nominal =
-      const_cast<NominalTypeDecl *>(dyn_cast<NominalTypeDecl>(decl))) {
-    auto &ctx = nominal->getASTContext();
-    auto flags = OptionSet<NominalTypeDecl::LookupDirectFlags>();
-    flags |= NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions;
-    for (auto code : nominal->lookupDirect(ctx.Id_Code, flags)) {
-      if (auto clangDecl = code->getClangDecl())
-        return clangDecl;
-    }
-  }
-
-  return ClangNode();
+  auto &ctx = decl->getASTContext();
+  auto *importer = static_cast<ClangImporter *>(ctx.getClangModuleLoader());
+  return importer->getEffectiveClangNode(decl);
 }
 
 /// Retrieve the Clang node for the given extension, if it has one.
@@ -995,4 +1146,145 @@ ClangNode swift::ide::extensionGetClangNode(const ExtensionDecl *ext) {
   }
 
   return ClangNode();
+}
+
+std::pair<Type, ConcreteDeclRef> swift::ide::getReferencedDecl(Expr *expr) {
+  auto exprTy = expr->getType();
+
+  // Look through unbound instance member accesses.
+  if (auto *dotSyntaxExpr = dyn_cast<DotSyntaxBaseIgnoredExpr>(expr))
+    expr = dotSyntaxExpr->getRHS();
+
+  // Look through the 'self' application.
+  if (auto *selfApplyExpr = dyn_cast<SelfApplyExpr>(expr))
+    expr = selfApplyExpr->getFn();
+
+  // Look through curry thunks.
+  if (auto *closure = dyn_cast<AutoClosureExpr>(expr))
+    if (auto *unwrappedThunk = closure->getUnwrappedCurryThunkExpr())
+      expr = unwrappedThunk;
+
+  // If this is an IUO result, unwrap the optional type.
+  auto refDecl = expr->getReferencedDecl();
+  if (!refDecl) {
+    if (auto *applyExpr = dyn_cast<ApplyExpr>(expr)) {
+      auto fnDecl = applyExpr->getFn()->getReferencedDecl();
+      if (auto *func = fnDecl.getDecl()) {
+        if (func->isImplicitlyUnwrappedOptional()) {
+          if (auto objectTy = exprTy->getOptionalObjectType())
+            exprTy = objectTy;
+        }
+      }
+    }
+  }
+
+  return std::make_pair(exprTy, refDecl);
+}
+
+bool swift::ide::isBeingCalled(ArrayRef<Expr *> ExprStack) {
+  if (ExprStack.empty())
+    return false;
+
+  Expr *Target = ExprStack.back();
+  auto UnderlyingDecl = getReferencedDecl(Target).second;
+  for (Expr *E: reverse(ExprStack)) {
+    auto *AE = dyn_cast<ApplyExpr>(E);
+    if (!AE || AE->isImplicit())
+      continue;
+    if (isa<ConstructorRefCallExpr>(AE) && AE->getArg() == Target)
+      return true;
+    if (isa<SelfApplyExpr>(AE))
+      continue;
+    if (getReferencedDecl(AE->getFn()).second == UnderlyingDecl)
+      return true;
+  }
+  return false;
+}
+
+static Expr *getContainingExpr(ArrayRef<Expr *> ExprStack, size_t index) {
+  if (ExprStack.size() > index)
+    return ExprStack.end()[-std::ptrdiff_t(index + 1)];
+  return nullptr;
+}
+
+Expr *swift::ide::getBase(ArrayRef<Expr *> ExprStack) {
+  if (ExprStack.empty())
+    return nullptr;
+
+  Expr *CurrentE = ExprStack.back();
+  Expr *ParentE = getContainingExpr(ExprStack, 1);
+  Expr *Base = nullptr;
+  if (auto DSE = dyn_cast_or_null<DotSyntaxCallExpr>(ParentE))
+    Base = DSE->getBase();
+  else if (auto MRE = dyn_cast<MemberRefExpr>(CurrentE))
+    Base = MRE->getBase();
+  else if (auto SE = dyn_cast<SubscriptExpr>(CurrentE))
+    Base = SE->getBase();
+
+  if (Base) {
+    while (auto ICE = dyn_cast<ImplicitConversionExpr>(Base))
+      Base = ICE->getSubExpr();
+    // DotSyntaxCallExpr with getBase() == CurrentE (ie. the current call is
+    // the base of another expression)
+    if (Base == CurrentE)
+      return nullptr;
+  }
+  return Base;
+}
+
+bool swift::ide::isDynamicCall(Expr *Base, ValueDecl *D) {
+  auto TyD = D->getDeclContext()->getSelfNominalTypeDecl();
+  if (!TyD)
+    return false;
+
+  if (isa<StructDecl>(TyD) || isa<EnumDecl>(TyD) || D->isFinal())
+    return false;
+
+  // super.method()
+  // TODO: Should be dynamic if `D` is marked as dynamic and @objc, but in
+  //       that case we really need to change the role the index outputs as
+  //       well - the overrides we'd want to include are from the type of
+  //       super up to `D`
+  if (Base->isSuperExpr())
+    return false;
+
+  // `SomeType.staticOrClassMethod()`
+  if (isa<TypeExpr>(Base))
+    return false;
+
+  // `type(of: foo).staticOrClassMethod()`, not "dynamic" if the instance type
+  // is a struct/enum or if it is a class and the function is a static method
+  // (rather than a class method).
+  if (auto IT = Base->getType()->getAs<MetatypeType>()) {
+    auto InstanceType = IT->getInstanceType();
+    if (InstanceType->getStructOrBoundGenericStruct() ||
+        InstanceType->getEnumOrBoundGenericEnum())
+      return false;
+    if (InstanceType->getClassOrBoundGenericClass() && D->isFinal())
+      return false;
+  }
+
+  return true;
+}
+
+void swift::ide::getReceiverType(Expr *Base,
+                                 SmallVectorImpl<NominalTypeDecl *> &Types) {
+  Type ReceiverTy = Base->getType();
+  if (!ReceiverTy)
+    return;
+
+  if (auto LVT = ReceiverTy->getAs<LValueType>())
+    ReceiverTy = LVT->getObjectType();
+  else if (auto MetaT = ReceiverTy->getAs<MetatypeType>())
+    ReceiverTy = MetaT->getInstanceType();
+  else if (auto SelfT = ReceiverTy->getAs<DynamicSelfType>())
+    ReceiverTy = SelfT->getSelfType();
+
+  // TODO: Handle generics and composed protocols
+  if (auto OpenedTy = ReceiverTy->getAs<OpenedArchetypeType>())
+    ReceiverTy = OpenedTy->getOpenedExistentialType();
+
+  if (auto TyD = ReceiverTy->getAnyNominal()) {
+    Types.push_back(TyD);
+  }
 }

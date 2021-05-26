@@ -17,11 +17,13 @@
 #ifndef SWIFT_IRGEN_GENDECL_H
 #define SWIFT_IRGEN_GENDECL_H
 
-#include "swift/Basic/OptimizationMode.h"
-#include "swift/SIL/SILLocation.h"
-#include "llvm/IR/CallingConv.h"
 #include "DebugTypeInfo.h"
 #include "IRGen.h"
+#include "swift/Basic/OptimizationMode.h"
+#include "swift/SIL/SILLocation.h"
+#include "clang/AST/DeclCXX.h"
+#include "llvm/IR/CallingConv.h"
+#include "llvm/Support/CommandLine.h"
 
 namespace llvm {
   class AttributeList;
@@ -50,11 +52,27 @@ namespace irgen {
   createVariable(IRGenModule &IGM, LinkInfo &linkInfo, llvm::Type *objectType,
                  Alignment alignment, DebugTypeInfo DebugType = DebugTypeInfo(),
                  Optional<SILLocation> DebugLoc = None,
-                 StringRef DebugName = StringRef(), bool heapAllocated = false,
-                 bool indirectForDebugInfo = false);
+                 StringRef DebugName = StringRef(), bool heapAllocated = false);
+
+  llvm::GlobalVariable *
+  createLinkerDirectiveVariable(IRGenModule &IGM, StringRef Name);
 
   void disableAddressSanitizer(IRGenModule &IGM, llvm::GlobalVariable *var);
+
+  /// If the calling convention for `ctor` doesn't match the calling convention
+  /// that we assumed for it when we imported it as `initializer`, emit and
+  /// return a thunk that conforms to the assumed calling convention. The thunk
+  /// is marked `alwaysinline`, so it doesn't generate any runtime overhead.
+  /// If the assumed calling convention was correct, just return `ctor`.
+  ///
+  /// See also comments in CXXMethodConventions in SIL/IR/SILFunctionType.cpp.
+  llvm::Constant *
+  emitCXXConstructorThunkIfNeeded(IRGenModule &IGM, Signature signature,
+                                  const clang::CXXConstructorDecl *ctor,
+                                  StringRef name, llvm::Constant *ctorAddress);
 }
 }
+
+extern llvm::cl::opt<bool> UseBasicDynamicReplacement;
 
 #endif

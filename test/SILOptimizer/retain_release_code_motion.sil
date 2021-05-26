@@ -1,6 +1,6 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -retain-sinking -late-release-hoisting %s | %FileCheck %s
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -release-hoisting %s | %FileCheck --check-prefix=CHECK-RELEASE-HOISTING %s
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -retain-sinking -retain-sinking -late-release-hoisting %s | %FileCheck --check-prefix=CHECK-MULTIPLE-RS-ROUNDS %s
+// RUN: %target-sil-opt -enable-sil-verify-all -retain-sinking -late-release-hoisting %s | %FileCheck %s
+// RUN: %target-sil-opt -enable-sil-verify-all -release-hoisting %s | %FileCheck --check-prefix=CHECK-RELEASE-HOISTING %s
+// RUN: %target-sil-opt -enable-sil-verify-all -retain-sinking -retain-sinking -late-release-hoisting %s | %FileCheck --check-prefix=CHECK-MULTIPLE-RS-ROUNDS %s
 
 import Builtin
 import Swift
@@ -30,6 +30,8 @@ struct A {
 }
 
 class fuzz { }
+
+protocol P : AnyObject { }
 
 enum Boo {
   case one
@@ -62,7 +64,7 @@ enum Optional<T> {
 }
 
 struct Unowned {
-  @sil_stored unowned let x: @sil_unowned Builtin.NativeObject
+  @_hasStorage unowned let x: @sil_unowned Builtin.NativeObject
 }
 
 sil @createS : $@convention(thin) () -> @owned S
@@ -265,7 +267,7 @@ bb3:
 }
 
 final class MyArrayBuffer {
-  @sil_stored var dummyElements: Int32
+  @_hasStorage var dummyElements: Int32
   init()
 }
 
@@ -718,3 +720,328 @@ bb2:
   return %9999 : $()
 }
 
+// Don't remove a retain of an AnyObject which comes from a metatype.
+//
+// CHECK-LABEL: sil @conditional_metatype_cast
+// CHECK: bb2([[ARG:%[0-9]+]] : $AnyObject):
+// CHECK: strong_retain [[ARG]]
+// CHECK: checked_cast_addr_br
+// CHECK: } // end sil function 'conditional_metatype_cast'
+sil @conditional_metatype_cast : $@convention(thin) () -> AnyObject {
+bb0:
+  %0 = metatype $@thick Int.Type
+  checked_cast_br %0 : $@thick Int.Type to AnyObject, bb2, bb1
+
+bb1:
+  unreachable
+
+bb2(%6 : $AnyObject):
+  strong_retain %6 : $AnyObject
+  %9 = alloc_stack $AnyObject
+  store %6 to %9 : $*AnyObject
+  %11 = alloc_stack $@thick Int.Type
+  checked_cast_addr_br take_always AnyObject in %9 : $*AnyObject to Int.Type in %11 : $*@thick Int.Type, bb3, bb4
+
+bb3:
+  dealloc_stack %11 : $*@thick Int.Type
+  dealloc_stack %9 : $*AnyObject
+  return %6 : $AnyObject
+
+bb4:
+  unreachable
+}
+
+// Don't remove a retain of an AnyObject which comes from a metatype.
+//
+// CHECK-LABEL: sil @unconditional_metatype_cast
+// CHECK: [[O:%[0-9]+]] = unconditional_checked_cast
+// CHECK: strong_retain [[O]]
+// CHECK: checked_cast_addr_br
+// CHECK: } // end sil function 'unconditional_metatype_cast'
+sil @unconditional_metatype_cast : $@convention(thin) () -> AnyObject {
+bb0:
+  %0 = metatype $@thick Int.Type
+  %6 = unconditional_checked_cast %0 : $@thick Int.Type to AnyObject
+  strong_retain %6 : $AnyObject
+  %9 = alloc_stack $AnyObject
+  store %6 to %9 : $*AnyObject
+  %11 = alloc_stack $@thick Int.Type
+  checked_cast_addr_br take_always AnyObject in %9 : $*AnyObject to Int.Type in %11 : $*@thick Int.Type, bb3, bb4
+
+bb3:
+  dealloc_stack %11 : $*@thick Int.Type
+  dealloc_stack %9 : $*AnyObject
+  return %6 : $AnyObject
+
+bb4:
+  unreachable
+}
+
+
+
+// Hoist releases above dealloc_stack
+// CHECK-LABEL: sil @testReleaseHoistDeallocStack : $@convention(thin) (AnyObject) -> () {
+// CHECK: bb0(%0 : $AnyObject):
+// CHECK-NOT:  retain
+// CHECK:      [[A:%.*]] = alloc_stack $Int64
+// CHECK-NEXT:  dealloc_stack [[A]] : $*Int64
+// CHECK-NOT:  release
+// CHECK-LABEL: } // end sil function 'testReleaseHoistDeallocStack'
+sil @testReleaseHoistDeallocStack : $@convention(thin) (AnyObject)->() {
+bb0(%0 : $AnyObject):
+  strong_retain %0 : $AnyObject
+  %alloc = alloc_stack $Int64
+  dealloc_stack %alloc : $*Int64
+  strong_release %0 : $AnyObject
+  %34 = tuple ()
+  return %34 : $()
+}
+
+// Do not hoist releases above builtins that operate on object references.
+//
+// CHECK-RELEASE-HOISTING-LABEL: sil @testCopyArray : $@convention(thin) (_ContiguousArrayBuffer<AnyObject>, Builtin.Word, Builtin.Word) -> Builtin.RawPointer {
+// CHECK-RELEASE-HOISTING: bb0(%0 : $_ContiguousArrayBuffer<AnyObject>, %1 : $Builtin.Word, %2 : $Builtin.Word):
+// CHECK-RELEASE-HOISTING:   builtin "copyArray"<AnyObject>
+// CHECK-RELEASE-HOISTING:   release_value %0 : $_ContiguousArrayBuffer<AnyObject>
+// CHECK-RELEASE-HOISTING-LABEL: } // end sil function 'testCopyArray'
+sil @testCopyArray : $@convention(thin) (_ContiguousArrayBuffer<AnyObject>, Builtin.Word, Builtin.Word) -> Builtin.RawPointer {
+bb0(%0 : $_ContiguousArrayBuffer<AnyObject>, %1 : $Builtin.Word, %2 : $Builtin.Word):
+  %eltty = metatype $@thick AnyObject.Protocol
+  %newptr = builtin "allocRaw"(%1 : $Builtin.Word, %1 : $Builtin.Word) : $Builtin.RawPointer
+  bind_memory %newptr : $Builtin.RawPointer, %1 : $Builtin.Word to $*AnyObject
+  %storage = struct_extract %0 : $_ContiguousArrayBuffer<AnyObject>, #_ContiguousArrayBuffer._storage
+  %elements = ref_tail_addr %storage : $__ContiguousArrayStorageBase, $AnyObject
+  %eltptr = address_to_pointer %elements : $*AnyObject to $Builtin.RawPointer
+  %objptr = struct $UnsafePointer<AnyObject> (%eltptr : $Builtin.RawPointer)
+  %ptrdep = mark_dependence %objptr : $UnsafePointer<AnyObject> on %storage : $__ContiguousArrayStorageBase
+  %rawptr = struct_extract %ptrdep : $UnsafePointer<AnyObject>, #UnsafePointer._rawValue
+  %copy = builtin "copyArray"<AnyObject>(%eltty : $@thick AnyObject.Protocol, %newptr : $Builtin.RawPointer, %rawptr : $Builtin.RawPointer, %1 : $Builtin.Word) : $()
+  release_value %0 : $_ContiguousArrayBuffer<AnyObject>
+  return %newptr : $Builtin.RawPointer
+}
+
+// CHECK-LABEL: sil @dontMoveOverExistentialToClassCast : $@convention(thin) (@guaranteed AnyObject) -> Optional<fuzz>
+// CHECK:    strong_retain %0
+// CHECK:    checked_cast_br %0
+// CHECK:  } // end sil function 'dontMoveOverExistentialToClassCast'
+sil @dontMoveOverExistentialToClassCast : $@convention(thin) (@guaranteed AnyObject) -> Optional<fuzz> {
+bb0(%0 : $AnyObject):
+  strong_retain %0 : $AnyObject
+  checked_cast_br %0 : $AnyObject to fuzz, bb1, bb2
+
+bb1(%18 : $fuzz):
+  %19 = enum $Optional<fuzz>, #Optional.some!enumelt, %18 : $fuzz
+  br bb3(%19 : $Optional<fuzz>)
+
+bb2:
+  strong_release %0 : $AnyObject
+  %22 = enum $Optional<fuzz>, #Optional.none!enumelt
+  br bb3(%22 : $Optional<fuzz>)
+
+bb3(%24 : $Optional<fuzz>):
+  return %24 : $Optional<fuzz>
+}
+
+// CHECK-LABEL: sil @dontMoveOverClassToExistentialCast : $@convention(thin) (@guaranteed fuzz) -> Optional<P>
+// CHECK:    strong_retain %0
+// CHECK:    checked_cast_br %0
+// CHECK:  } // end sil function 'dontMoveOverClassToExistentialCast'
+sil @dontMoveOverClassToExistentialCast : $@convention(thin) (@guaranteed fuzz) -> Optional<P> {
+bb0(%0 : $fuzz):
+  strong_retain %0 : $fuzz
+  checked_cast_br %0 : $fuzz to P, bb1, bb2
+
+bb1(%18 : $P):
+  %19 = enum $Optional<P>, #Optional.some!enumelt, %18 : $P
+  br bb3(%19 : $Optional<P>)
+
+bb2:
+  strong_release %0 : $fuzz
+  %22 = enum $Optional<P>, #Optional.none!enumelt
+  br bb3(%22 : $Optional<P>)
+
+bb3(%24 : $Optional<P>):
+  return %24 : $Optional<P>
+}
+
+// CHECK-LABEL: sil @dontMoveOverExistentialToExistentialCast : $@convention(thin) (@guaranteed AnyObject) -> Optional<P>
+// CHECK:    strong_retain %0
+// CHECK:    checked_cast_br %0
+// CHECK:  } // end sil function 'dontMoveOverExistentialToExistentialCast'
+sil @dontMoveOverExistentialToExistentialCast : $@convention(thin) (@guaranteed AnyObject) -> Optional<P> {
+bb0(%0 : $AnyObject):
+  strong_retain %0 : $AnyObject
+  checked_cast_br %0 : $AnyObject to P, bb1, bb2
+
+bb1(%18 : $P):
+  %19 = enum $Optional<P>, #Optional.some!enumelt, %18 : $P
+  br bb3(%19 : $Optional<P>)
+
+bb2:
+  strong_release %0 : $AnyObject
+  %22 = enum $Optional<P>, #Optional.none!enumelt
+  br bb3(%22 : $Optional<P>)
+
+bb3(%24 : $Optional<P>):
+  return %24 : $Optional<P>
+}
+
+// -----------------------------------------------------------------------------
+// Test EscapeAnalysis::mayReleaseContent
+// -----------------------------------------------------------------------------
+
+class Node {
+  var node: Node
+}
+struct Queue {
+  var node: Node
+}
+
+sil @getNode : $@convention(thin) () -> @owned Node
+
+// testInoutRelease helper.
+//
+// To test a corner case in canApplyDecrementRefCount, this function
+// cannot have "mayReadRC" or "global mayRelease" side effects.
+sil [ossa] @setNode : $@convention(thin) (@owned Node, @inout Queue) -> () {
+bb0(%0 : @owned $Node, %1 : $*Queue):
+  %new = struct $Queue(%0 : $Node)
+  store %new to [assign] %1 : $*Queue
+  %6 = tuple ()
+  return %6 : $()
+}
+
+// When analyzing this function for retain code motion,
+// AliasAnalysis::canApplyDecrementRefCount will query
+// EscapeAnalysis::mayReleaseContent, passing it an inout pointer for
+// the "released reference".
+//
+// rdar://74360041 (Assertion failed:
+// (!releasedReference->getType().isAddress() && "an address is never
+// a reference"), function mayReleaseContent
+//
+// CHECK-LABEL: sil @testInoutRelease : $@convention(thin) (@inout Queue) -> () {
+// CHECK: strong_retain
+// CHECK: apply {{.*}} : $@convention(thin) (@owned Node, @inout Queue) -> ()
+// CHECK-LABEL: } // end sil function 'testInoutRelease'
+sil @testInoutRelease : $@convention(thin) (@inout Queue) -> () {
+bb0(%0 : $*Queue):
+  %get = function_ref @getNode : $@convention(thin) () -> @owned Node
+  %node = apply %get() : $@convention(thin) () -> @owned Node
+  %set = function_ref @setNode : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  strong_retain %node : $Node
+  %call = apply %set(%node, %0) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  %12 = tuple ()
+  return %12 : $()
+}
+
+// Still cannot sink the retain because %extraNode is not unique.
+//
+// CHECK-LABEL: sil @testMayReleaseNoSink : $@convention(thin) (@inout Queue) -> () {
+// CHECK: strong_retain
+// CHECK: apply {{.*}} : $@convention(thin) (@owned Node, @inout Queue) -> ()
+// CHECK-LABEL: } // end sil function 'testMayReleaseNoSink'
+sil @testMayReleaseNoSink : $@convention(thin) (@inout Queue) -> () {
+bb0(%0 : $*Queue):
+  %get = function_ref @getNode : $@convention(thin) () -> @owned Node
+  %node = apply %get() : $@convention(thin) () -> @owned Node
+  %extraNode = apply %get() : $@convention(thin) () -> @owned Node
+  %set = function_ref @setNode : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  strong_retain %extraNode : $Node
+  %call = apply %set(%node, %0) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  %12 = tuple ()
+  return %12 : $()
+}
+
+// The retain of extraNode can sink here because is unique within this
+// function and not released by setNode.
+//
+// CHECK-LABEL: sil @testMayReleaseSink : $@convention(thin) (@inout Queue) -> () {
+// CHECK: apply {{.*}} : $@convention(thin) (@owned Node, @inout Queue) -> ()
+// CHECK: strong_retain
+// CHECK-LABEL: } // end sil function 'testMayReleaseSink'
+sil @testMayReleaseSink : $@convention(thin) (@inout Queue) -> () {
+bb0(%0 : $*Queue):
+  %get = function_ref @getNode : $@convention(thin) () -> @owned Node
+  %node = apply %get() : $@convention(thin) () -> @owned Node
+  %extraNode = alloc_ref $Node
+  %set = function_ref @setNode : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  strong_retain %extraNode : $Node
+  %call = apply %set(%node, %0) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  %12 = tuple ()
+  return %12 : $()
+}
+
+// Both the queue and node are unique and non-escaping, but we still
+// can't sink because the queue may point to the node.
+//
+// CHECK-LABEL: sil @testMayReleaseUniqNoSink : $@convention(thin) () -> () {
+// CHECK: strong_retain
+// CHECK: apply {{.*}} : $@convention(thin) (@owned Node, @inout Queue) -> ()
+// CHECK-LABEL: } // end sil function 'testMayReleaseUniqNoSink'
+sil @testMayReleaseUniqNoSink : $@convention(thin) () -> () {
+bb0:
+  %queue = alloc_stack $Queue
+  %extraNode = alloc_ref $Node
+  %set = function_ref @setNode : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  strong_retain %extraNode : $Node
+  %call = apply %set(%extraNode, %queue) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  dealloc_stack %queue : $*Queue
+  %12 = tuple ()
+  return %12 : $()
+}
+
+// %queue is unique, but %extraNode is not. We can still sink because
+// there's no connection.
+//
+// CHECK-LABEL: sil @testMayReleaseUniqSink : $@convention(thin) () -> () {
+// CHECK: apply {{.*}} : $@convention(thin) (@owned Node, @inout Queue) -> ()
+// CHECK: strong_retain
+// CHECK-LABEL: } // end sil function 'testMayReleaseUniqSink'
+sil @testMayReleaseUniqSink : $@convention(thin) () -> () {
+bb0:
+  %queue = alloc_stack $Queue
+  %get = function_ref @getNode : $@convention(thin) () -> @owned Node
+  %extraNode = apply %get() : $@convention(thin) () -> @owned Node
+  %node = alloc_ref $Node
+  %set = function_ref @setNode : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  strong_retain %extraNode : $Node
+  %call = apply %set(%node, %queue) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  dealloc_stack %queue : $*Queue
+  %12 = tuple ()
+  return %12 : $()
+}
+
+// CG: %queue -> %node1 -> %node2
+//
+// If the retain of %node2 sink below the call to @setNode, then when
+// @inout %queue is overwritten by setNode, both node1 and node2 are
+// freed. The subsequent retain of %node2 will crash.
+//
+// This used to be allowed because we reasoned that a local reference
+// to %node2 should have "its own retain". This is true, but it's
+// still important not to sink that retain for that local reference
+// below a call where that object may be indirectly released via
+// another destroyed object.
+//
+// CHECK-LABEL: sil @testMayReleaseIndirectSink : $@convention(thin) () -> () {
+// CHECK: strong_retain
+// CHECK: apply {{.*}} : $@convention(thin) (@owned Node, @inout Queue) -> ()
+// CHECK-LABEL: } // end sil function 'testMayReleaseIndirectSink'
+sil @testMayReleaseIndirectSink : $@convention(thin) () -> () {
+bb0:
+  %set = function_ref @setNode : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  %queue = alloc_stack $Queue
+  %node1 = alloc_ref $Node
+  %node2 = alloc_ref $Node
+  %addr = ref_element_addr %node1 : $Node, #Node.node
+  store %node2 to %addr : $*Node
+  %call1 = apply %set(%node1, %queue) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  %extraNode = alloc_ref $Node
+  strong_retain %node2 : $Node
+  // This call destroys %node1 which releases %node2.
+  %call2 = apply %set(%extraNode, %queue) : $@convention(thin) (@owned Node, @inout Queue) -> ()
+  dealloc_stack %queue : $*Queue
+  %12 = tuple ()
+  return %12 : $()
+}

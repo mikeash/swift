@@ -77,6 +77,32 @@ importer::getDefinitionForClangTypeDecl(const clang::Decl *D) {
   return None;
 }
 
+static bool isInLocalScope(const clang::Decl *D) {
+  const clang::DeclContext *LDC = D->getLexicalDeclContext();
+  while (true) {
+    if (LDC->isFunctionOrMethod())
+      return true;
+    if (!isa<clang::TagDecl>(LDC))
+      return false;
+    if (const auto *CRD = dyn_cast<clang::CXXRecordDecl>(LDC))
+      if (CRD->isLambda())
+        return true;
+    LDC = LDC->getLexicalParent();
+  }
+  return false;
+}
+
+const clang::Decl *
+importer::getFirstNonLocalDecl(const clang::Decl *D) {
+  D = D->getCanonicalDecl();
+  auto iter = llvm::find_if(D->redecls(), [](const clang::Decl *next) -> bool {
+    return !isInLocalScope(next);
+  });
+  if (iter == D->redecls_end())
+    return nullptr;
+  return *iter;
+}
+
 Optional<clang::Module *>
 importer::getClangSubmoduleForDecl(const clang::Decl *D,
                                    bool allowForwardDeclaration) {
@@ -91,7 +117,7 @@ importer::getClangSubmoduleForDecl(const clang::Decl *D,
   }
 
   if (!actual)
-    actual = D->getCanonicalDecl();
+    actual = getFirstNonLocalDecl(D);
 
   return actual->getImportedOwningModule();
 }
@@ -333,6 +359,7 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     case clang::BuiltinType::ARCUnbridgedCast:
     case clang::BuiltinType::BoundMember:
     case clang::BuiltinType::BuiltinFn:
+    case clang::BuiltinType::IncompleteMatrixIdx:
     case clang::BuiltinType::Overload:
     case clang::BuiltinType::PseudoObject:
     case clang::BuiltinType::UnknownAny:
@@ -365,6 +392,7 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     case clang::BuiltinType::SatULongFract:
     case clang::BuiltinType::Half:
     case clang::BuiltinType::LongDouble:
+    case clang::BuiltinType::BFloat16:
     case clang::BuiltinType::Float16:
     case clang::BuiltinType::Float128:
     case clang::BuiltinType::NullPtr:
@@ -419,10 +447,36 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
     case clang::BuiltinType::OCLClkEvent:
     case clang::BuiltinType::OCLQueue:
     case clang::BuiltinType::OCLReserveID:
+    case clang::BuiltinType::OCLIntelSubgroupAVCMcePayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImePayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCRefPayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCSicPayload:
+    case clang::BuiltinType::OCLIntelSubgroupAVCMceResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCRefResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCSicResult:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeResultSingleRefStreamout:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeResultDualRefStreamout:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeSingleRefStreamin:
+    case clang::BuiltinType::OCLIntelSubgroupAVCImeDualRefStreamin:
       return OmissionTypeName();
 
     // OpenMP types that don't have Swift equivalents.
     case clang::BuiltinType::OMPArraySection:
+    case clang::BuiltinType::OMPArrayShaping:
+    case clang::BuiltinType::OMPIterator:
+      return OmissionTypeName();
+
+    // ARM SVE builtin types that don't have Swift equivalents.
+#define SVE_TYPE(Name, Id, ...) \
+    case clang::BuiltinType::Id:
+#include "clang/Basic/AArch64SVEACLETypes.def"
+      return OmissionTypeName();
+
+    // PPC MMA builtin types that don't have Swift equivalents.
+#define PPC_VECTOR_TYPE(Name, Id, Size) \
+    case clang::BuiltinType::Id:
+#include "clang/Basic/PPCTypes.def"
       return OmissionTypeName();
     }
   }
@@ -446,10 +500,10 @@ OmissionTypeName importer::getClangTypeNameForOmission(clang::ASTContext &ctx,
   return StringRef();
 }
 
-static clang::SwiftNewtypeAttr *
+static clang::SwiftNewTypeAttr *
 retrieveNewTypeAttr(const clang::TypedefNameDecl *decl) {
   // Retrieve the attribute.
-  auto attr = decl->getAttr<clang::SwiftNewtypeAttr>();
+  auto attr = decl->getAttr<clang::SwiftNewTypeAttr>();
   if (!attr)
     return nullptr;
 
@@ -462,7 +516,7 @@ retrieveNewTypeAttr(const clang::TypedefNameDecl *decl) {
   return attr;
 }
 
-clang::SwiftNewtypeAttr *
+clang::SwiftNewTypeAttr *
 importer::getSwiftNewtypeAttr(const clang::TypedefNameDecl *decl,
                               ImportNameVersion version) {
   // Newtype was introduced in Swift 3
@@ -551,44 +605,26 @@ bool importer::isNSNotificationGlobal(const clang::NamedDecl *decl) {
 }
 
 bool importer::hasNativeSwiftDecl(const clang::Decl *decl) {
-  for (auto annotation : decl->specific_attrs<clang::AnnotateAttr>()) {
-    if (annotation->getAnnotation() == SWIFT_NATIVE_ANNOTATION_STRING) {
+  if (auto *attr = decl->getAttr<clang::ExternalSourceSymbolAttr>())
+    if (attr->getGeneratedDeclaration() && attr->getLanguage() == "Swift")
       return true;
-    }
-  }
-
-  if (auto *category = dyn_cast<clang::ObjCCategoryDecl>(decl)) {
-    clang::SourceLocation categoryNameLoc = category->getCategoryNameLoc();
-    if (categoryNameLoc.isMacroID()) {
-      // Climb up to the top-most macro invocation.
-      clang::ASTContext &clangCtx = category->getASTContext();
-      clang::SourceManager &SM = clangCtx.getSourceManager();
-
-      clang::SourceLocation macroCaller =
-          SM.getImmediateMacroCallerLoc(categoryNameLoc);
-      while (macroCaller.isMacroID()) {
-        categoryNameLoc = macroCaller;
-        macroCaller = SM.getImmediateMacroCallerLoc(categoryNameLoc);
-      }
-
-      StringRef macroName = clang::Lexer::getImmediateMacroName(
-          categoryNameLoc, SM, clangCtx.getLangOpts());
-      if (macroName == "SWIFT_EXTENSION")
-        return true;
-    }
-  }
-
   return false;
 }
 
 /// Translate the "nullability" notion from API notes into an optional type
 /// kind.
-OptionalTypeKind importer::translateNullability(clang::NullabilityKind kind) {
+OptionalTypeKind importer::translateNullability(
+    clang::NullabilityKind kind, bool stripNonResultOptionality) {
+  if (stripNonResultOptionality &&
+      kind != clang::NullabilityKind::NullableResult)
+    return OptionalTypeKind::OTK_None;
+
   switch (kind) {
   case clang::NullabilityKind::NonNull:
     return OptionalTypeKind::OTK_None;
 
   case clang::NullabilityKind::Nullable:
+  case clang::NullabilityKind::NullableResult:
     return OptionalTypeKind::OTK_Optional;
 
   case clang::NullabilityKind::Unspecified:
@@ -596,29 +632,7 @@ OptionalTypeKind importer::translateNullability(clang::NullabilityKind kind) {
   }
 
   llvm_unreachable("Invalid NullabilityKind.");
-}
-
-bool importer::hasDesignatedInitializers(
-    const clang::ObjCInterfaceDecl *classDecl) {
-  if (classDecl->hasDesignatedInitializers())
-    return true;
-
-  return false;
-}
-
-bool importer::isDesignatedInitializer(
-    const clang::ObjCInterfaceDecl *classDecl,
-    const clang::ObjCMethodDecl *method) {
-  // If the information is on the AST, use it.
-  if (classDecl->hasDesignatedInitializers()) {
-    auto *methodParent = method->getClassInterface();
-    if (!methodParent ||
-        methodParent->getCanonicalDecl() == classDecl->getCanonicalDecl()) {
-      return method->hasAttr<clang::ObjCDesignatedInitializerAttr>();
-    }
-  }
-
-  return false;
+  return OptionalTypeKind::OTK_Optional;
 }
 
 bool importer::isRequiredInitializer(const clang::ObjCMethodDecl *method) {
@@ -706,27 +720,25 @@ bool importer::isUnavailableInSwift(
     if (attr->getPlatform()->getName() == "swift")
       return true;
 
-    if (platformAvailability.filter &&
-        !platformAvailability.filter(attr->getPlatform()->getName())) {
+    if (!platformAvailability.isPlatformRelevant(
+            attr->getPlatform()->getName())) {
       continue;
     }
 
-    if (platformAvailability.deprecatedAsUnavailableFilter) {
-      llvm::VersionTuple version = attr->getDeprecated();
-      if (version.empty())
-        continue;
-      if (platformAvailability.deprecatedAsUnavailableFilter(
-            version.getMajor(), version.getMinor())) {
-        return true;
-      }
+
+    llvm::VersionTuple version = attr->getDeprecated();
+    if (version.empty())
+      continue;
+    if (platformAvailability.treatDeprecatedAsUnavailable(
+            decl, version, /*isAsync=*/false)) {
+      return true;
     }
   }
 
   return false;
 }
 
-OptionalTypeKind importer::getParamOptionality(version::Version swiftVersion,
-                                               const clang::ParmVarDecl *param,
+OptionalTypeKind importer::getParamOptionality(const clang::ParmVarDecl *param,
                                                bool knownNonNull) {
   auto &clangCtx = param->getASTContext();
 

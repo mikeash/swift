@@ -19,8 +19,8 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
+#include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -77,6 +77,10 @@ public:
   /// Traverse ProtocolConformanceMapCache recursively to determine sole
   /// conforming concrete type. 
   NominalTypeDecl *findSoleConformingType(ProtocolDecl *Protocol);
+
+  // Wrapper function to findSoleConformingType that checks for additional
+  // constraints for classes using ClassHierarchyAnalysis.
+  bool getSoleConformingType(ProtocolDecl *Protocol, ClassHierarchyAnalysis *CHA, CanType &ConcreteType);
 
 private:
   /// Compute inheritance properties.

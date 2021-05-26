@@ -205,21 +205,22 @@ func func_with_unknown_attr2(x: @unknown(_) Int) {} // expected-error {{unknown 
 func func_with_unknown_attr3(x: @unknown(Int) -> Int) {} // expected-error {{unknown attribute 'unknown'}}
 func func_with_unknown_attr4(x: @unknown(Int) throws -> Int) {} // expected-error {{unknown attribute 'unknown'}}
 func func_with_unknown_attr5(x: @unknown (x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}}
-func func_with_unknown_attr6(x: @unknown(x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}} expected-error {{expected parameter type following ':'}}
-func func_with_unknown_attr7(x: @unknown (Int) () -> Int) {} // expected-error {{unknown attribute 'unknown'}} expected-error {{expected ',' separator}} {{47-47=,}} expected-error {{unnamed parameters must be written with the empty name '_'}} {{48-48=_: }}
+func func_with_unknown_attr6(x: @unknown(x: Int, y: Int)) {} // expected-error {{unknown attribute 'unknown'}}
+func func_with_unknown_attr7(x: @unknown (Int) () -> Int) {} // expected-error {{unknown attribute 'unknown'}}
 
 func func_type_attribute_with_space(x: @convention (c) () -> Int) {} // OK. Known attributes can have space before its paren.
 
-// @thin is not supported except in SIL.
-var thinFunc : @thin () -> () // expected-error {{attribute is not supported}}
+// @thin and @pseudogeneric are not supported except in SIL.
+var thinFunc : @thin () -> () // expected-error {{unknown attribute 'thin'}}
+var pseudoGenericFunc : @pseudogeneric () -> () // expected-error {{unknown attribute 'pseudogeneric'}}
 
 @inline(never) func nolineFunc() {}
-@inline(never) var noinlineVar : Int // expected-error {{'@inline(never)' attribute cannot be applied to this declaration}} {{1-16=}}
+@inline(never) var noinlineVar : Int { return 0 }
 @inline(never) class FooClass { // expected-error {{'@inline(never)' attribute cannot be applied to this declaration}} {{1-16=}}
 }
 
 @inline(__always) func AlwaysInlineFunc() {}
-@inline(__always) var alwaysInlineVar : Int // expected-error {{'@inline(__always)' attribute cannot be applied to this declaration}} {{1-19=}}
+@inline(__always) var alwaysInlineVar : Int { return 0 }
 @inline(__always) class FooClass2 { // expected-error {{'@inline(__always)' attribute cannot be applied to this declaration}} {{1-19=}}
 }
 
@@ -262,8 +263,8 @@ class C {
   @_optimize(size) var c : Int // expected-error {{'@_optimize(size)' attribute cannot be applied to stored properties}}
 }
 
-class SILStored {
-  @sil_stored var x : Int = 42  // expected-error {{'sil_stored' only allowed in SIL modules}}
+class HasStorage {
+  @_hasStorage var x : Int = 42  // ok, _hasStorage is allowed here
 }
 
 @_show_in_interface protocol _underscored {}
@@ -273,3 +274,39 @@ class SILStored {
 @_invalid_attribute_ // expected-error {{unknown attribute '_invalid_attribute_'}}
 @inline(__always)
 public func sillyFunction() {}
+
+// rdar://problem/45732251: unowned/unowned(unsafe) optional lets are permitted
+func unownedOptionals(x: C) {
+  unowned let y: C? = x
+  unowned(unsafe) let y2: C? = x
+
+  _ = y
+  _ = y2
+}
+
+// @_nonEphemeral attribute
+struct S1<T> {
+  func foo(@_nonEphemeral _ x: String) {} // expected-error {{@_nonEphemeral attribute only applies to pointer types}}
+  func bar(@_nonEphemeral _ x: T) {} // expected-error {{@_nonEphemeral attribute only applies to pointer types}}
+
+  func baz<U>(@_nonEphemeral _ x: U) {} // expected-error {{@_nonEphemeral attribute only applies to pointer types}}
+
+  func qux(@_nonEphemeral _ x: UnsafeMutableRawPointer) {}
+  func quux(@_nonEphemeral _ x: UnsafeMutablePointer<Int>?) {}
+}
+
+@_nonEphemeral struct S2 {} // expected-error {{@_nonEphemeral may only be used on 'parameter' declarations}}
+
+protocol P {}
+extension P {
+  // Allow @_nonEphemeral on the protocol Self type, as the protocol could be adopted by a pointer type.
+  func foo(@_nonEphemeral _ x: Self) {}
+  func bar(@_nonEphemeral _ x: Self?) {}
+}
+
+enum E1 {
+  case str(@_nonEphemeral _: String) // expected-error {{expected parameter name followed by ':'}}
+  case ptr(@_nonEphemeral _: UnsafeMutableRawPointer) // expected-error {{expected parameter name followed by ':'}}
+
+  func foo() -> @_nonEphemeral UnsafeMutableRawPointer? { return nil } // expected-error {{attribute can only be applied to declarations, not types}}
+}

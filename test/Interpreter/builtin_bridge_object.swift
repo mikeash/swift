@@ -1,11 +1,10 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-build-swift -parse-stdlib %s -o %t/a.out
-// RUN: %target-codesign %t/a.out
-// RUN: %target-run %t/a.out | %FileCheck %s
+// RUN: %target-run-simple-swift(-Onone -parse-stdlib -Xfrontend -enable-copy-propagation) | %FileCheck %s --check-prefixes=CHECK,CHECK-DBG
+// RUN: %target-run-simple-swift(-O -parse-stdlib -Xfrontend -enable-copy-propagation) | %FileCheck --check-prefixes=CHECK,CHECK-OPT %s
+
 // REQUIRES: executable_test
+// REQUIRES: objc_interop
 
 // FIXME: rdar://problem/19648117 Needs splitting objc parts out
-// XFAIL: linux
 
 import Swift
 import SwiftShims
@@ -14,7 +13,7 @@ class C {
   deinit { print("deallocated") }
 }
 
-#if arch(i386) || arch(arm)
+#if arch(i386) || arch(arm) || arch(arm64_32)
 
 // We have no ObjC tagged pointers, and two low spare bits due to alignment.
 let NATIVE_SPARE_BITS: UInt = 0x0000_0003
@@ -29,7 +28,7 @@ let OBJC_TAGGED_POINTER_BITS: UInt = 0x8000_0000_0000_0001
 #elseif arch(arm64)
 
 // We have ObjC tagged pointers in the highest bit
-let NATIVE_SPARE_BITS: UInt = 0x7F00_0000_0000_0007
+let NATIVE_SPARE_BITS: UInt = 0x7000_0000_0000_0007
 let OBJC_TAGGED_POINTER_BITS: UInt = 0x8000_0000_0000_0000
 
 #elseif arch(powerpc64) || arch(powerpc64le)
@@ -65,20 +64,21 @@ if true {
   print(x === x1)
   // CHECK-NEXT: true
   print(x === x2)
+  // CHECK-OPT-NEXT: deallocated
+  // CHECK-DBG-NEXT: deallocated
 
   print(nonPointerBits(bo) == 0)
   // CHECK-NEXT: true
   
   var bo3 = Builtin.castToBridgeObject(C(), 0._builtinWordValue)
-  print(_getBool(Builtin.isUnique(&bo3)))
+  print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
   // CHECK-NEXT: true
   let bo4 = bo3
-  print(_getBool(Builtin.isUnique(&bo3)))
+  print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
   // CHECK-NEXT: false
   _fixLifetime(bo3)
   _fixLifetime(bo4)
 }
-// CHECK-NEXT: deallocated
 // CHECK-NEXT: deallocated
 
 // Try with all spare bits set.
@@ -93,20 +93,21 @@ if true {
   print(x === x1)
   // CHECK-NEXT: true
   print(x === x2)
+  // CHECK-OPT-NEXT: deallocated
+  // CHECK-DBG-NEXT: deallocated
   
   print(nonPointerBits(bo) == NATIVE_SPARE_BITS)
   // CHECK-NEXT: true
   
   var bo3 = Builtin.castToBridgeObject(C(), NATIVE_SPARE_BITS._builtinWordValue)
-  print(_getBool(Builtin.isUnique(&bo3)))
+  print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
   // CHECK-NEXT: true
   let bo4 = bo3
-  print(_getBool(Builtin.isUnique(&bo3)))
+  print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
   // CHECK-NEXT: false
   _fixLifetime(bo3)
   _fixLifetime(bo4)
 }
-// CHECK-NEXT: deallocated
 // CHECK-NEXT: deallocated
 
 
@@ -132,7 +133,7 @@ if true {
   print(x === x2)
 
   var bo3 = nonNativeBridgeObject(NSNumber(value: 22))
-  print(_getBool(Builtin.isUnique(&bo3)))
+  print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
   // CHECK-NEXT: false
   _fixLifetime(bo3)
 }
@@ -154,7 +155,7 @@ if true {
   print(x === x2)
   
   var bo3 = nonNativeBridgeObject(unTaggedString)
-  print(_getBool(Builtin.isUnique(&bo3)))
+  print(Bool(_builtinBooleanLiteral: Builtin.isUnique(&bo3)))
   // CHECK-NEXT: false
   _fixLifetime(bo3)
 }

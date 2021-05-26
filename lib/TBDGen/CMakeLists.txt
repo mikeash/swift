@@ -1,9 +1,15 @@
-add_subdirectory(tapi)
 
 add_swift_host_library(swiftTBDGen STATIC
-  ${TAPI_SOURCES}
+  APIGen.cpp
   TBDGen.cpp
-  LINK_LIBRARIES
-    swiftAST
-    swiftSIL
+  TBDGenRequests.cpp
+  LLVM_LINK_COMPONENTS
+    demangle
+    TextAPI
 )
+target_link_libraries(swiftTBDGen PRIVATE
+  swiftAST
+  swiftIRGen
+  swiftSIL)
+
+set_swift_llvm_is_available(swiftTBDGen)

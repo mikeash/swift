@@ -34,7 +34,8 @@ namespace driver {
   enum class LinkKind {
     None,
     Executable,
-    DynamicLibrary
+    DynamicLibrary,
+    StaticLibrary
   };
 
   /// Used by a Job to request a "filelist": a file containing a list of all
@@ -44,9 +45,11 @@ namespace driver {
   /// the Job this info is attached to.
   struct FilelistInfo {
     enum class WhichFiles : unsigned {
-      Input,
-      PrimaryInputs,
+      InputJobs,
+      SourceInputActions,
+      InputJobsAndSourceInputActions,
       Output,
+      IndexUnitOutputPaths,
       /// Batch mode frontend invocations may have so many supplementary
       /// outputs that they don't comfortably fit as command-line arguments.
       /// In that case, add a FilelistInfo to record the path to the file.

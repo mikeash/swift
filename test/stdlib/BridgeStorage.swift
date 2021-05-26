@@ -1,8 +1,8 @@
-//===--- BridgeStorage.swift.gyb ------------------------------*- swift -*-===//
+//===--- BridgeStorage.swift ----------------------------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -116,10 +116,10 @@ var unTaggedNSString : NSString {
 }
 
 allTests.test("_BridgeStorage") {
-  typealias B = _BridgeStorage<C, NSString>
+  typealias B = _BridgeStorage<C>
 
   let oy: NSString = "oy"
-  expectTrue(B(objC: oy).objCInstance == oy)
+  expectTrue(B(objC: oy).objCInstance === oy)
 
   for flag in [false, true] {
     do {
@@ -145,6 +145,8 @@ allTests.test("_BridgeStorage") {
         expectTrue(b.unflaggedNativeInstance === c)
         expectFalse(b.isUniquelyReferencedUnflaggedNative())
       }
+      // Keep 'c' alive for the isUniquelyReferenced check above.
+      _fixLifetime(c)
     }
 
   }
@@ -155,6 +157,7 @@ allTests.test("_BridgeStorage") {
   // Add a reference and verify that it's still native but no longer unique
   var c = b
   expectFalse(b.isUniquelyReferencedNative())
+  _fixLifetime(b) // make sure b is not killed early
   _fixLifetime(c) // make sure c is not killed early
 
   let n = C()

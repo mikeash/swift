@@ -11,11 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
-#include "swift/AST/ASTScope.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
+
+#include "llvm/Support/Host.h"
 
 namespace swift {
 namespace unittest {
@@ -27,7 +29,9 @@ namespace unittest {
 class TestContextBase {
 public:
   LangOptions LangOpts;
+  TypeCheckerOptions TypeCheckerOpts;
   SearchPathOptions SearchPathOpts;
+  ClangImporterOptions ClangImporterOpts;
   SourceManager SourceMgr;
   DiagnosticEngine Diags;
 
@@ -51,14 +55,28 @@ public:
   TestContext(ShouldDeclareOptionalTypes optionals = DoNotDeclareOptionalTypes);
 
   template <typename Nominal>
-  Nominal *makeNominal(StringRef name,
-                       GenericParamList *genericParams = nullptr) {
+  typename std::enable_if<!std::is_same<Nominal, swift::ClassDecl>::value,
+                          Nominal *>::type
+  makeNominal(StringRef name, GenericParamList *genericParams = nullptr) {
     auto result = new (Ctx) Nominal(SourceLoc(), Ctx.getIdentifier(name),
                                     SourceLoc(), /*inherited*/{},
                                     genericParams, FileForLookups);
     result->setAccess(AccessLevel::Internal);
     return result;
   }
+
+  template <typename Nominal>
+  typename std::enable_if<std::is_same<Nominal, swift::ClassDecl>::value,
+                          swift::ClassDecl *>::type
+  makeNominal(StringRef name, GenericParamList *genericParams = nullptr) {
+    auto result = new (Ctx) ClassDecl(SourceLoc(), Ctx.getIdentifier(name),
+                                      SourceLoc(), /*inherited*/{},
+                                      genericParams, FileForLookups,
+                                      /*isActor*/false);
+    result->setAccess(AccessLevel::Internal);
+    return result;
+  }
+
 };
 
 } // end namespace unittest

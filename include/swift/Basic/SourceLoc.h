@@ -17,6 +17,7 @@
 #ifndef SWIFT_BASIC_SOURCELOC_H
 #define SWIFT_BASIC_SOURCELOC_H
 
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/StringRef.h"
@@ -43,7 +44,13 @@ public:
   
   bool isValid() const { return Value.isValid(); }
   bool isInvalid() const { return !isValid(); }
-  
+
+  /// An explicit bool operator so one can check if a SourceLoc is valid in an
+  /// if statement:
+  ///
+  /// if (auto x = getSourceLoc()) { ... }
+  explicit operator bool() const { return isValid(); }
+
   bool operator==(const SourceLoc &RHS) const { return RHS.Value == Value; }
   bool operator!=(const SourceLoc &RHS) const { return !operator==(RHS); }
   
@@ -77,7 +84,15 @@ public:
     print(OS, SM, Tmp);
   }
 
-  void dump(const SourceManager &SM) const;
+  SWIFT_DEBUG_DUMPER(dump(const SourceManager &SM));
+
+	friend size_t hash_value(SourceLoc loc) {
+		return reinterpret_cast<uintptr_t>(loc.getOpaquePointerValue());
+	}
+
+	friend void simple_display(raw_ostream &OS, const SourceLoc &loc) {
+		// Nothing meaningful to print.
+	}
 };
 
 /// SourceRange in swift is a pair of locations.  However, note that the end
@@ -97,6 +112,12 @@ public:
   
   bool isValid() const { return Start.isValid(); }
   bool isInvalid() const { return !isValid(); }
+
+  /// An explicit bool operator so one can check if a SourceRange is valid in an
+  /// if statement:
+  ///
+  /// if (auto x = getSourceRange()) { ... }
+  explicit operator bool() const { return isValid(); }
 
   /// Extend this SourceRange to the smallest continuous SourceRange that
   /// includes both this range and the other one.
@@ -120,7 +141,7 @@ public:
     print(OS, SM, Tmp, PrintText);
   }
 
-  void dump(const SourceManager &SM) const;
+  SWIFT_DEBUG_DUMPER(dump(const SourceManager &SM));
 };
 
 /// A half-open character-based source range.
@@ -129,13 +150,13 @@ class CharSourceRange {
   unsigned ByteLength;
 
 public:
-  /// \brief Constructs an invalid range.
-  CharSourceRange() {}
+  /// Constructs an invalid range.
+  CharSourceRange() = default;
 
   CharSourceRange(SourceLoc Start, unsigned ByteLength)
     : Start(Start), ByteLength(ByteLength) {}
 
-  /// \brief Constructs a character range which starts and ends at the
+  /// Constructs a character range which starts and ends at the
   /// specified character locations.
   CharSourceRange(const SourceManager &SM, SourceLoc Start, SourceLoc End);
 
@@ -169,7 +190,7 @@ public:
      less_equal(Other.getEnd().Value.getPointer(), getEnd().Value.getPointer());
   }
 
-  /// \brief expands *this to cover Other
+  /// expands *this to cover Other
   void widen(CharSourceRange Other) {
     auto Diff = Other.getEnd().Value.getPointer() - getEnd().Value.getPointer();
     if (Diff > 0) {
@@ -192,7 +213,7 @@ public:
     return StringRef(Start.Value.getPointer(), ByteLength);
   }
 
-  /// \brief Return the length of this valid range in bytes.  Can be zero.
+  /// Return the length of this valid range in bytes.  Can be zero.
   unsigned getByteLength() const {
     assert(isValid() && "length does not make sense for an invalid range");
     return ByteLength;
@@ -211,7 +232,7 @@ public:
     print(OS, SM, Tmp, PrintText);
   }
   
-  void dump(const SourceManager &SM) const;
+  SWIFT_DEBUG_DUMPER(dump(const SourceManager &SM));
 };
 
 } // end namespace swift
@@ -257,10 +278,8 @@ template <> struct DenseMapInfo<swift::SourceRange> {
   }
 
   static unsigned getHashValue(const swift::SourceRange &Val) {
-    return hash_combine(DenseMapInfo<const void *>::getHashValue(
-                            Val.Start.getOpaquePointerValue()),
-                        DenseMapInfo<const void *>::getHashValue(
-                            Val.End.getOpaquePointerValue()));
+    return hash_combine(Val.Start.getOpaquePointerValue(),
+                        Val.End.getOpaquePointerValue());
   }
 
   static bool isEqual(const swift::SourceRange &LHS,

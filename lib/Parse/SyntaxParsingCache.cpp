@@ -16,6 +16,13 @@
 using namespace swift;
 using namespace swift::syntax;
 
+void SyntaxParsingCache::addEdit(size_t Start, size_t End,
+                                 size_t ReplacementLength) {
+  assert((Edits.empty() || Edits.back().End <= Start) &&
+         "'Start' must be greater than or equal to 'End' of the previous edit");
+  Edits.emplace_back(Start, End, ReplacementLength);
+}
+
 bool SyntaxParsingCache::nodeCanBeReused(const Syntax &Node, size_t NodeStart,
                                          size_t Position,
                                          SyntaxKind Kind) const {
@@ -34,14 +41,12 @@ bool SyntaxParsingCache::nodeCanBeReused(const Syntax &Node, size_t NodeStart,
   // StructDecl inside and `private struc Foo {}` parses as two CodeBlockItems
   // one for `private` and one for `struc Foo {}`
   size_t NextLeafNodeLength = 0;
-  if (auto NextNode = Node.getData().getNextNode()) {
+  if (auto NextNode = Node.getData()->getNextNode()) {
     auto NextLeafNode = NextNode->getFirstToken();
     auto NextRawNode = NextLeafNode->getRaw();
     assert(NextRawNode->isPresent());
     NextLeafNodeLength += NextRawNode->getTokenText().size();
-    for (auto TriviaPiece : NextRawNode->getLeadingTrivia()) {
-      NextLeafNodeLength += TriviaPiece.getTextLength();
-    }
+    NextLeafNodeLength += NextRawNode->getLeadingTriviaLength();
   }
 
   auto NodeEnd = NodeStart + Node.getTextLength();
@@ -80,25 +85,33 @@ llvm::Optional<Syntax> SyntaxParsingCache::lookUpFrom(const Syntax &Node,
   return llvm::None;
 }
 
-size_t SyntaxParsingCache::translateToPreEditPosition(
-    size_t PostEditPosition, llvm::SmallVector<SourceEdit, 4> Edits) {
+Optional<size_t>
+SyntaxParsingCache::translateToPreEditPosition(size_t PostEditPosition,
+                                               ArrayRef<SourceEdit> Edits) {
   size_t Position = PostEditPosition;
-  for (auto I = Edits.begin(), E = Edits.end(); I != E; ++I) {
-    auto Edit = *I;
-    if (Edit.End + Edit.ReplacementLength - Edit.originalLength() <= Position) {
-      Position = Position - Edit.ReplacementLength + Edit.originalLength();
-    }
+  for (auto &Edit : Edits) {
+    if (Edit.Start > Position)
+      // Remaining edits doesn't affect the position. (Edits are sorted)
+      break;
+    if (Edit.Start + Edit.ReplacementLength > Position)
+      // This is a position inserted by the edit, and thus doesn't exist in the
+      // pre-edit version of the file.
+      return None;
+
+    Position = Position - Edit.ReplacementLength + Edit.originalLength();
   }
   return Position;
 }
 
 llvm::Optional<Syntax> SyntaxParsingCache::lookUp(size_t NewPosition,
                                                   SyntaxKind Kind) {
-  size_t OldPosition = translateToPreEditPosition(NewPosition, Edits);
+  Optional<size_t> OldPosition = translateToPreEditPosition(NewPosition, Edits);
+  if (!OldPosition.hasValue())
+    return None;
 
-  auto Node = lookUpFrom(OldSyntaxTree, /*NodeStart=*/0, OldPosition, Kind);
+  auto Node = lookUpFrom(OldSyntaxTree, /*NodeStart=*/0, *OldPosition, Kind);
   if (Node.hasValue()) {
-    ReusedNodeIds.insert(Node->getId());
+    ReusedNodes.insert(Node->getRaw());
   }
   return Node;
 }
@@ -107,16 +120,16 @@ std::vector<SyntaxReuseRegion>
 SyntaxParsingCache::getReusedRegions(const SourceFileSyntax &SyntaxTree) const {
   /// Determines the reused source regions from reused syntax node IDs
   class ReusedRegionsCollector : public SyntaxVisitor {
-    std::unordered_set<SyntaxNodeId> ReusedNodeIds;
+    std::unordered_set<const RawSyntax *> ReusedNodes;
     std::vector<SyntaxReuseRegion> ReusedRegions;
 
-    bool didReuseNode(SyntaxNodeId NodeId) {
-      return ReusedNodeIds.count(NodeId) > 0;
+    bool didReuseNode(const RawSyntax *Node) {
+      return ReusedNodes.count(Node) > 0;
     }
 
   public:
-    ReusedRegionsCollector(std::unordered_set<SyntaxNodeId> ReusedNodeIds)
-        : ReusedNodeIds(ReusedNodeIds) {}
+    ReusedRegionsCollector(std::unordered_set<const RawSyntax *> ReusedNodes)
+        : ReusedNodes(ReusedNodes) {}
 
     const std::vector<SyntaxReuseRegion> &getReusedRegions() {
       std::sort(ReusedRegions.begin(), ReusedRegions.end(),
@@ -128,7 +141,7 @@ SyntaxParsingCache::getReusedRegions(const SourceFileSyntax &SyntaxTree) const {
     }
 
     void visit(Syntax Node) override {
-      if (didReuseNode(Node.getId())) {
+      if (didReuseNode(Node.getRaw())) {
         // Node has been reused, add it to the list
         auto Start = Node.getAbsolutePositionBeforeLeadingTrivia();
         auto End = Node.getAbsoluteEndPositionAfterTrailingTrivia();
@@ -145,7 +158,7 @@ SyntaxParsingCache::getReusedRegions(const SourceFileSyntax &SyntaxTree) const {
     }
   };
 
-  ReusedRegionsCollector ReuseRegionsCollector(getReusedNodeIds());
+  ReusedRegionsCollector ReuseRegionsCollector(getReusedNodes());
   ReuseRegionsCollector.collectReusedRegions(SyntaxTree);
   return ReuseRegionsCollector.getReusedRegions();
 }

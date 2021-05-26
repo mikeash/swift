@@ -51,7 +51,7 @@ class SILDebugInfoGenerator : public SILModuleTransform {
     uint64_t Pos = 0;
 
     void write_impl(const char *Ptr, size_t Size) override {
-      for (size_t Idx = 0; Idx < Size; Idx++) {
+      for (size_t Idx = 0; Idx < Size; ++Idx) {
         char c = Ptr[Idx];
         if (c == '\n')
         ++LineNum;
@@ -125,10 +125,10 @@ class SILDebugInfoGenerator : public SILModuleTransform {
         PrintedFuncs.push_back(F);
 
         // Set the debug scope for the function.
-        SILLocation::DebugLoc DL(Ctx.LCS.LineNum, 1, FileNameBuf);
-        RegularLocation Loc(DL);
+        RegularLocation Loc(SILLocation::FilenameAndLocation::alloc(
+             Ctx.LCS.LineNum, 1,FileNameBuf, *M));
         SILDebugScope *Scope = new (*M) SILDebugScope(Loc, F);
-        F->setDebugScope(Scope);
+        F->setSILDebugScope(Scope);
 
         // Ensure that the function is visible for debugging.
         F->setBare(IsNotBare);
@@ -141,16 +141,28 @@ class SILDebugInfoGenerator : public SILModuleTransform {
       for (SILFunction *F : PrintedFuncs) {
         const SILDebugScope *Scope = F->getDebugScope();
         for (SILBasicBlock &BB : *F) {
-          for (SILInstruction &I : BB) {
-            SILLocation Loc = I.getLoc();
-            SILLocation::DebugLoc DL(Ctx.LineNums[&I], 1, FileNameBuf);
-            assert(DL.Line && "no line set for instruction");
-            if (Loc.is<ReturnLocation>() || Loc.is<ImplicitReturnLocation>()) {
-              Loc.setDebugInfoLoc(DL);
-              I.setDebugLocation(SILDebugLocation(Loc, Scope));
+          for (auto iter = BB.begin(), end = BB.end(); iter != end;) {
+            SILInstruction *I = &*iter;
+            ++iter;
+            if (isa<DebugValueInst>(I) || isa<DebugValueAddrInst>(I)) {
+              // debug_value and debug_value_addr are not needed anymore.
+              // Also, keeping them might trigger a verifier error.
+              I->eraseFromParent();
+              continue;
+            }
+            SILLocation Loc = I->getLoc();
+            auto *filePos = SILLocation::FilenameAndLocation::alloc(
+                Ctx.LineNums[I], 1, FileNameBuf, *M);
+            assert(filePos->line && "no line set for instruction");
+            if (Loc.is<ReturnLocation>()) {
+              I->setDebugLocation(
+                SILDebugLocation(ReturnLocation(filePos), Scope));
+            } else if (Loc.is<ImplicitReturnLocation>()) {
+              I->setDebugLocation(
+                SILDebugLocation(ImplicitReturnLocation(filePos), Scope));
             } else {
-              RegularLocation RLoc(DL);
-              I.setDebugLocation(SILDebugLocation(RLoc, Scope));
+              I->setDebugLocation(
+                SILDebugLocation(RegularLocation(filePos), Scope));
             }
           }
         }

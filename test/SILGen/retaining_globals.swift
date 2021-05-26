@@ -1,5 +1,5 @@
 
-// RUN: %target-swift-emit-silgen(mock-sdk: %clang-importer-sdk) -module-name retaining_globals -import-objc-header %S/Inputs/globals.h -enable-sil-ownership %s | %FileCheck %s
+// RUN: %target-swift-emit-silgen(mock-sdk: %clang-importer-sdk) -module-name retaining_globals -import-objc-header %S/Inputs/globals.h %s | %FileCheck %s
 // REQUIRES: objc_interop
 
 
@@ -27,7 +27,7 @@ func main() {
 
   // CHECK: [[globalString:%.*]] = load [copy] {{%.*}} : $*NSString
   // CHECK: [[bridgeStringFunc:%.*]] = function_ref @{{.*}} : $@convention(method) (@guaranteed Optional<NSString>, @thin String.Type) -> @owned String
-  // CHECK: [[wrappedString:%.*]] = enum $Optional<NSString>, #Optional.some!enumelt.1, [[globalString]] : $NSString
+  // CHECK: [[wrappedString:%.*]] = enum $Optional<NSString>, #Optional.some!enumelt, [[globalString]] : $NSString
   // CHECK: [[stringMetaType:%.*]] = metatype $@thin String.Type
   // CHECK: [[bridgedString:%.*]] = apply [[bridgeStringFunc]]([[wrappedString]], [[stringMetaType]]) : $@convention(method) (@guaranteed Optional<NSString>, @thin String.Type) -> @owned String
   let string = globalString // Problematic case, wasn't being retained

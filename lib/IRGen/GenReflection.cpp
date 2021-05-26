@@ -15,25 +15,33 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/Decl.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Platform.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/Reflection/MetadataSourceBuilder.h"
 #include "swift/Reflection/Records.h"
 #include "swift/SIL/SILModule.h"
 
 #include "ConstantBuilder.h"
+#include "Explosion.h"
+#include "Field.h"
 #include "GenClass.h"
 #include "GenDecl.h"
 #include "GenEnum.h"
 #include "GenHeap.h"
+#include "GenMeta.h"
 #include "GenProto.h"
 #include "GenType.h"
+#include "IRGenDebugInfo.h"
+#include "IRGenFunction.h"
 #include "IRGenMangler.h"
 #include "IRGenModule.h"
 #include "LoadableTypeInfo.h"
+#include "MetadataRequest.h"
 
 using namespace swift;
 using namespace irgen;
@@ -164,25 +172,323 @@ public:
   }
 };
 
-llvm::Constant *IRGenModule::getTypeRef(CanType type, MangledTypeRefRole role) {
+// Return the minimum Swift runtime version that supports demangling a given
+// type.
+static llvm::VersionTuple
+getRuntimeVersionThatSupportsDemanglingType(IRGenModule &IGM,
+                                            CanType type) {
+  // Associated types of opaque types weren't mangled in a usable form by the
+  // Swift 5.1 runtime, so we needed to add a new mangling in 5.2.
+  if (type->hasOpaqueArchetype()) {
+    auto hasOpaqueAssocType = type.findIf([](CanType t) -> bool {
+      if (auto a = dyn_cast<NestedArchetypeType>(t)) {
+        return isa<OpaqueTypeArchetypeType>(a->getRoot());
+      }
+      return false;
+    });
+    
+    if (hasOpaqueAssocType)
+      return llvm::VersionTuple(5, 2);
+    // Although opaque types in general were only added in Swift 5.1,
+    // declarations that use them are already covered by availability
+    // guards, so we don't need to limit availability of mangled names
+    // involving them.
+  }
+  
+  return llvm::VersionTuple(5, 0);
+}
+
+// Produce a fallback mangled type name that uses an open-coded callback
+// to form the metadata. This is useful for working around bugs in older
+// runtimes, or supporting new type system features when deploying back.
+//
+// Note that this functionality is limited, because the demangler callback
+// mechanism can only produce complete metadata. It can't be used in situations
+// where completing the metadata during demangling might cause cyclic
+// dependencies.
+static std::pair<llvm::Constant *, unsigned>
+getTypeRefByFunction(IRGenModule &IGM,
+                     CanGenericSignature sig,
+                     CanType t) {
+  IRGenMangler mangler;
+  std::string symbolName =
+    mangler.mangleSymbolNameForMangledMetadataAccessorString(
+                                                   "get_type_metadata", sig, t);
+  auto constant = IGM.getAddrOfStringForMetadataRef(symbolName, /*align*/2,
+                                                    /*low bit*/false,
+    [&](ConstantInitBuilder &B) {
+      llvm::Function *accessor;
+      
+      // Otherwise, we need to emit a helper function to bind the arguments
+      // out of the demangler's argument buffer.
+      auto fnTy = llvm::FunctionType::get(IGM.TypeMetadataPtrTy,
+                                          {IGM.Int8PtrTy}, /*vararg*/ false);
+      accessor =
+        llvm::Function::Create(fnTy, llvm::GlobalValue::PrivateLinkage,
+                               symbolName, IGM.getModule());
+      accessor->setAttributes(IGM.constructInitialAttributes());
+      
+      SmallVector<GenericRequirement, 4> requirements;
+      GenericEnvironment *genericEnv = nullptr;
+      if (sig) {
+        enumerateGenericSignatureRequirements(sig,
+                [&](GenericRequirement reqt) { requirements.push_back(reqt); });
+        genericEnv = sig->getGenericEnvironment();
+      }
+      
+      {
+        IRGenFunction IGF(IGM, accessor);
+        if (IGM.DebugInfo)
+          IGM.DebugInfo->emitArtificialFunction(IGF, accessor);
+
+        auto bindingsBufPtr = IGF.collectParameters().claimNext();
+
+        auto substT = genericEnv
+          ? genericEnv->mapTypeIntoContext(t)->getCanonicalType()
+          : t;
+
+        bindFromGenericRequirementsBuffer(IGF, requirements,
+            Address(bindingsBufPtr, IGM.getPointerAlignment()),
+            MetadataState::Complete,
+            [&](CanType t) {
+              return genericEnv
+                ? genericEnv->mapTypeIntoContext(t)->getCanonicalType()
+                : t;
+            });
+
+        auto ret = IGF.emitTypeMetadataRef(substT);
+        IGF.Builder.CreateRet(ret);
+      }
+      // Form the mangled name with its relative reference.
+      auto S = B.beginStruct();
+      S.setPacked(true);
+      S.add(llvm::ConstantInt::get(IGM.Int8Ty, 255));
+      S.add(llvm::ConstantInt::get(IGM.Int8Ty, 9));
+      S.addRelativeAddress(accessor);
+
+      // And a null terminator!
+      S.addInt(IGM.Int8Ty, 0);
+
+      return S.finishAndCreateFuture();
+    });
+  return {constant, 6};
+}
+
+static std::pair<llvm::Constant *, unsigned>
+getTypeRefImpl(IRGenModule &IGM,
+               CanType type,
+               CanGenericSignature sig,
+               MangledTypeRefRole role) {
   switch (role) {
   case MangledTypeRefRole::DefaultAssociatedTypeWitness:
   case MangledTypeRefRole::Metadata:
-    // Note that we're using all of the nominal types referenced by this type.
-    type.findIf([&](CanType type) -> bool {
-      if (auto nominal = type.getAnyNominal())
-        this->IRGen.noteUseOfTypeMetadata(nominal);
-      return false;
-    });
+    // Note that we're using all of the nominal types referenced by this type,
+    // ensuring that we can always reconstruct type metadata from a mangled name
+    // in-process.
+    IGM.IRGen.noteUseOfTypeMetadata(type);
+    
+    // If the minimum deployment target's runtime demangler wouldn't understand
+    // this mangled name, then fall back to generating a "mangled name" with a
+    // symbolic reference with a callback function.
+    if (auto runtimeCompatVersion = getSwiftRuntimeCompatibilityVersionForTarget
+                                      (IGM.Context.LangOpts.Target)) {
+      if (*runtimeCompatVersion <
+            getRuntimeVersionThatSupportsDemanglingType(IGM, type)) {
+        return getTypeRefByFunction(IGM, sig, type);
+      }
+    }
+      
     break;
 
   case MangledTypeRefRole::Reflection:
+    // For reflection records only used for out-of-process reflection, we do not
+    // need to force emission of runtime type metadata.
+    IGM.IRGen.noteUseOfFieldDescriptors(type);
     break;
   }
 
   IRGenMangler Mangler;
-  auto SymbolicName = Mangler.mangleTypeForReflection(*this, type);
-  return getAddrOfStringForTypeRef(SymbolicName, role);
+  auto SymbolicName = Mangler.mangleTypeForReflection(IGM, sig, type);
+  return {IGM.getAddrOfStringForTypeRef(SymbolicName, role),
+          SymbolicName.runtimeSizeInBytes()};
+}
+
+std::pair<llvm::Constant *, unsigned>
+IRGenModule::getTypeRef(CanType type, CanGenericSignature sig,
+                        MangledTypeRefRole role) {
+  type = substOpaqueTypesWithUnderlyingTypes(type);
+  return getTypeRefImpl(*this, type, sig, role);
+}
+
+std::pair<llvm::Constant *, unsigned>
+IRGenModule::getTypeRef(Type type, GenericSignature genericSig,
+                        MangledTypeRefRole role) {
+  return getTypeRef(type->getCanonicalType(genericSig),
+                    genericSig.getCanonicalSignature(), role);
+}
+
+std::pair<llvm::Constant *, unsigned>
+IRGenModule::getLoweredTypeRef(SILType loweredType,
+                               CanGenericSignature genericSig,
+                               MangledTypeRefRole role) {
+  auto substTy =
+    substOpaqueTypesWithUnderlyingTypes(loweredType, genericSig);
+  auto type = substTy.getASTType();
+  if (substTy.hasArchetype())
+    type = type->mapTypeOutOfContext()->getCanonicalType();
+
+  return getTypeRefImpl(*this, type, genericSig, role);
+}
+
+/// Emit a mangled string referencing a specific protocol conformance, so that
+/// the runtime can fetch its witness table.
+///
+/// TODO: Currently this uses a stub mangling that just refers to an accessor
+/// function. We need to fully develop the mangling with the ability to refer
+/// to dependent conformances to be able to use mangled strings.
+llvm::Constant *
+IRGenModule::emitWitnessTableRefString(CanType type,
+                                      ProtocolConformanceRef conformance,
+                                      GenericSignature origGenericSig,
+                                      bool shouldSetLowBit) {
+  std::tie(type, conformance)
+    = substOpaqueTypesWithUnderlyingTypes(type, conformance);
+  
+  auto origType = type;
+  CanGenericSignature genericSig;
+  SmallVector<GenericRequirement, 4> requirements;
+  GenericEnvironment *genericEnv = nullptr;
+
+  if (origGenericSig) {
+    genericSig = origGenericSig.getCanonicalSignature();
+    enumerateGenericSignatureRequirements(genericSig,
+                [&](GenericRequirement reqt) { requirements.push_back(reqt); });
+    genericEnv = genericSig->getGenericEnvironment();
+  }
+
+  IRGenMangler mangler;
+  std::string symbolName =
+    mangler.mangleSymbolNameForMangledConformanceAccessorString(
+      "get_witness_table", genericSig, type, conformance);
+
+  return getAddrOfStringForMetadataRef(symbolName, /*alignment=*/2,
+      shouldSetLowBit,
+      [&](ConstantInitBuilder &B) {
+        // Build a stub that loads the necessary bindings from the key path's
+        // argument buffer then fetches the metadata.
+        auto fnTy = llvm::FunctionType::get(WitnessTablePtrTy,
+                                            {Int8PtrTy}, /*vararg*/ false);
+        auto accessorThunk =
+          llvm::Function::Create(fnTy, llvm::GlobalValue::PrivateLinkage,
+                                 symbolName, getModule());
+        accessorThunk->setAttributes(constructInitialAttributes());
+        
+        {
+          IRGenFunction IGF(*this, accessorThunk);
+          if (DebugInfo)
+            DebugInfo->emitArtificialFunction(IGF, accessorThunk);
+
+          if (type->hasTypeParameter()) {
+            auto bindingsBufPtr = IGF.collectParameters().claimNext();
+
+            bindFromGenericRequirementsBuffer(IGF, requirements,
+                Address(bindingsBufPtr, getPointerAlignment()),
+                MetadataState::Complete,
+                [&](CanType t) {
+                  return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
+                });
+
+            type = genericEnv->mapTypeIntoContext(type)->getCanonicalType();
+          }
+          if (origType->hasTypeParameter()) {
+            auto origSig = genericEnv->getGenericSignature();
+            conformance = conformance.subst(origType,
+              QueryInterfaceTypeSubstitutions(genericEnv),
+              LookUpConformanceInSignature(origSig.getPointer()));
+          }
+          auto ret = emitWitnessTableRef(IGF, type, conformance);
+          IGF.Builder.CreateRet(ret);
+        }
+
+        // Form the mangled name with its relative reference.
+        auto S = B.beginStruct();
+        S.setPacked(true);
+        S.add(llvm::ConstantInt::get(Int8Ty, 255));
+        S.add(llvm::ConstantInt::get(Int8Ty, 9));
+        S.addRelativeAddress(accessorThunk);
+
+        // And a null terminator!
+        S.addInt(Int8Ty, 0);
+
+        return S.finishAndCreateFuture();
+      });
+}
+
+
+llvm::Constant *IRGenModule::getMangledAssociatedConformance(
+                                  const NormalProtocolConformance *conformance,
+                                  const AssociatedConformance &requirement) {
+  // Figure out the name of the symbol to be used for the conformance.
+  IRGenMangler mangler;
+  auto symbolName =
+    mangler.mangleSymbolNameForAssociatedConformanceWitness(
+      conformance, requirement.getAssociation(),
+      requirement.getAssociatedRequirement());
+
+  // See if we emitted the constant already.
+  auto &entry = StringsForTypeRef[symbolName];
+  if (entry.second) {
+    return entry.second;
+  }
+
+  // Get the accessor for this associated conformance.
+  llvm::Function *accessor;
+  unsigned char kind;
+  if (conformance) {
+    kind = 7;
+    accessor = getAddrOfAssociatedTypeWitnessTableAccessFunction(conformance,
+                                                                requirement);
+  } else {
+    kind = 8;
+    accessor = getAddrOfDefaultAssociatedConformanceAccessor(requirement);
+  }
+
+  // Form the mangled name with its relative reference.
+  ConstantInitBuilder B(*this);
+  auto S = B.beginStruct();
+  S.setPacked(true);
+  S.add(llvm::ConstantInt::get(Int8Ty, 255));
+  S.add(llvm::ConstantInt::get(Int8Ty, kind));
+  S.addRelativeAddress(accessor);
+
+  // And a null terminator!
+  S.addInt(Int8Ty, 0);
+
+  auto finished = S.finishAndCreateFuture();
+  auto var = new llvm::GlobalVariable(Module, finished.getType(),
+                                      /*constant*/ true,
+                                      llvm::GlobalValue::LinkOnceODRLinkage,
+                                      nullptr,
+                                      symbolName);
+  ApplyIRLinkage(IRLinkage::InternalLinkOnceODR).to(var);
+  var->setAlignment(llvm::MaybeAlign(2));
+  setTrueConstGlobal(var);
+  var->setSection(getReflectionTypeRefSectionName());
+
+  finished.installInGlobal(var);
+
+  // Drill down to the i8* at the beginning of the constant.
+  auto addr = llvm::ConstantExpr::getBitCast(var, Int8PtrTy);
+
+  // Set the low bit.
+  unsigned bit = ProtocolRequirementFlags::AssociatedTypeMangledNameBit;
+  auto bitConstant = llvm::ConstantInt::get(IntPtrTy, bit);
+  addr = llvm::ConstantExpr::getGetElementPtr(nullptr, addr, bitConstant);
+
+  // Update the entry.
+  entry = {var, addr};
+
+  return addr;
 }
 
 class ReflectionMetadataBuilder {
@@ -198,51 +504,70 @@ protected:
   
   // Collect any builtin types referenced from this type.
   void addBuiltinTypeRefs(CanType type) {
-    type.visit([&](CanType t) {
-      if (IGM.getSwiftModule()->isStdlibModule() && isa<BuiltinType>(t))
-        IGM.BuiltinTypes.insert(t);
-
-      // We need size/alignment information for imported value types,
-      // so emit builtin descriptors for them.
-      //
-      // In effect they're treated like an opaque blob, which is OK
-      // for now, at least until we want to import C++ types or
-      // something like that.
-      //
-      // Classes and protocols go down a different path.
-      if (auto Nominal = t->getAnyNominal())
-        if (Nominal->hasClangNode()) {
-          if (auto CD = dyn_cast<ClassDecl>(Nominal))
-            IGM.ImportedClasses.insert(CD);
-          else if (auto PD = dyn_cast<ProtocolDecl>(Nominal))
-            IGM.ImportedProtocols.insert(PD);
-          else
-            IGM.OpaqueTypes.insert(Nominal);
-        }
-    });
+    if (IGM.getSwiftModule()->isStdlibModule()) {
+      type.visit([&](CanType t) {
+        if (isa<BuiltinType>(t))
+          IGM.BuiltinTypes.insert(t);
+      });
+    }
   }
 
   /// Add a 32-bit relative offset to a mangled typeref string
   /// in the typeref reflection section.
-  void addTypeRef(CanType type) {
-    B.addRelativeAddress(IGM.getTypeRef(type, MangledTypeRefRole::Reflection));
+  ///
+  /// By default, we use MangledTypeRefRole::Reflection, which does not
+  /// force emission of any type metadata referenced from the typeref.
+  ///
+  /// For reflection records which are demangled to produce type metadata
+  /// in-process, pass MangledTypeRefRole::Metadata instead.
+  void addTypeRef(Type type, GenericSignature genericSig,
+                  MangledTypeRefRole role =
+                      MangledTypeRefRole::Reflection) {
+    addTypeRef(type->getCanonicalType(genericSig),
+               genericSig.getCanonicalSignature(), role);
+  }
+
+  /// Add a 32-bit relative offset to a mangled typeref string
+  /// in the typeref reflection section.
+  ///
+  /// By default, we use MangledTypeRefRole::Reflection, which does not
+  /// force emission of any type metadata referenced from the typeref.
+  ///
+  /// For reflection records which are demangled to produce type metadata
+  /// in-process, pass MangledTypeRefRole::Metadata instead.
+  void addTypeRef(CanType type,
+                  CanGenericSignature sig,
+                  MangledTypeRefRole role =
+                      MangledTypeRefRole::Reflection) {
+    B.addRelativeAddress(IGM.getTypeRef(type, sig, role).first);
+    addBuiltinTypeRefs(type);
+  }
+
+  void
+  addLoweredTypeRef(SILType loweredType,
+                    CanGenericSignature genericSig,
+                    MangledTypeRefRole role = MangledTypeRefRole::Reflection) {
+    B.addRelativeAddress(
+        IGM.getLoweredTypeRef(loweredType, genericSig, role).first);
+    addBuiltinTypeRefs(loweredType.getASTType());
   }
 
   /// Add a 32-bit relative offset to a mangled nominal type string
   /// in the typeref reflection section.
-  void addNominalRef(const NominalTypeDecl *nominal) {
+  ///
+  /// See above comment about 'role'.
+  void addNominalRef(const NominalTypeDecl *nominal,
+                     MangledTypeRefRole role =
+                      MangledTypeRefRole::Reflection) {
     if (auto proto = dyn_cast<ProtocolDecl>(nominal)) {
       IRGenMangler mangler;
       SymbolicMangling mangledStr;
       mangledStr.String = mangler.mangleBareProtocol(proto);
       auto mangledName =
-        IGM.getAddrOfStringForTypeRef(mangledStr,
-                                      MangledTypeRefRole::Reflection);
+        IGM.getAddrOfStringForTypeRef(mangledStr, role);
       B.addRelativeAddress(mangledName);
     } else {
-      CanType type = nominal->getDeclaredType()->getCanonicalType();
-      B.addRelativeAddress(
-        IGM.getTypeRef(type, MangledTypeRefRole::Reflection));
+      addTypeRef(nominal->getDeclaredType(), GenericSignature(), role);
     }
   }
 
@@ -303,25 +628,21 @@ class AssociatedTypeMetadataBuilder : public ReflectionMetadataBuilder {
   ArrayRef<std::pair<StringRef, CanType>> AssociatedTypes;
 
   void layout() override {
-    // If the conforming type is generic, we just want to emit the
-    // unbound generic type here.
-    auto *Nominal = Conformance->getType()->getAnyNominal();
-    assert(Nominal && "Structural conformance?");
+    PrettyStackTraceConformance DebugStack("emitting associated type metadata",
+                                           Conformance);
 
-    PrettyStackTraceDecl DebugStack("emitting associated type metadata",
-                                    Nominal);
-
-    addTypeRef(Nominal->getDeclaredType()->getCanonicalType());
+    auto *DC = Conformance->getDeclContext();
+    addNominalRef(DC->getSelfNominalTypeDecl());
     addNominalRef(Conformance->getProtocol());
 
     B.addInt32(AssociatedTypes.size());
     B.addInt32(AssociatedTypeRecordSize);
 
+    auto genericSig = DC->getGenericSignatureOfContext().getCanonicalSignature();
     for (auto AssocTy : AssociatedTypes) {
       auto NameGlobal = IGM.getAddrOfFieldName(AssocTy.first);
       B.addRelativeAddress(NameGlobal);
-      addBuiltinTypeRefs(AssocTy.second);
-      addTypeRef(AssocTy.second);
+      addTypeRef(AssocTy.second, genericSig);
     }
   }
 
@@ -343,32 +664,54 @@ public:
 };
 
 class FieldTypeMetadataBuilder : public ReflectionMetadataBuilder {
-  const uint32_t fieldRecordSize = 12;
+public:
+  static const uint32_t FieldRecordSize = 12;
+  
+private:
   const NominalTypeDecl *NTD;
 
-  void addFieldDecl(const ValueDecl *value, CanType type,
-                    bool indirect=false) {
-    reflection::FieldRecordFlags flags;
-    flags.setIsIndirectCase(indirect);
-    if (auto var = dyn_cast<VarDecl>(value))
-      flags.setIsVar(!var->isLet());
-
+  void addField(reflection::FieldRecordFlags flags,
+                Type type, StringRef name) {
     B.addInt32(flags.getRawValue());
 
     if (!type) {
       B.addInt32(0);
     } else {
-      addTypeRef(type);
-      addBuiltinTypeRefs(type);
+      auto genericSig = NTD->getGenericSignature();
+
+      // The standard library's Mirror demangles metadata from field
+      // descriptors, so use MangledTypeRefRole::Metadata to ensure
+      // runtime metadata is available.
+      addTypeRef(type, genericSig, MangledTypeRefRole::Metadata);
     }
 
     if (IGM.IRGen.Opts.EnableReflectionNames) {
-      auto name = value->getBaseName().getIdentifier().str();
       auto fieldName = IGM.getAddrOfFieldName(name);
       B.addRelativeAddress(fieldName);
     } else {
       B.addInt32(0);
     }
+  }
+
+  void addField(Field field) {
+    reflection::FieldRecordFlags flags;
+    bool isLet = false;
+
+    switch (field.getKind()) {
+    case Field::Var: {
+      auto var = field.getVarDecl();
+      isLet = var->isLet();
+      break;
+    }
+    case Field::MissingMember:
+      llvm_unreachable("emitting reflection for type with missing member");
+    case Field::DefaultActorStorage:
+      flags.setIsArtificial();
+      break;
+    }
+    flags.setIsVar(!isLet);
+
+    addField(flags, field.getInterfaceType(IGM), field.getName());
   }
 
   void layoutRecord() {
@@ -384,22 +727,22 @@ class FieldTypeMetadataBuilder : public ReflectionMetadataBuilder {
     }
 
     B.addInt16(uint16_t(kind));
-    B.addInt16(fieldRecordSize);
+    B.addInt16(FieldRecordSize);
 
-    // Imported classes don't need field descriptors
-    if (NTD->hasClangNode() && isa<ClassDecl>(NTD)) {
-      B.addInt32(0);
-      return;
-    }
+    B.addInt32(getNumFields(NTD));
+    forEachField(IGM, NTD, [&](Field field) {
+      addField(field);
+    });
+  }
 
-    assert(!NTD->hasClangNode() || isa<StructDecl>(NTD));
+  void addField(const EnumDecl *enumDecl, const EnumElementDecl *decl,
+                bool hasPayload) {
+    reflection::FieldRecordFlags flags;
+    if (hasPayload && (decl->isIndirect() || enumDecl->isIndirect()))
+      flags.setIsIndirectCase();
 
-    auto properties = NTD->getStoredProperties();
-    B.addInt32(std::distance(properties.begin(), properties.end()));
-    for (auto property : properties)
-      addFieldDecl(property,
-                   property->getInterfaceType()
-                       ->getCanonicalType());
+    addField(flags, decl->getArgumentInterfaceType(),
+             decl->getBaseIdentifier().str());
   }
 
   void layoutEnum() {
@@ -410,61 +753,57 @@ class FieldTypeMetadataBuilder : public ReflectionMetadataBuilder {
 
     auto kind = FieldDescriptorKind::Enum;
 
-    // If this is a fixed-size multi-payload enum, we have to emit a descriptor
-    // with the size and alignment of the type, because the reflection library
-    // cannot derive this information at runtime.
     if (strategy.getElementsWithPayload().size() > 1 &&
         !strategy.needsPayloadSizeInMetadata()) {
       kind = FieldDescriptorKind::MultiPayloadEnum;
-      IGM.OpaqueTypes.insert(enumDecl);
     }
 
     B.addInt16(uint16_t(kind));
-    B.addInt16(fieldRecordSize);
+    B.addInt16(FieldRecordSize);
     B.addInt32(strategy.getElementsWithPayload().size()
                + strategy.getElementsWithNoPayload().size());
 
     for (auto enumCase : strategy.getElementsWithPayload()) {
-      bool indirect = (enumCase.decl->isIndirect() ||
-                       enumDecl->isIndirect());
-      addFieldDecl(enumCase.decl,
-                   enumCase.decl->getArgumentInterfaceType()
-                                ->getCanonicalType(),
-                   indirect);
+      addField(enumDecl, enumCase.decl, /*has payload*/ true);
     }
 
     for (auto enumCase : strategy.getElementsWithNoPayload()) {
-      addFieldDecl(enumCase.decl, CanType());
+      addField(enumDecl, enumCase.decl, /*has payload*/ false);
     }
   }
 
   void layoutProtocol() {
-    auto protocolDecl = cast<ProtocolDecl>(NTD);
+    auto PD = cast<ProtocolDecl>(NTD);
     FieldDescriptorKind Kind;
-    if (protocolDecl->isObjC())
+    if (PD->isObjC())
       Kind = FieldDescriptorKind::ObjCProtocol;
-    else if (protocolDecl->requiresClass())
+    else if (PD->requiresClass())
       Kind = FieldDescriptorKind::ClassProtocol;
     else
       Kind = FieldDescriptorKind::Protocol;
     B.addInt16(uint16_t(Kind));
-    B.addInt16(fieldRecordSize);
+    B.addInt16(FieldRecordSize);
     B.addInt32(0);
   }
 
   void layout() override {
-    if (NTD->hasClangNode() &&
-        !isa<ClassDecl>(NTD) &&
-        !isa<StructDecl>(NTD) &&
-        !isa<ProtocolDecl>(NTD))
-      return;
+    if (NTD->hasClangNode()) {
+      auto *enumDecl = dyn_cast<EnumDecl>(NTD);
+      // Structs and namespace-like enums are ok.
+      assert(isa<StructDecl>(NTD) || (enumDecl && !enumDecl->hasCases()));
+    }
 
     PrettyStackTraceDecl DebugStack("emitting field type metadata", NTD);
     addNominalRef(NTD);
 
     auto *CD = dyn_cast<ClassDecl>(NTD);
+    auto *PD = dyn_cast<ProtocolDecl>(NTD);
     if (CD && CD->getSuperclass()) {
-      addTypeRef(CD->getSuperclass()->getCanonicalType());
+      addTypeRef(CD->getSuperclass(),
+                 CD->getGenericSignature());
+    } else if (PD && PD->getDeclaredInterfaceType()->getSuperclass()) {
+      addTypeRef(PD->getDeclaredInterfaceType()->getSuperclass(),
+                 PD->getGenericSignature());
     } else {
       B.addInt32(0);
     }
@@ -505,6 +844,57 @@ public:
   }
 };
 
+static bool
+deploymentTargetHasRemoteMirrorZeroSizedTypeDescriptorBug(IRGenModule &IGM) {
+  auto target = IGM.Context.LangOpts.Target;
+  
+  if (target.isMacOSX() && target.isMacOSXVersionLT(10, 15, 4)) {
+    return true;
+  }
+  if (target.isiOS() && target.isOSVersionLT(13, 4)) { // includes tvOS
+    return true;
+  }
+  if (target.isWatchOS() && target.isOSVersionLT(6, 2)) {
+    return true;
+  }
+  
+  return false;
+}
+
+/// Metadata builder that emits a fixed-layout empty type as an empty struct, as
+/// a workaround for a RemoteMirror crash in older OSes.
+class EmptyStructMetadataBuilder : public ReflectionMetadataBuilder {
+  const NominalTypeDecl *NTD;
+  
+  void layout() override {
+    addNominalRef(NTD);
+    B.addInt32(0);
+    B.addInt16(uint16_t(FieldDescriptorKind::Struct));
+    B.addInt16(FieldTypeMetadataBuilder::FieldRecordSize);
+    B.addInt32(0);
+  }
+  
+public:
+  EmptyStructMetadataBuilder(IRGenModule &IGM,
+                             const NominalTypeDecl *NTD)
+    : ReflectionMetadataBuilder(IGM), NTD(NTD) {
+      assert(IGM.getTypeInfoForUnlowered(
+                           NTD->getDeclaredTypeInContext()->getCanonicalType())
+                .isKnownEmpty(ResilienceExpansion::Maximal)
+             && "should only be used for known empty types");
+  }
+
+  llvm::GlobalVariable *emit() {
+    auto section = IGM.getFieldTypeMetadataSectionName();
+    return ReflectionMetadataBuilder::emit(
+      [&](IRGenModule &IGM, ConstantInit definition) -> llvm::Constant* {
+        return IGM.getAddrOfReflectionFieldDescriptor(
+          NTD->getDeclaredType()->getCanonicalType(), definition);
+      },
+      section);
+  }
+};
+
 class FixedTypeMetadataBuilder : public ReflectionMetadataBuilder {
   ModuleDecl *module;
   CanType type;
@@ -529,10 +919,23 @@ public:
   }
   
   void layout() override {
-    addTypeRef(type);
+    if (type->isAnyObject()) {
+      // AnyObject isn't actually a builtin type; we're emitting it as the old
+      // Builtin.UnknownObject type for ABI compatibility.
+      B.addRelativeAddress(
+          IGM.getAddrOfStringForTypeRef("BO", MangledTypeRefRole::Reflection));
+    } else {
+      addTypeRef(type, CanGenericSignature());
+    }
 
     B.addInt32(ti->getFixedSize().getValue());
-    B.addInt32(ti->getFixedAlignment().getValue());
+
+    auto alignment = ti->getFixedAlignment().getValue();
+    unsigned bitwiseTakable =
+      (ti->isBitwiseTakable(ResilienceExpansion::Minimal) == IsBitwiseTakable
+       ? 1 : 0);
+    B.addInt32(alignment | (bitwiseTakable << 16));
+
     B.addInt32(ti->getFixedStride().getValue());
     B.addInt32(ti->getFixedExtraInhabitantCount(IGM));
   }
@@ -552,38 +955,24 @@ void IRGenModule::emitBuiltinTypeMetadataRecord(CanType builtinType) {
   builder.emit();
 }
 
-void IRGenModule::emitOpaqueTypeMetadataRecord(const NominalTypeDecl *nominalDecl) {
-  FixedTypeMetadataBuilder builder(*this, nominalDecl);
-  builder.emit();
-}
-
-bool IRGenModule::shouldEmitOpaqueTypeMetadataRecord(
-    const NominalTypeDecl *nominalDecl) {
-  if (nominalDecl->getAttrs().hasAttribute<AlignmentAttr>()) {
-    auto &ti = getTypeInfoForUnlowered(nominalDecl->getDeclaredTypeInContext());
-    if (isa<FixedTypeInfo>(ti))
-      return true;
-  }
-
-  return false;
-}
-
 /// Builds a constant LLVM struct describing the layout of a fixed-size
 /// SIL @box. These look like closure contexts, but without any necessary
 /// bindings or metadata sources, and only a single captured value.
 class BoxDescriptorBuilder : public ReflectionMetadataBuilder {
-  CanType BoxedType;
+  SILType BoxedType;
+  CanGenericSignature genericSig;
 public:
-  BoxDescriptorBuilder(IRGenModule &IGM, CanType BoxedType)
-    : ReflectionMetadataBuilder(IGM), BoxedType(BoxedType) {}
-  
+  BoxDescriptorBuilder(IRGenModule &IGM, SILType BoxedType,
+                       CanGenericSignature genericSig)
+      : ReflectionMetadataBuilder(IGM), BoxedType(BoxedType),
+        genericSig(genericSig) {}
+
   void layout() override {
     B.addInt32(1);
     B.addInt32(0); // Number of sources
     B.addInt32(0); // Number of generic bindings
 
-    addTypeRef(BoxedType);
-    addBuiltinTypeRefs(BoxedType);
+    addLoweredTypeRef(BoxedType, genericSig);
   }
 
   llvm::GlobalVariable *emit() {
@@ -595,6 +984,11 @@ public:
 /// Builds a constant LLVM struct describing the layout of a heap closure,
 /// the types of its captures, and the sources of metadata if any of the
 /// captures are generic.
+///
+/// For now capture descriptors are only used by out-of-process reflection.
+///
+/// If the standard library's Mirror type ever gains the ability to reflect
+/// closure contexts, we should use MangledTypeRefRole::Metadata below.
 class CaptureDescriptorBuilder : public ReflectionMetadataBuilder {
   swift::reflection::MetadataSourceBuilder SourceBuilder;
   CanSILFunctionType OrigCalleeType;
@@ -609,8 +1003,11 @@ public:
                            SubstitutionMap Subs,
                            const HeapLayout &Layout)
     : ReflectionMetadataBuilder(IGM),
-      OrigCalleeType(OrigCalleeType),
-      SubstCalleeType(SubstCalleeType), Subs(Subs),
+      // TODO: Preserve substitutions, since they may affect representation in
+      // the box
+      OrigCalleeType(OrigCalleeType->getUnsubstitutedType(IGM.getSILModule())),
+      SubstCalleeType(SubstCalleeType->getUnsubstitutedType(IGM.getSILModule())),
+      Subs(Subs),
       Layout(Layout) {}
 
   using MetadataSourceMap
@@ -626,7 +1023,7 @@ public:
       Encoder.visit(Source);
 
       auto EncodedSource =
-        IGM.getAddrOfStringForTypeRef(OS.str(), MangledTypeRefRole::Metadata);
+        IGM.getAddrOfStringForTypeRef(OS.str(), MangledTypeRefRole::Reflection);
       B.addRelativeAddress(EncodedSource);
     }
   }
@@ -649,8 +1046,8 @@ public:
         return true;
     }
 
-    auto ElementTypes = Layout.getElementTypes().slice(
-        Layout.hasBindings() ? 1 : 0);
+    auto ElementTypes =
+        Layout.getElementTypes().slice(Layout.getIndexAfterBindings());
     for (auto ElementType : ElementTypes) {
       auto SwiftType = ElementType.getASTType();
       if (SwiftType->hasOpenedExistential())
@@ -664,7 +1061,7 @@ public:
   /// We'll keep track of how many things are in the bindings struct with its
   /// own count in the capture descriptor.
   ArrayRef<SILType> getElementTypes() {
-    return Layout.getElementTypes().slice(Layout.hasBindings() ? 1 : 0);
+    return Layout.getElementTypes().slice(Layout.getIndexAfterBindings());
   }
 
   /// Build a map from generic parameter -> source of its metadata at runtime.
@@ -739,8 +1136,8 @@ public:
 
   /// Get the interface types of all of the captured values, mapped out of the
   /// context of the callee we're partially applying.
-  std::vector<CanType> getCaptureTypes() {
-    std::vector<CanType> CaptureTypes;
+  std::vector<SILType> getCaptureTypes() {
+    std::vector<SILType> CaptureTypes;
 
     for (auto ElementType : getElementTypes()) {
       auto SwiftType = ElementType.getASTType();
@@ -755,9 +1152,17 @@ public:
           return t;
         })->getCanonicalType();
       }
+      
+      // TODO: We should preserve substitutions in SILFunctionType captures
+      // once the runtime MetadataReader can understand them, since they can
+      // affect representation.
+      //
+      // For now, eliminate substitutions from the capture representation.
+      SwiftType =
+        SwiftType->replaceSubstitutedSILFunctionTypesWithUnsubstituted(IGM.getSILModule())
+                 ->getCanonicalType();
 
-      auto InterfaceType = SwiftType->mapTypeOutOfContext();
-      CaptureTypes.push_back(InterfaceType->getCanonicalType());
+      CaptureTypes.push_back(SILType::getPrimitiveObjectType(SwiftType));
     }
 
     return CaptureTypes;
@@ -771,10 +1176,12 @@ public:
     B.addInt32(MetadataSources.size());
     B.addInt32(Layout.getBindings().size());
 
+    auto sig =
+      OrigCalleeType->getInvocationGenericSignature().getCanonicalSignature();
+
     // Now add typerefs of all of the captures.
     for (auto CaptureType : CaptureTypes) {
-      addTypeRef(CaptureType);
-      addBuiltinTypeRefs(CaptureType);
+      addLoweredTypeRef(CaptureType, sig);
     }
 
     // Add the pairs that make up the generic param -> metadata source map
@@ -783,7 +1190,7 @@ public:
       auto GenericParam = GenericAndSource.first->getCanonicalType();
       auto Source = GenericAndSource.second;
 
-      addTypeRef(GenericParam);
+      addTypeRef(GenericParam, sig);
       addMetadataSource(Source);
     }
   }
@@ -800,14 +1207,17 @@ static std::string getReflectionSectionName(IRGenModule &IGM,
   SmallString<50> SectionName;
   llvm::raw_svector_ostream OS(SectionName);
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("unknown object format");
+  case llvm::Triple::XCOFF:
   case llvm::Triple::COFF:
     assert(FourCC.size() <= 4 &&
            "COFF section name length must be <= 8 characters");
     OS << ".sw5" << FourCC << "$B";
     break;
   case llvm::Triple::ELF:
+  case llvm::Triple::Wasm:
     OS << "swift5_" << LongName;
     break;
   case llvm::Triple::MachO:
@@ -815,11 +1225,8 @@ static std::string getReflectionSectionName(IRGenModule &IGM,
            "Mach-O section name length must be <= 16 characters");
     OS << "__TEXT,__swift5_" << LongName << ", regular, no_dead_strip";
     break;
-  case llvm::Triple::Wasm:
-    llvm_unreachable("web assembly object format is not supported.");
-    break;
   }
-  return OS.str();
+  return std::string(OS.str());
 }
 
 const char *IRGenModule::getFieldTypeMetadataSectionName() {
@@ -870,11 +1277,12 @@ llvm::Constant *IRGenModule::getAddrOfFieldName(StringRef Name) {
 }
 
 llvm::Constant *
-IRGenModule::getAddrOfBoxDescriptor(CanType BoxedType) {
+IRGenModule::getAddrOfBoxDescriptor(SILType BoxedType,
+                                    CanGenericSignature genericSig) {
   if (!IRGen.Opts.EnableReflectionMetadata)
     return llvm::Constant::getNullValue(CaptureDescriptorPtrTy);
 
-  BoxDescriptorBuilder builder(*this, BoxedType);
+  BoxDescriptorBuilder builder(*this, BoxedType, genericSig);
   auto var = builder.emit();
 
   return llvm::ConstantExpr::getBitCast(var, CaptureDescriptorPtrTy);
@@ -900,7 +1308,11 @@ IRGenModule::getAddrOfCaptureDescriptor(SILFunction &Caller,
 }
 
 void IRGenModule::
-emitAssociatedTypeMetadataRecord(const ProtocolConformance *Conformance) {
+emitAssociatedTypeMetadataRecord(const RootProtocolConformance *conformance) {
+  auto normalConf = dyn_cast<NormalProtocolConformance>(conformance);
+  if (!normalConf)
+    return;
+
   if (!IRGen.Opts.EnableReflectionMetadata)
     return;
 
@@ -916,21 +1328,21 @@ emitAssociatedTypeMetadataRecord(const ProtocolConformance *Conformance) {
     return false;
   };
 
-  Conformance->forEachTypeWitness(/*resolver*/ nullptr, collectTypeWitness);
+  normalConf->forEachTypeWitness(collectTypeWitness);
 
   // If there are no associated types, don't bother emitting any
   // metadata.
   if (AssociatedTypes.empty())
     return;
 
-  AssociatedTypeMetadataBuilder builder(*this, Conformance, AssociatedTypes);
+  AssociatedTypeMetadataBuilder builder(*this, normalConf, AssociatedTypes);
   builder.emit();
 }
 
 void IRGenModule::emitBuiltinReflectionMetadata() {
   if (getSwiftModule()->isStdlibModule()) {
     BuiltinTypes.insert(Context.TheNativeObjectType);
-    BuiltinTypes.insert(Context.TheUnknownObjectType);
+    BuiltinTypes.insert(Context.getAnyObjectType());
     BuiltinTypes.insert(Context.TheBridgeObjectType);
     BuiltinTypes.insert(Context.TheRawPointerType);
     BuiltinTypes.insert(Context.TheUnsafeValueBufferType);
@@ -949,20 +1361,8 @@ void IRGenModule::emitBuiltinReflectionMetadata() {
     BuiltinTypes.insert(anyMetatype);
   }
 
-  for (auto CD : ImportedClasses)
-    emitFieldMetadataRecord(CD);
-
-  for (auto PD : ImportedProtocols)
-    emitFieldMetadataRecord(PD);
-
-  for (auto SD : ImportedStructs)
-    emitFieldMetadataRecord(SD);
-
   for (auto builtinType : BuiltinTypes)
     emitBuiltinTypeMetadataRecord(builtinType);
-
-  for (auto nominalDecl : OpaqueTypes)
-    emitOpaqueTypeMetadataRecord(nominalDecl);
 }
 
 void IRGenerator::emitBuiltinReflectionMetadata() {
@@ -971,20 +1371,74 @@ void IRGenerator::emitBuiltinReflectionMetadata() {
   }
 }
 
-void IRGenModule::emitFieldMetadataRecord(const NominalTypeDecl *Decl) {
+void IRGenModule::emitFieldDescriptor(const NominalTypeDecl *D) {
   if (!IRGen.Opts.EnableReflectionMetadata)
     return;
 
-  // @objc enums never have generic parameters or payloads,
-  // and lower as their raw type.
-  if (auto *ED = dyn_cast<EnumDecl>(Decl))
-    if (ED->isObjC()) {
-      emitOpaqueTypeMetadataRecord(ED);
-      return;
+  auto T = D->getDeclaredTypeInContext()->getCanonicalType();
+
+  bool needsOpaqueDescriptor = false;
+  bool needsFieldDescriptor = true;
+
+  if (auto *ED = dyn_cast<EnumDecl>(D)) {
+    auto &strategy = getEnumImplStrategy(*this, T);
+
+    // @objc enums never have generic parameters or payloads,
+    // and lower as their raw type.
+    if (!strategy.isReflectable()) {
+      needsOpaqueDescriptor = true;
+      needsFieldDescriptor = false;
     }
 
-  FieldTypeMetadataBuilder builder(*this, Decl);
-  FieldDescriptors.push_back(builder.emit());
+    // If this is a fixed-size multi-payload enum, we have to emit a descriptor
+    // with the size and alignment of the type, because the reflection library
+    // cannot derive this information at runtime.
+    if (strategy.getElementsWithPayload().size() > 1 &&
+        !strategy.needsPayloadSizeInMetadata()) {
+      needsOpaqueDescriptor = true;
+    }
+  }
+
+  if (auto *SD = dyn_cast<StructDecl>(D)) {
+    if (SD->hasClangNode())
+      needsOpaqueDescriptor = true;
+  }
+
+  // If the type has custom @_alignment, emit a fixed record with the
+  // alignment since remote mirrors will need to treat the type as opaque.
+  //
+  // Note that we go on to also emit a field descriptor in this case,
+  // since in-process reflection only cares about the types of the fields
+  // and does not independently re-derive the layout.
+  if (D->getAttrs().hasAttribute<AlignmentAttr>()) {
+    auto &TI = getTypeInfoForUnlowered(T);
+    if (isa<FixedTypeInfo>(TI)) {
+      needsOpaqueDescriptor = true;
+    }
+  }
+
+  if (needsOpaqueDescriptor) {
+    // Work around an issue in the RemoteMirror library that ships in
+    // macOS 10.15/iOS 13 and earlier that causes it to crash on a
+    // BuiltinTypeDescriptor with zero size. If the type has zero size, emit it
+    // as an empty struct instead, which will have the same impact on the
+    // encoded type layout.
+    auto &TI = getTypeInfoForUnlowered(T);
+    if (deploymentTargetHasRemoteMirrorZeroSizedTypeDescriptorBug(*this)
+        && TI.isKnownEmpty(ResilienceExpansion::Maximal)) {
+      EmptyStructMetadataBuilder builder(*this, D);
+      builder.emit();
+      return;
+    }
+    
+    FixedTypeMetadataBuilder builder(*this, D);
+    builder.emit();
+  }
+
+  if (needsFieldDescriptor) {
+    FieldTypeMetadataBuilder builder(*this, D);
+    FieldDescriptors.push_back(builder.emit());
+  }
 }
 
 void IRGenModule::emitReflectionMetadataVersion() {
@@ -994,7 +1448,7 @@ void IRGenModule::emitReflectionMetadataVersion() {
                                           llvm::GlobalValue::LinkOnceODRLinkage,
                                           Init,
                                           "__swift_reflection_version");
-  Version->setVisibility(llvm::GlobalValue::HiddenVisibility);
+  ApplyIRLinkage(IRLinkage::InternalLinkOnceODR).to(Version);
   addUsedGlobal(Version);
 }
 

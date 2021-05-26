@@ -116,13 +116,10 @@
 /// collection wrapper instead of a set. To restore efficient set operations,
 /// create a new set from the result.
 ///
-///     let morePrimes = primes.union([11, 13, 17, 19])
-///
-///     let laterPrimes = morePrimes.filter { $0 > 10 }
-///     // 'laterPrimes' is of type Array<Int>
-///
-///     let laterPrimesSet = Set(morePrimes.filter { $0 > 10 })
-///     // 'laterPrimesSet' is of type Set<Int>
+///     let primesStrings = primes.map(String.init)
+///     // 'primesStrings' is of type Array<String>
+///     let primesStringsSet = Set(primes.map(String.init))
+///     // 'primesStringsSet' is of type Set<String>
 ///
 /// Bridging Between Set and NSSet
 /// ==============================
@@ -146,7 +143,7 @@
 /// unspecified. The instances of `NSSet` and `Set` share buffer using the
 /// same copy-on-write optimization that is used when two instances of `Set`
 /// share buffer.
-@_fixed_layout
+@frozen
 public struct Set<Element: Hashable> {
   @usableFromInline
   internal var _variant: _Variant
@@ -174,7 +171,7 @@ public struct Set<Element: Hashable> {
 
 #if _runtime(_ObjC)
   @inlinable
-  internal init(_cocoa: __owned _CocoaSet) {
+  internal init(_cocoa: __owned __CocoaSet) {
     _variant = _Variant(cocoa: _cocoa)
   }
 
@@ -187,10 +184,10 @@ public struct Set<Element: Hashable> {
   ///   is a reference type).
   @inlinable
   public // SPI(Foundation)
-  init(_immutableCocoaSet: __owned _NSSet) {
-    _sanityCheck(_isBridgedVerbatimToObjectiveC(Element.self),
+  init(_immutableCocoaSet: __owned AnyObject) {
+    _internalInvariant(_isBridgedVerbatimToObjectiveC(Element.self),
       "Set can be backed by NSSet _variant only when the member type can be bridged verbatim to Objective-C")
-    self.init(_cocoa: _CocoaSet(_immutableCocoaSet))
+    self.init(_cocoa: __CocoaSet(_immutableCocoaSet))
   }
 #endif
 }
@@ -391,18 +388,6 @@ extension Set: Collection {
   public var isEmpty: Bool {
     return count == 0
   }
-
-  /// The first element of the set.
-  ///
-  /// The first element of the set is not necessarily the first element added
-  /// to the set. Don't expect any particular ordering of set elements.
-  ///
-  /// If the set is empty, the value of this property is `nil`.
-  @inlinable
-  public var first: Element? {
-    var iterator = makeIterator()
-    return iterator.next()
-  }
 }
 
 // FIXME: rdar://problem/23549059 (Optimize == for Set)
@@ -534,14 +519,14 @@ extension Set: SetAlgebra {
   ///
   ///     var classDays: Set<DayOfTheWeek> = [.wednesday, .friday]
   ///     print(classDays.insert(.monday))
-  ///     // Prints "(true, .monday)"
+  ///     // Prints "(inserted: true, memberAfterInsert: DayOfTheWeek.monday)"
   ///     print(classDays)
-  ///     // Prints "[.friday, .wednesday, .monday]"
+  ///     // Prints "[DayOfTheWeek.friday, DayOfTheWeek.wednesday, DayOfTheWeek.monday]"
   ///
   ///     print(classDays.insert(.friday))
-  ///     // Prints "(false, .friday)"
+  ///     // Prints "(inserted: false, memberAfterInsert: DayOfTheWeek.friday)"
   ///     print(classDays)
-  ///     // Prints "[.friday, .wednesday, .monday]"
+  ///     // Prints "[DayOfTheWeek.friday, DayOfTheWeek.wednesday, DayOfTheWeek.monday]"
   ///
   /// - Parameter newMember: An element to insert into the set.
   /// - Returns: `(true, newMember)` if `newMember` was not contained in the
@@ -571,7 +556,7 @@ extension Set: SetAlgebra {
   ///
   ///     var classDays: Set<DayOfTheWeek> = [.monday, .wednesday, .friday]
   ///     print(classDays.update(with: .monday))
-  ///     // Prints "Optional(.monday)"
+  ///     // Prints "Optional(DayOfTheWeek.monday)"
   ///
   /// - Parameter newMember: An element to insert into the set.
   /// - Returns: An element equal to `newMember` if the set already contained
@@ -724,7 +709,8 @@ extension Set: SetAlgebra {
   @inlinable
   public func isSubset<S: Sequence>(of possibleSuperset: S) -> Bool
   where S.Element == Element {
-    // FIXME(performance): isEmpty fast path, here and elsewhere.
+    guard !isEmpty else { return true }
+    
     let other = Set(possibleSuperset)
     return isSubset(of: other)
   }
@@ -775,10 +761,12 @@ extension Set: SetAlgebra {
   @inlinable
   public func isSuperset<S: Sequence>(of possibleSubset: __owned S) -> Bool
     where S.Element == Element {
-    // FIXME(performance): Don't build a set; just ask if every element is in
-    // `self`.
-    let other = Set(possibleSubset)
-    return other.isSubset(of: self)
+    for member in possibleSubset {
+      if !contains(member) {
+        return false
+      }
+    }
+    return true
   }
 
   /// Returns a Boolean value that indicates whether the set is a strict
@@ -823,9 +811,7 @@ extension Set: SetAlgebra {
   @inlinable
   public func isDisjoint<S: Sequence>(with other: S) -> Bool
   where S.Element == Element {
-    // FIXME(performance): Don't need to build a set.
-    let otherSet = Set(other)
-    return isDisjoint(with: otherSet)
+    return _isDisjoint(with: other)
   }
 
   /// Returns a new set with the elements of both this set and the given
@@ -932,6 +918,10 @@ extension Set: SetAlgebra {
   @inlinable
   internal mutating func _subtract<S: Sequence>(_ other: S)
   where S.Element == Element {
+    // If self is empty we don't need to iterate over `other` because there's
+    // nothing to remove on self.
+    guard !isEmpty else { return }
+
     for item in other {
       remove(item)
     }
@@ -1133,8 +1123,16 @@ extension Set {
   ///   otherwise, `false`.
   @inlinable
   public func isDisjoint(with other: Set<Element>) -> Bool {
-    for member in self {
-      if other.contains(member) {
+    return _isDisjoint(with: other)
+  }
+    
+  @inlinable
+  internal func _isDisjoint<S: Sequence>(with other: S) -> Bool
+  where S.Element == Element {
+    guard !isEmpty else { return true }
+
+    for member in other {
+      if contains(member) {
         return false
       }
     }
@@ -1225,8 +1223,10 @@ extension Set {
   @inlinable
   public __consuming func intersection(_ other: Set<Element>) -> Set<Element> {
     var newSet = Set<Element>()
-    for member in self {
-      if other.contains(member) {
+    let (smaller, larger) =
+      count < other.count ? (self, other) : (other, self)
+    for member in smaller {
+      if larger.contains(member) {
         newSet.insert(member)
       }
     }
@@ -1264,7 +1264,7 @@ extension Set {
 
 extension Set {
   /// The position of an element in a set.
-  @_fixed_layout
+  @frozen
   public struct Index {
     // Index for native buffer is efficient.  Index for bridged NSSet is
     // not, because neither NSEnumerator nor fast enumeration support moving
@@ -1273,12 +1273,12 @@ extension Set {
     // safe to copy the state.  So, we cannot implement Index that is a value
     // type for bridged NSSet in terms of Cocoa enumeration facilities.
 
-    @_frozen
+    @frozen
     @usableFromInline
     internal enum _Variant {
       case native(_HashTable.Index)
 #if _runtime(_ObjC)
-      case cocoa(_CocoaSet.Index)
+      case cocoa(__CocoaSet.Index)
 #endif
     }
 
@@ -1300,7 +1300,7 @@ extension Set {
 #if _runtime(_ObjC)
     @inlinable
     @inline(__always)
-    internal init(_cocoa index: __owned _CocoaSet.Index) {
+    internal init(_cocoa index: __owned __CocoaSet.Index) {
       self.init(_variant: .cocoa(index))
     }
 #endif
@@ -1361,7 +1361,7 @@ extension Set.Index {
 
 #if _runtime(_ObjC)
   @usableFromInline
-  internal var _asCocoa: _CocoaSet.Index {
+  internal var _asCocoa: __CocoaSet.Index {
     @_transparent
     get {
       switch _variant {
@@ -1379,8 +1379,8 @@ extension Set.Index {
       }
       let dummy = _HashTable.Index(bucket: _HashTable.Bucket(offset: 0), age: 0)
       _variant = .native(dummy)
+      defer { _variant = .cocoa(cocoa) }
       yield &cocoa
-      _variant = .cocoa(cocoa)
     }
   }
 #endif
@@ -1450,7 +1450,7 @@ extension Set.Index: Hashable {
 
 extension Set {
   /// An iterator over the members of a `Set<Element>`.
-  @_fixed_layout
+  @frozen
   public struct Iterator {
     // Set has a separate IteratorProtocol and Index because of efficiency
     // and implementability reasons.
@@ -1462,11 +1462,11 @@ extension Set {
     // IteratorProtocol, which is being consumed as iteration proceeds.
 
     @usableFromInline
-    @_frozen
+    @frozen
     internal enum _Variant {
       case native(_NativeSet<Element>.Iterator)
 #if _runtime(_ObjC)
-      case cocoa(_CocoaSet.Iterator)
+      case cocoa(__CocoaSet.Iterator)
 #endif
     }
 
@@ -1485,7 +1485,7 @@ extension Set {
 
 #if _runtime(_ObjC)
     @usableFromInline
-    internal init(_cocoa: __owned _CocoaSet.Iterator) {
+    internal init(_cocoa: __owned __CocoaSet.Iterator) {
       self.init(_variant: .cocoa(_cocoa))
     }
 #endif
@@ -1530,7 +1530,7 @@ extension Set.Iterator {
         return nativeIterator
 #if _runtime(_ObjC)
       case .cocoa:
-        _sanityCheckFailure("internal error: does not contain a native index")
+        _internalInvariantFailure("internal error: does not contain a native index")
 #endif
       }
     }
@@ -1541,11 +1541,11 @@ extension Set.Iterator {
 
 #if _runtime(_ObjC)
   @usableFromInline @_transparent
-  internal var _asCocoa: _CocoaSet.Iterator {
+  internal var _asCocoa: __CocoaSet.Iterator {
     get {
       switch _variant {
       case .native:
-        _sanityCheckFailure("internal error: does not contain a Cocoa index")
+        _internalInvariantFailure("internal error: does not contain a Cocoa index")
       case .cocoa(let cocoa):
         return cocoa
       }
@@ -1625,9 +1625,16 @@ extension Set {
   public // FIXME(reserveCapacity): Should be inlinable
   mutating func reserveCapacity(_ minimumCapacity: Int) {
     _variant.reserveCapacity(minimumCapacity)
-    _sanityCheck(self.capacity >= minimumCapacity)
+    _internalInvariant(self.capacity >= minimumCapacity)
   }
 }
 
 public typealias SetIndex<Element: Hashable> = Set<Element>.Index
 public typealias SetIterator<Element: Hashable> = Set<Element>.Iterator
+
+extension Set: Sendable, UnsafeSendable
+  where Element: Sendable { }
+extension Set.Index: Sendable, UnsafeSendable
+  where Element: Sendable { }
+extension Set.Iterator: Sendable, UnsafeSendable
+  where Element: Sendable { }

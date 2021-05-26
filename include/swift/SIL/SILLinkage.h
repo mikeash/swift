@@ -15,6 +15,9 @@
 
 #include "llvm/Support/ErrorHandling.h"
 
+// FIXME: Remove after fixmeWitnessHasLinkageThatNeedsToBePublic is removed.
+#include "swift/SIL/SILDeclRef.h"
+
 namespace swift {
 
 class ValueDecl;
@@ -117,6 +120,10 @@ enum class SubclassScope : uint8_t {
 
   /// This class can only be subclassed in this module.
   Internal,
+
+  /// This class is resilient so even public methods cannot be directly
+  /// referenced from outside the module.
+  Resilient,
 
   /// There is no class to subclass, or it is final.
   NotApplicable,
@@ -250,6 +257,11 @@ inline SILLinkage effectiveLinkageForClassMember(SILLinkage linkage,
       return SILLinkage::Hidden;
     break;
 
+  case SubclassScope::Resilient:
+    if (isAvailableExternally(linkage))
+      return SILLinkage::HiddenExternal;
+    return SILLinkage::Hidden;
+
   case SubclassScope::NotApplicable:
     break;
   }
@@ -265,9 +277,11 @@ inline SILLinkage effectiveLinkageForClassMember(SILLinkage linkage,
 // then SILGen gives the member private linkage, ignoring the more
 // visible access level it was given in the AST.
 inline bool
-fixmeWitnessHasLinkageThatNeedsToBePublic(SILLinkage witnessLinkage) {
-  return !hasPublicVisibility(witnessLinkage) &&
-         !hasSharedVisibility(witnessLinkage);
+fixmeWitnessHasLinkageThatNeedsToBePublic(SILDeclRef witness) {
+  auto witnessLinkage = witness.getLinkage(ForDefinition);
+  return !hasPublicVisibility(witnessLinkage)
+         && (!hasSharedVisibility(witnessLinkage)
+             || !witness.isSerialized());
 }
 
 } // end swift namespace

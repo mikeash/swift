@@ -1,25 +1,22 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
-//
-// REQUIRES: OS=macosx
-// REQUIRES: OS=ios
-// REQUIRES: OS=tvos
-// REQUIRES: OS=watchos
-// REQUIRES: OS=linux-androideabi
-// REQUIRES: OS=linux-gnu
+// REQUIRES: VENDOR=apple || OS=linux-androideabi || OS=linux-android || OS=linux-gnu
+// UNSUPPORTED: freestanding
 
 import Swift
 import StdlibUnittest
 
-#if os(Linux) || os(Android)
-  import Glibc
-#elseif os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if canImport(Darwin)
   import Darwin
+#elseif canImport(Glibc)
+  import Glibc
+#else
+#error("Unsupported platform")
 #endif
 
 var POSIXErrorCodeTestSuite = TestSuite("POSIXErrorCode")
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if canImport(Darwin)
 
 POSIXErrorCodeTestSuite.test("Darwin POSIX error codes constants") {
   expectEqual(EPERM, POSIXErrorCode.EPERM.rawValue)
@@ -161,3 +158,5 @@ POSIXErrorCodeTestSuite.test("Linux POSIX error codes constants") {
 }
 
 #endif
+
+runAllTests()

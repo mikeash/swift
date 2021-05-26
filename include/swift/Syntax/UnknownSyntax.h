@@ -16,8 +16,6 @@
 #include "swift/Syntax/SyntaxData.h"
 #include "swift/Syntax/Syntax.h"
 
-#include <vector>
-
 namespace swift {
 namespace syntax {
 
@@ -31,8 +29,7 @@ namespace syntax {
 class UnknownSyntax : public Syntax {
   void validate() const;
 public:
-  UnknownSyntax(const RC<SyntaxData> Root, const SyntaxData *Data)
-    : Syntax(Root, Data) {}
+  UnknownSyntax(const RC<const SyntaxData> &Data) : Syntax(Data) {}
 
   static bool classof(const Syntax *S) {
     return S->isUnknown();

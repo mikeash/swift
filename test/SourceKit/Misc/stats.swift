@@ -2,6 +2,7 @@ func foo() {}
 
 // RUN: %sourcekitd-test -req=syntax-map %s == -req=stats | %FileCheck %s -check-prefix=SYNTAX_1
 
+// SYNTAX_1:   {{.*}} source.statistic.instruction-count
 // SYNTAX_1: 2 {{.*}} source.statistic.num-requests
 // SYNTAX_1: 0 {{.*}} source.statistic.num-semantic-requests
 // SYNTAX_1: 0 {{.*}} source.statistic.num-ast-builds
@@ -16,7 +17,7 @@ func foo() {}
 // SYNTAX_2: 0 {{.*}} source.statistic.num-open-documents
 // SYNTAX_2: 1 {{.*}} source.statistic.max-open-documents
 
-// RUN: %sourcekitd-test -req=sema %s -- %s == -req=stats | %FileCheck %s -check-prefix=SEMA_1
+// RUN: %sourcekitd-test -req=sema %s -- -Xfrontend -disable-implicit-concurrency-module-import  %s == -req=stats | %FileCheck %s -check-prefix=SEMA_1
 
 // SEMA_1: 3 {{.*}} source.statistic.num-requests
 // SEMA_1: 0 {{.*}} source.statistic.num-semantic-requests
@@ -26,7 +27,7 @@ func foo() {}
 // SEMA_1: 0 {{.*}} source.statistic.num-ast-cache-hits
 // SEMA_1: 0 {{.*}} source.statistic.num-ast-snaphost-uses
 
-// RUN: %sourcekitd-test -req=sema %s -- %s == -req=edit -pos=1:1 -replace=" " %s == -req=stats | %FileCheck %s -check-prefix=SEMA_2
+// RUN: %sourcekitd-test -req=sema %s -- -Xfrontend -disable-implicit-concurrency-module-import  %s == -req=edit -pos=1:1 -replace=" " %s == -req=stats | %FileCheck %s -check-prefix=SEMA_2
 
 // SEMA_2: 5 {{.*}} source.statistic.num-requests
 // SEMA_2: 0 {{.*}} source.statistic.num-semantic-requests
@@ -38,7 +39,7 @@ func foo() {}
 // here.
 // SEMA_2: 0 {{.*}} source.statistic.num-ast-snaphost-uses
 
-// RUN: %sourcekitd-test -req=sema %s -- %s == -req=cursor -pos=1:6 %s -- %s == -req=stats | %FileCheck %s -check-prefix=SEMA_3
+// RUN: %sourcekitd-test -req=sema %s -- -Xfrontend -disable-implicit-concurrency-module-import  %s == -req=cursor -pos=1:6 %s -- -Xfrontend -disable-implicit-concurrency-module-import  %s == -req=stats | %FileCheck %s -check-prefix=SEMA_3
 
 // SEMA_3: 4 {{.*}} source.statistic.num-requests
 // SEMA_3: 1 {{.*}} source.statistic.num-semantic-requests
@@ -48,7 +49,7 @@ func foo() {}
 // SEMA_3: 0 {{.*}} source.statistic.num-ast-cache-hits
 // SEMA_3: 1 {{.*}} source.statistic.num-ast-snaphost-uses
 
-// RUN: %sourcekitd-test -req=sema %s -- %s == -req=related-idents -pos=1:6 %s -- %s == -req=stats | %FileCheck %s -check-prefix=SEMA_4
+// RUN: %sourcekitd-test -req=sema %s -- -Xfrontend -disable-implicit-concurrency-module-import  %s == -req=related-idents -pos=1:6 %s -- -Xfrontend -disable-implicit-concurrency-module-import  %s == -req=stats | %FileCheck %s -check-prefix=SEMA_4
 
 // SEMA_4: 4 {{.*}} source.statistic.num-requests
 // SEMA_4: 1 {{.*}} source.statistic.num-semantic-requests

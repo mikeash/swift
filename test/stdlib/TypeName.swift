@@ -1,4 +1,11 @@
-// RUN: %target-run-simple-swift
+// RUN: %empty-directory(%t)
+// RUN: %target-build-swift -O -module-name=main %s -o %t/O.out
+// RUN: %target-codesign %t/O.out
+// RUN: %target-run %t/O.out
+// RUN: %target-build-swift -Onone -module-name=main %s -o %t/Onone.out
+// RUN: %target-codesign %t/Onone.out
+// RUN: %target-run %t/Onone.out
+
 // REQUIRES: executable_test
 
 import StdlibUnittest
@@ -59,11 +66,17 @@ TypeNameTests.test("Prints") {
   typealias F = () -> ()
   typealias F2 = () -> () -> ()
   typealias F3 = (() -> ()) -> ()
+  typealias F4 = (Int, Float) -> ()
+  typealias F5 = ((Int, Float)) -> ()
+  typealias F6 = (Int...) -> ()
 
   expectEqual("() -> ()", _typeName(F.self))
   expectEqual("() -> () -> ()", _typeName(F2.self))
   expectEqual("(() -> ()) -> ()", _typeName(F3.self))
   expectEqual("() -> ()", _typeName((() -> ()).self))
+  expectEqual("(Swift.Int, Swift.Float) -> ()", _typeName(F4.self))
+  expectEqual("((Swift.Int, Swift.Float)) -> ()", _typeName(F5.self))
+  expectEqual("(Swift.Int...) -> ()", _typeName(F6.self))
 
   expectEqual("(main.P) -> main.P2 & main.P3",
     _typeName(((P) -> P2 & P3).self))

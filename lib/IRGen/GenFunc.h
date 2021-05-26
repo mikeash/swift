@@ -47,13 +47,14 @@ namespace irgen {
 
   /// Emit a partial application thunk for a function pointer applied to a
   /// partial set of argument values.
-  void emitFunctionPartialApplication(
+  Optional<StackAddress> emitFunctionPartialApplication(
       IRGenFunction &IGF, SILFunction &SILFn, const FunctionPointer &fnPtr,
       llvm::Value *fnContext, Explosion &args,
       ArrayRef<SILParameterInfo> argTypes, SubstitutionMap subs,
       CanSILFunctionType origType, CanSILFunctionType substType,
       CanSILFunctionType outType, Explosion &out, bool isOutlined);
-
+  CanType getArgumentLoweringType(CanType type, SILParameterInfo paramInfo,
+                                  bool isNoEscape);
 } // end namespace irgen
 } // end namespace swift
 

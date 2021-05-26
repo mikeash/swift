@@ -1,28 +1,1259 @@
 CHANGELOG
 =========
 
-<details>
-<summary>Note: This is in reverse chronological order, so newer entries are added to the top.</summary>
+_**Note:** This is in reverse chronological order, so newer entries are added to the top._
 
-| Contents               |
-| :--------------------- |
-| [Swift 5.0](#swift-50) |
-| [Swift 4.2](#swift-42) |
-| [Swift 4.1](#swift-41) |
-| [Swift 4.0](#swift-40) |
-| [Swift 3.1](#swift-31) |
-| [Swift 3.0](#swift-30) |
-| [Swift 2.2](#swift-22) |
-| [Swift 2.1](#swift-21) |
-| [Swift 2.0](#swift-20) |
-| [Swift 1.2](#swift-12) |
-| [Swift 1.1](#swift-11) |
-| [Swift 1.0](#swift-10) |
+Swift 5.5
+---------
 
-</details>
+* [SE-0313][]:
+
+  Declarations inside an actor that would normally by actor-isolated can
+  explicitly become non-isolated using the `nonisolated` keyword. Non-isolated
+  declarations can be used to conform to synchronous protocol requirements:
+
+  ```swift
+  actor Account: Hashable {
+    let idNumber: Int
+    let balance: Double
+
+    nonisolated func hash(into hasher: inout Hasher) { // okay, non-isolated satisfies synchronous requirement
+      hasher.combine(idNumber) // okay, can reference idNumber from outside the let
+      hasher.combine(balance) // error: cannot synchronously access actor-isolated property
+    }
+  }
+  ```
+
+* [SE-0300][]:
+
+  Async functions can now be suspended using the `withUnsafeContinuation`
+  and `withUnsafeThrowingContinuation` functions. These both take a closure,
+  and then suspend the current async task, executing that closure with a
+  continuation value for the current task. The program must use that
+  continuation at some point in the future to resume the task, passing in
+  a value or error, which then becomes the result of the `withUnsafeContinuation`
+  call in the resumed task.
+
+* Type names are no longer allowed as an argument to a subscript parameter that expects a metatype type
+
+  ```swift
+  struct MyValue {
+  }
+
+  struct MyStruct {
+    subscript(a: MyValue.Type) -> Int { get { ... } }
+  }
+
+  func test(obj: MyStruct) {
+    let _ = obj[MyValue]
+  }
+  ```
+
+  Accepting subscripts with `MyValue` as an argument was an oversight because `MyValue` requires explicit `.self`
+  to reference its metatype, so correct syntax would be to use `obj[MyValue.self]`.
+
+* [SE-0310][]:
+  
+  Read-only computed properties and subscripts can now define their `get` accessor to be `async` and/or `throws`, by writing one or both of those keywords between the `get` and `{`.  Thus, these members can now make asynchronous calls or throw errors in the process of producing a value:
+  ```swift
+  class BankAccount: FinancialAccount {
+    var manager: AccountManager?
+
+    var lastTransaction: Transaction {
+      get async throws {
+        guard manager != nil else { throw BankError.notInYourFavor }
+        return await manager!.getLastTransaction()
+      }
+    }
+
+    subscript(_ day: Date) -> [Transaction] {
+      get async {
+        return await manager?.getTransactions(onDay: day) ?? []
+      }
+    }
+  }
+
+  protocol FinancialAccount {
+    associatedtype T
+    var lastTransaction: T { get async throws }
+    subscript(_ day: Date) -> [T] { get async }
+  }
+  ```
+  Accesses to such members, like `lastTransaction` above, will require appropriate marking with `await` and/or `try`:
+  ```swift
+  extension BankAccount {
+    func meetsTransactionLimit(_ limit: Amount) async -> Bool {
+      return try! await self.lastTransaction.amount < limit
+      //                    ^~~~~~~~~~~~~~~~ this access is async & throws
+    }                
+  }
+
+    
+  func hadWithdrawlOn(_ day: Date, from acct: BankAccount) async -> Bool {
+    return await !acct[day].allSatisfy { $0.amount >= Amount.zero }
+    //            ^~~~~~~~~ this access is async
+  }
+  ```
+
+* [SE-0306][]:
+
+  Swift 5.5 includes support for actors, a new kind of type that isolates its instance data to protect it from concurrent access. Accesses to an actor's instance declarations from outside the must be asynchronous:
+
+  ```swift
+  actor Counter {
+    var value = 0
+
+    func increment() {
+      value = value + 1
+    }
+  }
+
+  func useCounter(counter: Counter) async {
+    print(await counter.value) // interaction must be async
+    await counter.increment()  // interaction must be async
+  }
+  ```
+
+* The determination of whether a call to a `rethrows` function can throw now considers default arguments of `Optional` type.
+
+  In Swift 5.4, such default arguments were ignored entirely by `rethrows` checking. This meant that the following example was accepted:
+
+  ```swift
+  func foo(_: (() throws -> ())? = nil) rethrows {}
+  foo()  // no 'try' needed
+  ```
+
+  However, it also meant that the following was accepted, even though the call to `foo()` can throw and the call site is not marked with `try`:
+
+  ```swift
+  func foo(_: (() throws -> ())? = { throw myError }) rethrows {}
+  foo()  // 'try' *should* be required here
+  ```
+
+  The new behavior is that the first example is accepted because the default argument is syntactically written as `nil`, which is known not to throw. The second example is correctly rejected, on account of missing a `try` since the default argument *can* throw.
+
+* [SE-0293][]:
+
+  Property wrappers can now be applied to function and closure parameters:
+
+  ```swift
+  @propertyWrapper
+  struct Wrapper<Value> {
+    var wrappedValue: Value
+
+    var projectedValue: Self { return self }
+
+    init(wrappedValue: Value) { ... }
+
+    init(projectedValue: Self) { ... }
+  }
+
+  func test(@Wrapper value: Int) {
+    print(value)
+    print($value)
+    print(_value)
+  }
+
+  test(value: 10)
+
+  let projection = Wrapper(wrappedValue: 10)
+  test($value: projection)
+  ```
+
+  The call-site can pass a wrapped value or a projected value, and the property wrapper will be initialized using `init(wrappedValue:)` or `init(projectedValue:)`, respectively.
+
+* [SE-0299][]:
+
+  It is now possible to use leading-dot syntax in generic contexts to access static members of protocol extensions where `Self` is constrained to a fully concrete type:
+
+  ```swift
+  public protocol ToggleStyle { ... }
+
+  public struct DefaultToggleStyle: ToggleStyle { ... }
+
+  extension ToggleStyle where Self == DefaultToggleStyle {
+    public static var `default`: Self { .init() }
+  }
+
+  struct Toggle {
+    func applyToggle<T: ToggleStyle>(_ style: T) { ... }
+  }
+
+  Toggle(...).applyToggle(.default)
+  ```
+
+* Whenever a reference to `Self` does not impede the usage of a protocol as a value type, or a protocol member on a value of protocol type, the same is now true for references to `[Self]` and `[Key : Self]`:
+
+  ```swift
+  protocol Copyable {
+    func copy() -> Self
+    func copy(count: Int) -> [Self]
+  }
+
+  func test(c: Copyable) {
+    let copy: Copyable = c.copy() // OK
+    let copies: [Copyable] = c.copy(count: 5) // also OK
+  }
+  ```
+
+* [SE-0296][]:
+
+  Asynchronous programming is now natively supported using async/await. Asynchronous functions can be defined using `async`:
+
+  ```swift
+  func loadWebResource(_ path: String) async throws -> Resource { ... }
+  func decodeImage(_ r1: Resource, _ r2: Resource) async throws -> Image
+  func dewarpAndCleanupImage(_ i : Image) async -> Image
+  ```
+
+  Calls to `async` functions may suspend, meaning that they give up the thread on which they are executing and will be scheduled to run again later. The potential for suspension on asynchronous calls requires the `await` keyword, similarly to the way in which `try` acknowledges a call to a `throws` function:
+
+  ```swift
+  func processImageData() async throws -> Image {
+    let dataResource  = try await loadWebResource("dataprofile.txt")
+    let imageResource = try await loadWebResource("imagedata.dat")
+    let imageTmp      = try await decodeImage(dataResource, imageResource)
+    let imageResult   = await dewarpAndCleanupImage(imageTmp)
+    return imageResult
+  }
+  ```
+
+* The 'lazy' keyword now works in local contexts, making the following valid:
+
+  ```swift
+  func test(useIt: Bool) {
+    lazy var result = getPotentiallyExpensiveResult()
+    if useIt {
+      doIt(result)
+    }
+  }
+  ```
+
+* [SE-0297][]:
+
+  An Objective-C method that delivers its results asynchronously via a completion handler block will be translated into an `async` method that directly returns the result (or throws). For example, the following Objective-C method from [CloudKit](https://developer.apple.com/documentation/cloudkit/ckcontainer/1640387-fetchshareparticipantwithuserrec):
+
+  ```objc
+  - (void)fetchShareParticipantWithUserRecordID:(CKRecordID *)userRecordID
+      completionHandler:(void (^)(CKShareParticipant * _Nullable, NSError * _Nullable))completionHandler;
+  ```
+
+  will be translated into an `async throws` method that returns the participant instance:
+
+  ```swift
+  func fetchShareParticipant(
+      withUserRecordID userRecordID: CKRecord.ID
+  ) async throws -> CKShare.Participant
+  ```
+
+  Swift callers can invoke this `async` method within an `await` expression:
+
+  ```swift
+  guard let participant = try? await container.fetchShareParticipant(withUserRecordID: user) else {
+      return nil
+  }
+  ```
+
+* [SE-0298][]:
+
+  The "for" loop can be used to traverse asynchronous sequences in asynchronous code:
+
+  ```swift
+  for try await line in myFile.lines() {
+    // Do something with each line
+  }
+  ```
+
+  Asynchronous for loops use asynchronous sequences, defined by the protocol
+  `AsyncSequence` and its corresponding `AsyncIterator`.
+
+**Add new entries to the top of this section, not here!**
+
+Swift 5.4
+---------
+
+### 2021-04-26 (Xcode 12.5)
+
+* Protocol conformance checking now considers `where` clauses when evaluating if a `typealias` is a suitable witness for an associated type requirement. The following code is now rejected:
+
+  ```swift
+  protocol Holder {
+    associatedtype Contents
+  }
+
+  struct Box<T> : Holder {}
+  // error: type 'Box<T>' does not conform to protocol 'Holder'
+
+  extension Box where T : Hashable {
+    typealias Contents = T
+  }
+  ```
+
+  In most cases, the compiler would either crash or produce surprising results when making use of a `typealias` with an unsatisfied `where` clause, but it is possible that some previously-working code is now rejected. In the above example, the conformance can be fixed in one of various ways:
+
+  1) making it conditional (moving the `: Holder` from the definition of `Box` to the extension)
+  2) moving the `typealias` from the extension to the type itself
+  3) relaxing the `where` clause on the extension
+
+* Availability checking now rejects protocols that refine less available protocols. Previously, this was accepted by the compiler but could result in linker errors or runtime crashes:
+
+  ```swift
+  @available(macOS 11, *)
+  protocol Base {}
+
+  protocol Bad : Base {}
+  // error: 'Base' is only available in macOS 11 or newer
+
+  @available(macOS 11, *)
+  protocol Good : Base {} // OK
+  ```
+
+* The `@available` attribute is no longer permitted on generic parameters, where it had no effect:
+
+  ```swift
+  struct Bad<@available(macOS 11, *) T> {}
+  // error: '@available' attribute cannot be applied to this declaration
+
+  struct Good<T> {} // equivalent
+  ```
+
+* If a type is made to conform to a protocol via an extension, the availability of the extension is now taken into account when forming generic types that use this protocol conformance. For example, consider a `Box` type whose conformance to `Hashable` uses features only available on macOS 11:
+
+  ```swift
+  public struct Box {}
+
+  @available(macOS 11, *)
+  extension Box : Hashable {
+    func hash(into: inout Hasher) {
+      // call some new API to hash the value...
+    }
+  }
+
+  public func findBad(_: Set<Box>) -> Box {}
+  // warning: conformance of 'Box' to 'Hashable' is only available in macOS 11 or newer
+
+  @available(macOS 11, *)
+  public func findGood(_: Set<Box>) -> Box {} // OK
+  ```
+
+  In the above code, it is not valid for `findBad()` to take a `Set<Box>`, since `Set` requires that its element type conform to `Hashable`; however the conformance of `Box` to `Hashable` is not available prior to macOS 11.
+
+  Note that using an unavailable protocol conformance is a warning, not an error, to avoid potential source compatibility issues. This is because it was technically possible to write code in the past that made use of unavailable protocol conformances but worked anyway, if the optimizer had serendipitously eliminated all runtime dispatch through this conformance, or the code in question was entirely unreachable at runtime.
+
+  Protocol conformances can also be marked as completely unavailable or deprecated, by placing an appropriate `@available` attribute on the extension:
+
+  ```swift
+  @available(*, unavailable, message: "Not supported anymore")
+  extension Box : Hashable {}
+
+  @available(*, deprecated, message: "Suggest using something else")
+  extension Box : Hashable {}
+  ```
+
+  If a protocol conformance is defined on the type itself, it inherits availability from the type. You can move the protocol conformance to an extension if you need it to have narrower availability than the type.
+
+* When `swift` is run with no arguments, it starts a REPL (read eval print loop) that uses LLDB. The compiler also had a second REPL implementation, known as the "integrated REPL", formerly accessible by running `swift -frontend -repl`. The "integrated REPL" was only intended for use by compiler developers, and has now been removed.
+
+  Note that this does not take away the ability to put Swift code in a script and run it with `swift myScript.swift`. This so-called "script mode" is distinct from the integrated REPL, and continues to be supported.
+
+* Property wrappers now work in local contexts, making the following valid:
+
+  ```swift
+  @propertyWrapper
+  struct Wrapper<T> {
+    var wrappedValue: T
+  }
+
+  func test() {
+    @Wrapper var value = 10
+  }
+  ```
+
+* [SR-10069][]:
+
+  Function overloading now works in local contexts, making the following valid:
+
+  ```swift
+  func outer(x: Int, y: String) {
+    func doIt(_: Int) {}
+    func doIt(_: String) {}
+
+    doIt(x) // calls the first 'doIt(_:)' with an Int value
+    doIt(y) // calls the second 'doIt(_:)' with a String value
+  }
+  ```
+
+* [SE-0284][]:
+
+  Functions, subscripts, and initializers may now have more than one variadic parameter, as long as all parameters which follow variadic parameters are labeled. This makes declarations like the following valid:
+
+  ```swift
+  func foo(_ a: Int..., b: Double...) { }
+
+  struct Bar {
+    subscript(a: Int..., b b: Int...) -> [Int] { a + b }
+
+    init(a: String..., b: Float...) { }
+  }
+  ```
+
+* [SE-0287][]:
+
+  Implicit member expressions now support chains of member accesses, making the following valid:
+  
+  ```swift
+  let milky: UIColor = .white.withAlphaComponent(0.5)
+  let milky2: UIColor = .init(named: "white")!.withAlphaComponent(0.5)
+  let milkyChance: UIColor? = .init(named: "white")?.withAlphaComponent(0.5)
+  ```
+  
+  As is the case with the existing implicit member expression syntax, the resulting type of the chain must be the same as the (implicit) base, so it is not well-formed to write:
+  
+  ```swift
+  let cgMilky: CGColor = .white.withAlphaComponent(0.5).cgColor
+  ```
+  
+  (Unless, of course, appropriate `white` and `withAlphaComponent` members were defined on `CGColor`.)
+  
+  Members of a "chain" can be properties, method calls, subscript accesses, force unwraps, or optional chaining question marks. Furthermore, the type of each member along the chain is permitted to differ (again, as long as the base of the chain matches the resulting type) meaning the following successfully typechecks:
+  
+  ```swift
+  struct Foo {
+    static var foo = Foo()
+    static var bar = Bar()
+    
+    var anotherFoo: Foo { Foo() }
+    func getFoo() -> Foo { Foo() }
+    var optionalFoo: Foo? { Foo() }
+    subscript() -> Foo { Foo() }
+  }
+  
+  struct Bar {
+    var anotherFoo = Foo()
+  }
+
+  let _: Foo? = .bar.anotherFoo.getFoo().optionalFoo?.optionalFoo![]
+  ```
+
+**Add new entries to the top of this section, not here!**
+
+Swift 5.3
+---------
+
+### 2020-09-16 (Xcode 12.0)
+
+* [SE-0279][] & [SE-0286][]:
+
+  Trailing closure syntax has been extended to allow additional labeled closures to follow the initial unlabeled closure:
+  
+  ```swift
+  // Single trailing closure argument
+  UIView.animate(withDuration: 0.3) {
+    self.view.alpha = 0
+  }
+  // Multiple trailing closure arguments
+  UIView.animate(withDuration: 0.3) {
+    self.view.alpha = 0
+  } completion: { _ in
+    self.view.removeFromSuperview()
+  }
+  ```
+  
+  Additionally, trailing closure arguments now match the appropriate parameter according to a forward-scan rule (as opposed to the previous backward-scan rule):
+  
+  ```swift
+  func takesClosures(first: () -> Void, second: (Int) -> Void = { _ in }) {}
+  
+  takesClosures {
+    print("First")
+  }
+  ```
+  
+  In the above example, the trailing closure argument matches parameter `first`, whereas pre-Swift-5.3 it would have matched `second`. In order to ease the transition to this new rule, cases in which the forward-scan and backward-scan match a single trailing closure to different parameters, the backward-scan result is preferred and a warning is emitted. This is expected to be upgraded to an error in the next major version of Swift.
+
+* [SR-7083][]:
+
+  Property observers such as `willSet` and `didSet` are now supported on `lazy` properties:
+
+  ```swift
+  class C {
+    lazy var property: Int = 0 {
+      willSet { print("willSet called!") } // Okay
+      didSet { print("didSet called!") } // Okay
+    }
+  }
+  ```
+
+  Note that the initial value of the property will be forced and made available as the `oldValue` for the `didSet` observer, if the property hasn't been accessed yet.
+  
+  ```swift
+  class C {
+    lazy var property: Int = 0 {
+      didSet { print("Old value: ", oldValue) }
+    }
+  }
+
+  let c = C()
+  c.property = 1 // Prints 'Old value: 0'
+  ```
+
+  This could have side-effects, for example if the lazy property's initializer is doing other work.
+
+* [SR-11700][]:
+
+  Exclusivity violations within code that computes the `default`
+  argument during Dictionary access are now diagnosed.
+
+  ```swift
+  struct Container {
+     static let defaultKey = 0
+
+     var dictionary = [defaultKey:0]
+
+     mutating func incrementValue(at key: Int) {
+       dictionary[key, default: dictionary[Container.defaultKey]!] += 1
+     }
+  }
+  // error: overlapping accesses to 'self.dictionary', but modification requires exclusive access; consider copying to a local variable
+  //     dictionary[key, default: dictionary[Container.defaultKey]!] += 1
+  //     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  // note: conflicting access is here
+  //     dictionary[key, default: dictionary[Container.defaultKey]!] += 1
+  //                              ~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+  ```
+
+  The exclusivity violation can be avoided by precomputing the `default`
+  argument using a local variable.
+
+  ```swift
+  struct Container {
+    static let defaultKey = 0
+
+    var dictionary = [defaultKey:0]
+
+    mutating func incrementValue(at key: Int) {
+      let defaultValue = dictionary[Container.defaultKey]!
+      dictionary[key, default: defaultValue] += 1
+    }
+  }
+  // No error.
+  ```
+
+* [SE-0268][]:
+  
+  A `didSet` observer which does not refer to the `oldValue` in its body or does not explicitly request it by placing it in the parameter list (i.e. `didSet(oldValue)`) will no longer trigger a call to the property getter to fetch the `oldValue`.
+  
+  ```swift
+  class C {
+    var value: Int = 0 {
+      didSet { print("didSet called!") }
+    }
+  }
+  
+  let c = C()
+  // This does not trigger a call to the getter for 'value'
+  // because the 'didSet' observer on 'value' does not
+  // refer to the 'oldValue' in its body, which means
+  // the 'oldValue' does not need to be fetched.
+  c.value = 1
+  ```
+  
+* [SE-0276][]:
+
+  Catch clauses in a `do`-`catch` statement can now include multiple patterns in a comma-separated list. The body of a `catch` clause will be executed if a thrown error matches any of its patterns.
+
+  ```swift
+  do {
+    try performTask()
+  } catch TaskError.someFailure(let msg),
+          TaskError.anotherFailure(let msg) {
+    showMessage(msg)
+  }
+  ```
+
+* [SE-0280][]:
+  
+  Enum cases can now satisfy static protocol requirements. A static get-only property of type `Self` can be witnessed by an enum case with no associated values and a static function with arguments and returning `Self` can be witnessed by an enum case with associated values.
+  
+  ```swift
+  protocol P {
+    static var foo: Self { get }
+    static func bar(value: Int) -> Self
+  }
+  
+  enum E: P {
+    case foo // matches 'static var foo'
+    case bar(value: Int) // matches 'static func bar(value:)'
+  }
+  ```
+
+* [SE-0267][]:
+  
+  Non-generic members that support a generic parameter list, including nested type declarations, are now allowed to carry a contextual `where` clause against outer generic parameters. Previously, such declarations could only be expressed by placing the member inside a dedicated constrained extension.
+
+  ```swift
+  struct Box<Wrapped> {
+    func boxes() -> [Box<Wrapped.Element>] where Wrapped: Sequence { ... }
+  }
+  ```
+  Since contextual `where` clauses are effectively visibility constraints, overrides adopting this feature must be at least as visible as the overridden method. In practice, this implies any instance of `Derived` that can access `Base.foo` must also be able to access `Derived.foo`.
+  
+  ```swift
+  class Base<T> {
+    func foo() where T == Int { ... }
+  }
+  
+  class Derived<U>: Base<U> {
+    // OK, <U where U: Equatable> has broader visibility than <T where T == Int>
+    override func foo() where U: Equatable { ... } 
+  }
+
+* [SR-75][]:
+
+  Unapplied references to protocol methods are now supported. Previously this
+  only worked for methods defined in structs, enums and classes.
+
+  ```swift
+  protocol Cat {
+    func play(catToy: Toy)
+  }
+
+  let fn = Cat.play(catToy:)
+  fn(myCat)(myToy)
+  ```
+
+* [SE-0266][]:
+  
+  Enumerations with no associated values, or only `Comparable` associated values, can opt-in to synthesized `Comparable` conformance by declaring conformance to the `Comparable` protocol. The synthesized implementation orders the cases first by case-declaration order, and then by lexicographic order of the associated values (if any).
+  
+  ```swift
+  enum Foo: Comparable {
+    case a(Int), b(Int), c
+  }
+  
+  // .a(0) < .a(1) < .b(0) < .b(1) < .c
+  ```
+
+* [SE-0269][]:
+
+  When an escaping closure explicitly captures `self` in its capture list, the
+  use of implicit `self` is enabled within that closure. This means that the
+  following code is now valid:
+  
+  ```swift
+  func doStuff(_ stuff: @escaping () -> Void) {}
+  
+  class C {
+    var x = 0
+
+    func method() {
+      doStuff { [self] in
+        x += 1
+      }
+    }
+  }
+  ```
+  
+  This proposal also introduces new diagnostics for inserting `self` into the
+  closure's capture list in addition to the existing 'use `self.` explicitly'
+  fix-it.
+
+Swift 5.2
+---------
+
+### 2020-03-24 (Xcode 11.4)
+
+* [SR-11841][]:
+
+  When chaining calls to `filter(_:)` on a lazy sequence or collection, the
+  filtering predicates will now be called in the same order as eager filters.
+  
+  ```swift
+  let evens = (1...10).lazy
+      .filter { $0.isMultiple(of: 2) }
+      .filter { print($0); return true }
+  _ = evens.count
+  // Prints 2, 4, 6, 8, and 10 on separate lines
+  ```
+  
+  Previously, the predicates were called in reverse order.
+  
+* [SR-2790][]:
+
+  The compiler will now emit a warning when attempting to pass a temporary
+  pointer argument produced from an array, string, or inout argument to a
+  parameter which is known to escape it. This includes the various initializers 
+  for the `UnsafePointer`/`UnsafeBufferPointer` family of types, as well as
+  memberwise initializers.
+
+  ```swift
+  struct S {
+    var ptr: UnsafePointer<Int8>
+  }
+
+  func foo() {
+    var i: Int8 = 0
+    let ptr = UnsafePointer(&i)
+    // warning: initialization of 'UnsafePointer<Int8>' results in a 
+    // dangling pointer
+    
+    let s1 = S(ptr: [1, 2, 3]) 
+    // warning: passing '[Int8]' to parameter, but argument 'ptr' should be a
+    // pointer that outlives the call to 'init(ptr:)'
+    
+    let s2 = S(ptr: "hello")
+    // warning: passing 'String' to parameter, but argument 'ptr' should be a
+    // pointer that outlives the call to 'init(ptr:)'
+  }
+  ```
+
+  All 3 of the above examples are unsound because each argument produces a
+  temporary pointer only valid for the duration of the call they are passed to.
+  Therefore the returned value in each case references a dangling pointer.
+
+* [SR-2189][]:
+
+  The compiler now supports local functions whose default arguments capture
+  values from outer scopes.
+
+  ```swift
+  func outer(x: Int) -> (Int, Int) {
+    func inner(y: Int = x) -> Int {
+      return y
+    }
+
+    return (inner(), inner(y: 0))
+  }
+  ```
+
+* [SR-11429][]:
+
+  The compiler will now correctly strip argument labels from function references
+  used with the `as` operator in a function call. As a result, the `as` operator
+  can now be used to disambiguate a call to a function with argument labels. 
+  
+  ```swift
+  func foo(x: Int) {}
+  func foo(x: UInt) {}
+  
+  (foo as (Int) -> Void)(5)  // Calls foo(x: Int)
+  (foo as (UInt) -> Void)(5) // Calls foo(x: UInt)
+  ```
+  
+  Previously this was only possible for functions without argument labels.
+  
+  This change also means that a generic type alias can no longer be used to
+  preserve the argument labels of a function reference through the `as`
+  operator. The following is now rejected:
+  
+  ```swift
+  typealias Magic<T> = T
+  func foo(x: Int) {}
+  (foo as Magic)(x: 5) // error: Extraneous argument label 'x:' in call
+  ```
+  
+  The function value must instead be called without argument labels:
+  
+  ```swift
+  (foo as Magic)(5)
+  ```
+
+* [SR-11298][]:
+
+  A class-constrained protocol extension, where the extended protocol does
+  not impose a class constraint, will now infer the constraint implicitly.
+
+  ```swift
+  protocol Foo {}
+  class Bar: Foo {
+    var someProperty: Int = 0
+  }
+
+  // Even though 'Foo' does not impose a class constraint, it is automatically
+  // inferred due to the Self: Bar constraint.
+  extension Foo where Self: Bar {
+    var anotherProperty: Int {
+      get { return someProperty }
+      // As a result, the setter is now implicitly nonmutating, just like it would
+      // be if 'Foo' had a class constraint.
+      set { someProperty = newValue }
+    }
+  }
+  ```
+
+* [SE-0253][]:
+
+  Values of types that declare `func callAsFunction` methods can be called
+  like functions. The call syntax is shorthand for applying
+  `func callAsFunction` methods.
+
+  ```swift
+  struct Adder {
+    var base: Int
+    func callAsFunction(_ x: Int) -> Int {
+      return x + base
+    }
+  }
+  var adder = Adder(base: 3)
+  adder(10) // returns 13, same as `adder.callAsFunction(10)`
+  ```
+
+  * `func callAsFunction` argument labels are required at call sites.
+  * Multiple `func callAsFunction` methods on a single type are supported.
+  * `mutating func callAsFunction` is supported.
+  * `func callAsFunction` works with `throws` and `rethrows`.
+  * `func callAsFunction` works with trailing closures.
+  
+* [SE-0249][]:
+
+  A `\Root.value` key path expression is now allowed wherever a `(Root) -> Value` 
+  function is allowed. Such an expression is implicitly converted to a key path 
+  application of `{ $0[keyPath: \Root.value] }`.
+  
+  For example:
+  
+  ```swift
+  struct User {
+    let email: String
+    let isAdmin: Bool
+  }
+  
+  users.map(\.email) // this is equivalent to: users.map { $0[keyPath: \User.email] }
+  ```
+
+* [SR-4206][]:
+
+  A method override is no longer allowed to have a generic signature with
+  requirements not imposed by the base method. For example:
+
+  ```swift
+  protocol P {}
+  
+  class Base {
+    func foo<T>(arg: T) {}
+  }
+  
+  class Derived: Base {
+    override func foo<T: P>(arg: T) {}
+  }
+  ```
+
+  will now be diagnosed as an error.
+
+* [SR-6118][]:
+
+  Subscripts can now declare default arguments:
+
+  ```swift
+  struct Subscriptable {
+    subscript(x: Int, y: Int = 0) {
+      ...
+    }
+  }
+
+  let s = Subscriptable()
+  print(s[0])
+  ```
+
+Swift 5.1
+---------
+
+### 2019-09-20 (Xcode 11.0)
+
+* [SR-8974][]:
+
+  Duplicate tuple element labels are no longer allowed, because it leads
+  to incorrect behavior. For example:
+
+  ```swift
+  let dupLabels: (foo: Int, foo: Int) = (foo: 1, foo: 2)
+
+  enum Foo { case bar(x: Int, x: Int) }
+  let f: Foo = .bar(x: 0, x: 1)
+  ```
+
+  will now be diagnosed as an error. 
+
+  Note: You can still use duplicate argument labels when declaring functions and
+  subscripts, as long as the internal parameter names are different. For example:
+
+  ```swift
+  func foo(bar x: Int, bar y: Int) {}
+  subscript(a x: Int, a y: Int) -> Int {}
+  ```
+
+* [SE-0244][]:
+
+  Functions can now hide their concrete return type by declaring what protocols
+  it conforms to instead of specifying the exact return type:
+
+  ```swift
+  func makeMeACollection() -> some Collection {
+    return [1, 2, 3]
+  }
+  ```
+
+  Code that calls the function can use the interface of the protocol, but
+  does not have visibility into the underlying type.
+
+* [SE-0254][]:
+
+  Subscripts can now be declared `static` or (inside classes) `class`.
+
+* [SE-0252][]:
+
+  The existing `@dynamicMemberLookup` attribute has been extended with a
+  support for strongly-typed keypath implementations:
+
+  ```swift
+  @dynamicMemberLookup
+  struct Lens<T> {
+    let getter: () -> T
+    let setter: (T) -> Void
+
+    var value: T {
+      get {
+        return getter()
+      }
+      set {
+        setter(newValue)
+      }
+    }
+
+    subscript<U>(dynamicMember keyPath: WritableKeyPath<T, U>) -> Lens<U> {
+      return Lens<U>(
+          getter: { self.value[keyPath: keyPath] },
+          setter: { self.value[keyPath: keyPath] = $0 })
+    }
+  }
+  ```
+
+* [SR-8546][], [SR-9043][]:
+
+  More thorough checking has been implemented for restrictions around
+  escaping closures capturing `inout` parameters or values of noescape type.
+  While most code should not be affected, there are edge cases where
+  the Swift 5.0 compiler would accept code violating these restrictions.
+  This could result in runtime crashes or silent data corruption.
+  
+  An example of invalid code which was incorrectly accepted by the Swift 5.0
+  compiler is an `@escaping` closure calling a local function which
+  references an `inout` parameter from an outer scope:
+
+  ```swift
+  struct BadCaptureExample {
+    var escapingClosure: () -> ()
+
+    mutating func takesInOut(_ x: inout Int) {
+      func localFunction() {
+        x += 1
+      }
+
+      escapingClosure = { localFunction() }
+    }
+  }
+  ```
+
+  The compiler now correctly diagnoses the above code by pointing out that
+  the capture of `x` by `localFunction()` is invalid, since `localFunction()`
+  is referenced from an `@escaping` closure.
+
+  This also addresses certain cases where the compiler incorrectly diagnosed
+  certain code as invalid, when in fact no violation of restrictions had
+  taken place. For example,
+
+  ```swift
+  func takesNoEscape(_ fn: () -> ()) {
+    func localFunction() {
+      fn()
+    }
+
+    { localFunction() }()
+  }
+  ```
+
+* [SR-2672][]:
+
+  Conversions between tuple types are now fully implemented.
+  Previously, the following would diagnose an error:
+
+  ```swift
+  let values: (Int, Int) = (10, 15)
+  let converted: (Int?, Any) = values
+
+* [SE-0242][]:
+
+  The memberwise initializer for structures now provide default values for variables that hold default expressions.
+
+  ```swift
+  struct Dog {
+    var name = "Generic dog name"
+    var age = 0
+
+    // The synthesized memberwise initializer
+    init(name: String = "Generic dog name", age: Int = 0)
+  }
+
+  let sparky = Dog(name: "Sparky") // Dog(name: "Sparky", age: 0)
+  ```
+
+* [SE-0068][]:
+
+  It is now possible to use `Self` to refer to the innermost nominal
+  type inside struct, enum and class declarations. For example, the
+  two method declarations inside this struct are equivalent:
+  
+  ```swift
+  struct Box<Value> {
+    func transform1() -> Self { return self }
+    func transform2() -> Box<Value> { return self }
+  }
+  ```
+
+  In classes, `Self` is the dynamic type of the `self` value, as before.
+  Existing restrictions on `Self` in declaration types still apply;
+  that is, `Self` can only appear as the return type of a method.
+  However, `Self` can now be used inside the body of a method
+  without limitation.
+
+* [SR-7799][]:
+
+  Enum cases can now be matched against an optional enum without
+  requiring a '?' at the end of the pattern.
+
+  ```swift
+  enum Foo { case zero, one }
+
+  let foo: Foo? = .zero
+
+  switch foo {
+    case .zero: break
+    case .one: break
+    case .none: break
+  }
+  ```
+
+* [SR-9827][]:
+
+  `weak` and `unowned` stored properties no longer inhibit the
+   automatic synthesis of `Equatable` or `Hashable` conformance.
+
+* [SR-2688][]:
+
+  An `@autoclosure` parameter can now be declared with a typealias type.
+
+  ```swift
+  class Foo {
+    typealias FooClosure = () -> String
+    func fooFunction(closure: @autoclosure FooClosure) {}
+  }
+  ```
+
+* [SR-7601][]:
+
+  Methods declared `@objc` inside a class can now return `Self`:
+
+  ```swift
+  class MyClass : NSObject {
+    @objc func clone() -> Self { return self }
+  }
+  ```
+
+* [SR-2176][]:
+
+  Assigning '.none' to an optional enum which also has a 'none' case
+  or comparing such an enum with '.none' will now warn. Such expressions
+  create an ambiguity because the compiler chooses Optional.none
+  over Foo.none.
+
+  ```swift
+  enum Foo { case none }
+
+  // Assigned Optional.none instead of Foo.none
+  let foo: Foo? = .none
+  // Comparing with Optional.none instead of Foo.none
+  let isEqual = foo == .none
+  ```
+
+  The compiler will provide a warning along with a fix-it to
+  replace '.none' with 'Optional.none' or 'Foo.none' to resolve
+  the ambiguity.
+
+* Key path expressions can now include references to tuple elements.
+
+* Single-parameter functions accepting values of type `Any` are no
+  longer preferred over other functions.
+
+  ```swift
+  func foo(_: Any) { print("Any") }
+  func foo<T>(_: T) { print("T") }
+  foo(0) // prints "Any" in Swift < 5.1, "T" in Swift 5.1
+  ```
+
+* [SE-0245][]:
+
+  `Array` and `ContiguousArray` now have `init(unsafeUninitializedCapacity:initializingWith:)`,
+  which provides access to the array's uninitialized storage.
 
 Swift 5.0
 ---------
+
+### 2019-03-25 (Xcode 10.2)
+
+* [SE-0235][]:
+
+  The standard library now contains a `Result` type for manually propagating errors.
+  
+  ```swift
+  enum Result<Success, Failure: Error> {
+      case success(Success)
+      case failure(Failure)
+  }
+  ```
+  
+  This type serves a complementary role to that of throwing functions and initializers. 
+  Use `Result` in situations where automatic error propagation or `try`-`catch` 
+  blocks are undesirable, such as in asynchronous code or when accumulating the 
+  results of successive error-producing operations.
+  
+* `Error` now conforms to itself. This allows for the use of `Error` itself as 
+  the argument for a generic parameter constrained to `Error`.
+
+* Swift 3 mode has been removed. Supported values for the `-swift-version`
+  flag are `4`, `4.2`, and `5`.
+
+* [SE-0228][]:
+
+  String interpolation has been overhauled to improve its performance,
+  clarity, and efficiency.
+
+  Note that the old `_ExpressibleByStringInterpolation` protocol has been
+  removed; any code making use of this protocol will need to be updated
+  for the new design. An `#if compiler` block can be used to conditionalize
+  code between 4.2 and 5.0, for example:
+  
+  ```swift
+  #if compiler(<5.0)
+  extension MyType : _ExpressibleByStringInterpolation { ... }
+  #else
+  extension MyType : ExpressibleByStringInterpolation { ... }
+  #endif
+  ```
+
+* [SE-0213][]:
+
+  If `T` conforms to one of the `ExpressibleBy*` protocols and `literal` is a
+  literal expression, then `T(literal)` will construct a literal of type `T`
+  using the corresponding protocol, rather than calling a constructor member
+  of `T` with a value of  the protocol's default literal type.
+
+  For example, expressions like `UInt64(0xffff_ffff_ffff_ffff)` are now valid,
+  where previously they would overflow the default integer literal type of `Int`.
+
+* [SE-0230][]:
+
+  In Swift 5 mode, `try?` with an expression of Optional type will flatten the
+  resulting Optional, instead of returning an Optional of an Optional.
+
+* [SR-5719][]:
+
+  In Swift 5 mode, `@autoclosure` parameters can no longer be forwarded to
+  `@autoclosure` arguments in another function call. Instead, you must explicitly
+  call the function value with `()`; the call itself is wrapped inside an
+  implicit closure, guaranteeing the same behavior as in Swift 4 mode.
+
+  Example:
+
+  ```swift
+  func foo(_ fn: @autoclosure () -> Int) {}
+  func bar(_ fn: @autoclosure () -> Int) {
+    foo(fn)   // Incorrect, `fn` can't be forwarded and has to be called
+    foo(fn()) // Ok
+  }
+  ```
+
+* [SR-8109][]:
+
+  Single-element labeled tuple expressions, for example `(label: 123)`, were
+  allowed in some contexts but often resulted in surprising, inconsistent
+  behavior that varied across compiler releases. They are now completely
+  disallowed.
+
+  Note that single-element labeled _types_, for example `var x: (label: Int)`,
+  have already been prohibited since Swift 3.
+
+* [SR-695][]:
+
+  In Swift 5 mode, a class method returning `Self` can no longer be overridden
+  with a method returning a non-final concrete class type. Such code is not
+  type safe and will need to be updated.
+
+  For example,
+
+  ```swift
+  class Base {
+    class func factory() -> Self { ... }
+  }
+
+  class Derived : Base {
+    class override func factory() -> Derived { ... }
+  }
+  ```
+
+* In Swift 5 mode, the type of `self` in a convenience initializer of a non-final
+  class is now the dynamic `Self` type, and not the concrete class type.
+
+* [SR-5581][]:
+
+  Protocols can now constrain their conforming types to those that subclasses a
+  given class. Two equivalent forms are supported:
+
+  ```swift
+  protocol MyView : UIView { ... }
+  protocol MyView where Self : UIView { ... }
+  ```
+
+  Note that Swift 4.2 accepted the second form, but it was not fully implemented
+  and could sometimes crash at compile time or run time.
+
+* [SR-631][]:
+
+  Extension binding now supports extensions of nested types which themselves are
+  defined inside extensions. Previously this could fail with some declaration orders,
+  producing spurious "undeclared type" errors.
+
+* [SR-7139][]:
+
+  Exclusive memory access is now enforced at runtime by default in
+  optimized (`-O`/`-Osize`) builds. Programs that violate exclusivity will
+  trap at runtime with an "overlapping access" diagnostic
+  message. This can be disabled via a command line flag:
+  `-enforce-exclusivity=unchecked`, but doing so may result in undefined
+  behavior.
+
+  Runtime violations of exclusivity typically result from
+  simultaneous access of class properties, global variables (including
+  variables in top-level code), or variables captured by escaping
+  closures.
+
+* [SE-0216][]:
+
+  The `@dynamicCallable` attribute enables nominal types to be "callable" via a
+  simple syntactic sugar. The primary use case is dynamic language
+  interoperability.
+
+  Toy example:
+
+  ```swift
+  @dynamicCallable
+  struct ToyCallable {
+    func dynamicallyCall(withArguments: [Int]) {}
+    func dynamicallyCall(withKeywordArguments: KeyValuePairs<String, Int>) {}
+  }
+  let x = ToyCallable()
+  x(1, 2, 3) // desugars to `x.dynamicallyCall(withArguments: [1, 2, 3])`
+  x(label: 1, 2) // desugars to `x.dynamicallyCall(withKeywordArguments: ["label": 1, "": 2])`
+  ```
 
 * [SR-7251][]:
 
@@ -80,7 +1311,7 @@ Swift 5.0
 
 * [SE-0214][]:
 
-  Renamed the `DictionaryLiteral` type to `KeyValuePairs`.
+  The `DictionaryLiteral` type has been renamed to `KeyValuePairs`.
   A typealias preserves the old name for compatibility.
 
 * [SR-2608][]
@@ -88,8 +1319,16 @@ Swift 5.0
   Default arguments are now printed in SourceKit-generated interfaces for Swift
   modules, instead of just using a placeholder `default`.
 
-* Notable bug fix: unowned and unowned(unsafe) variables now support optional
-  types.
+* `unowned` and `unowned(unsafe)` variables now support Optional types.
+
+* Designated initializers with variadic parameters are now correctly inherited
+  in subclasses.
+
+* Extensions of concrete subclasses of generic classes can now contain
+  `@objc` members.
+
+* Complex recursive type definitions involving classes and generics that would
+  previously cause deadlocks at run time are now fully supported.
 
 * [SR-419][]
 
@@ -120,8 +1359,6 @@ Swift 5.0
     }
   }
   ```
-
-**Add new entries to the top of this section, not here!**
 
 Swift 4.2
 ---------
@@ -439,10 +1676,10 @@ Swift 4.1
   types, such as `index(of:)`.
 
 * [SE-0157][] is implemented. Associated types can now declare "recursive"
-	constraints, which require that the associated type conform to the enclosing
-	protocol. The standard library protocols have been updated to make use of
-	recursive constraints. For example, the `SubSequence` associated type of
-	`Sequence` follows the enclosing protocol:
+  constraints, which require that the associated type conform to the enclosing
+  protocol. The standard library protocols have been updated to make use of
+  recursive constraints. For example, the `SubSequence` associated type of
+  `Sequence` follows the enclosing protocol:
 
   ```swift
   protocol Sequence {
@@ -459,16 +1696,15 @@ Swift 4.1
   ```
 
   As a result, a number of new constraints have been introduced into the
-	standard library protocols:
+  standard library protocols:
 
-	* Make the `Indices` associated type have the same traversal requirements as
-	its enclosing protocol, e.g., `Collection.Indices` conforms to
-	`Collection`, `BidirectionalCollection.Indices` conforms to
-	`BidirectionalCollection`, and so on
-	* Make `Numeric.Magnitude` conform to `Numeric`
-	* Use more efficient `SubSequence` types for lazy filter and map
-	* Eliminate the `*Indexable` protocols
-
+  * Make the `Indices` associated type have the same traversal requirements as
+    its enclosing protocol, e.g., `Collection.Indices` conforms to
+    `Collection`, `BidirectionalCollection.Indices` conforms to
+    `BidirectionalCollection`, and so on
+  * Make `Numeric.Magnitude` conform to `Numeric`
+  * Use more efficient `SubSequence` types for lazy filter and map
+  * Eliminate the `*Indexable` protocols
 
 * [SE-0161][] is fully implemented. KeyPaths now support subscript, optional
   chaining, and optional force-unwrapping components.
@@ -698,9 +1934,9 @@ Swift 4.0
   setting the environment variable
   `SWIFT_DEBUG_IMPLICIT_OBJC_ENTRYPOINT` to a value between 1 and 3
   and testing the application. See the [migration discussion in
-  SE-0160](https://github.com/apple/swift-evolution/blob/master/proposals/0160-objc-inference.md#minimal-migration-workflow).
+  SE-0160](https://github.com/apple/swift-evolution/blob/main/proposals/0160-objc-inference.md#minimal-migration-workflow).
 
-* [SE-0138](https://github.com/apple/swift-evolution/blob/master/proposals/0138-unsaferawbufferpointer.md#amendment-to-normalize-the-slice-type):
+* [SE-0138](https://github.com/apple/swift-evolution/blob/main/proposals/0138-unsaferawbufferpointer.md#amendment-to-normalize-the-slice-type):
 
   Slicing a raw buffer no longer results in the same raw buffer
   type. Specifically, `Unsafe[Mutable]BufferPointer.SubSequence` now has type
@@ -1091,7 +2327,7 @@ using the `.dynamicType` member to retrieve the type of an expression should mig
   doSomething(x: 0, y: 0)     // argument labels are required
   ```
 
- Unapplied references to functions or initializers no longer carry argument labels. For example:
+  Unapplied references to functions or initializers no longer carry argument labels. For example:
 
   ```swift
   let f = doSomething(x:y:)     // inferred type is now (Int, Int) -> Void
@@ -5857,7 +7093,7 @@ Swift 1.0
 
 * A `map` method with the semantics of Haskell's `fmap` was added to
   `Array<T>`.  Map applies a function `f: T->U` to the values stored in
-  the array and returns an Array<U>.  So,
+  the array and returns an `Array<U>`.  So,
 
     ```swift
     (swift) func names(x: Int[]) -> String[] {
@@ -6599,7 +7835,7 @@ Swift 1.0
   are semantically identical in swift (the former just has data
   associated with its discriminators) and `enum` is the vastly more
   common case.  For more rationale, please see
-  [docs/proposals/Enums.rst](https://github.com/apple/swift/blob/master/docs/proposals/Enums.rst)
+  [docs/proposals/Enums.rst](https://github.com/apple/swift/blob/main/docs/proposals/Enums.rst)
 
 * The Optional type `T?` is now represented as an `enum`:
 
@@ -7033,241 +8269,297 @@ Swift 1.0
 
 <!-- References -->
 
-[SE-0001]: <https://github.com/apple/swift-evolution/blob/master/proposals/0001-keywords-as-argument-labels.md>
-[SE-0002]: <https://github.com/apple/swift-evolution/blob/master/proposals/0002-remove-currying.md>
-[SE-0003]: <https://github.com/apple/swift-evolution/blob/master/proposals/0003-remove-var-parameters.md>
-[SE-0004]: <https://github.com/apple/swift-evolution/blob/master/proposals/0004-remove-pre-post-inc-decrement.md>
-[SE-0005]: <https://github.com/apple/swift-evolution/blob/master/proposals/0005-objective-c-name-translation.md>
-[SE-0006]: <https://github.com/apple/swift-evolution/blob/master/proposals/0006-apply-api-guidelines-to-the-standard-library.md>
-[SE-0007]: <https://github.com/apple/swift-evolution/blob/master/proposals/0007-remove-c-style-for-loops.md>
-[SE-0008]: <https://github.com/apple/swift-evolution/blob/master/proposals/0008-lazy-flatmap-for-optionals.md>
-[SE-0009]: <https://github.com/apple/swift-evolution/blob/master/proposals/0009-require-self-for-accessing-instance-members.md>
-[SE-0010]: <https://github.com/apple/swift-evolution/blob/master/proposals/0010-add-staticstring-unicodescalarview.md>
-[SE-0011]: <https://github.com/apple/swift-evolution/blob/master/proposals/0011-replace-typealias-associated.md>
-[SE-0012]: <https://github.com/apple/swift-evolution/blob/master/proposals/0012-add-noescape-to-public-library-api.md>
-[SE-0013]: <https://github.com/apple/swift-evolution/blob/master/proposals/0013-remove-partial-application-super.md>
-[SE-0014]: <https://github.com/apple/swift-evolution/blob/master/proposals/0014-constrained-AnySequence.md>
-[SE-0015]: <https://github.com/apple/swift-evolution/blob/master/proposals/0015-tuple-comparison-operators.md>
-[SE-0016]: <https://github.com/apple/swift-evolution/blob/master/proposals/0016-initializers-for-converting-unsafe-pointers-to-ints.md>
-[SE-0017]: <https://github.com/apple/swift-evolution/blob/master/proposals/0017-convert-unmanaged-to-use-unsafepointer.md>
-[SE-0018]: <https://github.com/apple/swift-evolution/blob/master/proposals/0018-flexible-memberwise-initialization.md>
-[SE-0019]: <https://github.com/apple/swift-evolution/blob/master/proposals/0019-package-manager-testing.md>
-[SE-0020]: <https://github.com/apple/swift-evolution/blob/master/proposals/0020-if-swift-version.md>
-[SE-0021]: <https://github.com/apple/swift-evolution/blob/master/proposals/0021-generalized-naming.md>
-[SE-0022]: <https://github.com/apple/swift-evolution/blob/master/proposals/0022-objc-selectors.md>
-[SE-0023]: <https://github.com/apple/swift-evolution/blob/master/proposals/0023-api-guidelines.md>
-[SE-0024]: <https://github.com/apple/swift-evolution/blob/master/proposals/0024-optional-value-setter.md>
-[SE-0025]: <https://github.com/apple/swift-evolution/blob/master/proposals/0025-scoped-access-level.md>
-[SE-0026]: <https://github.com/apple/swift-evolution/blob/master/proposals/0026-abstract-classes-and-methods.md>
-[SE-0027]: <https://github.com/apple/swift-evolution/blob/master/proposals/0027-string-from-code-units.md>
-[SE-0028]: <https://github.com/apple/swift-evolution/blob/master/proposals/0028-modernizing-debug-identifiers.md>
-[SE-0029]: <https://github.com/apple/swift-evolution/blob/master/proposals/0029-remove-implicit-tuple-splat.md>
-[SE-0030]: <https://github.com/apple/swift-evolution/blob/master/proposals/0030-property-behavior-decls.md>
-[SE-0031]: <https://github.com/apple/swift-evolution/blob/master/proposals/0031-adjusting-inout-declarations.md>
-[SE-0032]: <https://github.com/apple/swift-evolution/blob/master/proposals/0032-sequencetype-find.md>
-[SE-0033]: <https://github.com/apple/swift-evolution/blob/master/proposals/0033-import-objc-constants.md>
-[SE-0034]: <https://github.com/apple/swift-evolution/blob/master/proposals/0034-disambiguating-line.md>
-[SE-0035]: <https://github.com/apple/swift-evolution/blob/master/proposals/0035-limit-inout-capture.md>
-[SE-0036]: <https://github.com/apple/swift-evolution/blob/master/proposals/0036-enum-dot.md>
-[SE-0037]: <https://github.com/apple/swift-evolution/blob/master/proposals/0037-clarify-comments-and-operators.md>
-[SE-0038]: <https://github.com/apple/swift-evolution/blob/master/proposals/0038-swiftpm-c-language-targets.md>
-[SE-0039]: <https://github.com/apple/swift-evolution/blob/master/proposals/0039-playgroundliterals.md>
-[SE-0040]: <https://github.com/apple/swift-evolution/blob/master/proposals/0040-attributecolons.md>
-[SE-0041]: <https://github.com/apple/swift-evolution/blob/master/proposals/0041-conversion-protocol-conventions.md>
-[SE-0042]: <https://github.com/apple/swift-evolution/blob/master/proposals/0042-flatten-method-types.md>
-[SE-0043]: <https://github.com/apple/swift-evolution/blob/master/proposals/0043-declare-variables-in-case-labels-with-multiple-patterns.md>
-[SE-0044]: <https://github.com/apple/swift-evolution/blob/master/proposals/0044-import-as-member.md>
-[SE-0045]: <https://github.com/apple/swift-evolution/blob/master/proposals/0045-scan-takewhile-dropwhile.md>
-[SE-0046]: <https://github.com/apple/swift-evolution/blob/master/proposals/0046-first-label.md>
-[SE-0047]: <https://github.com/apple/swift-evolution/blob/master/proposals/0047-nonvoid-warn.md>
-[SE-0048]: <https://github.com/apple/swift-evolution/blob/master/proposals/0048-generic-typealias.md>
-[SE-0049]: <https://github.com/apple/swift-evolution/blob/master/proposals/0049-noescape-autoclosure-type-attrs.md>
-[SE-0050]: <https://github.com/apple/swift-evolution/blob/master/proposals/0050-floating-point-stride.md>
-[SE-0051]: <https://github.com/apple/swift-evolution/blob/master/proposals/0051-stride-semantics.md>
-[SE-0052]: <https://github.com/apple/swift-evolution/blob/master/proposals/0052-iterator-post-nil-guarantee.md>
-[SE-0053]: <https://github.com/apple/swift-evolution/blob/master/proposals/0053-remove-let-from-function-parameters.md>
-[SE-0054]: <https://github.com/apple/swift-evolution/blob/master/proposals/0054-abolish-iuo.md>
-[SE-0055]: <https://github.com/apple/swift-evolution/blob/master/proposals/0055-optional-unsafe-pointers.md>
-[SE-0056]: <https://github.com/apple/swift-evolution/blob/master/proposals/0056-trailing-closures-in-guard.md>
-[SE-0057]: <https://github.com/apple/swift-evolution/blob/master/proposals/0057-importing-objc-generics.md>
-[SE-0058]: <https://github.com/apple/swift-evolution/blob/master/proposals/0058-objectivecbridgeable.md>
-[SE-0059]: <https://github.com/apple/swift-evolution/blob/master/proposals/0059-updated-set-apis.md>
-[SE-0060]: <https://github.com/apple/swift-evolution/blob/master/proposals/0060-defaulted-parameter-order.md>
-[SE-0061]: <https://github.com/apple/swift-evolution/blob/master/proposals/0061-autoreleasepool-signature.md>
-[SE-0062]: <https://github.com/apple/swift-evolution/blob/master/proposals/0062-objc-keypaths.md>
-[SE-0063]: <https://github.com/apple/swift-evolution/blob/master/proposals/0063-swiftpm-system-module-search-paths.md>
-[SE-0064]: <https://github.com/apple/swift-evolution/blob/master/proposals/0064-property-selectors.md>
-[SE-0065]: <https://github.com/apple/swift-evolution/blob/master/proposals/0065-collections-move-indices.md>
-[SE-0066]: <https://github.com/apple/swift-evolution/blob/master/proposals/0066-standardize-function-type-syntax.md>
-[SE-0067]: <https://github.com/apple/swift-evolution/blob/master/proposals/0067-floating-point-protocols.md>
-[SE-0068]: <https://github.com/apple/swift-evolution/blob/master/proposals/0068-universal-self.md>
-[SE-0069]: <https://github.com/apple/swift-evolution/blob/master/proposals/0069-swift-mutability-for-foundation.md>
-[SE-0070]: <https://github.com/apple/swift-evolution/blob/master/proposals/0070-optional-requirements.md>
-[SE-0071]: <https://github.com/apple/swift-evolution/blob/master/proposals/0071-member-keywords.md>
-[SE-0072]: <https://github.com/apple/swift-evolution/blob/master/proposals/0072-eliminate-implicit-bridging-conversions.md>
-[SE-0073]: <https://github.com/apple/swift-evolution/blob/master/proposals/0073-noescape-once.md>
-[SE-0074]: <https://github.com/apple/swift-evolution/blob/master/proposals/0074-binary-search.md>
-[SE-0075]: <https://github.com/apple/swift-evolution/blob/master/proposals/0075-import-test.md>
-[SE-0076]: <https://github.com/apple/swift-evolution/blob/master/proposals/0076-copying-to-unsafe-mutable-pointer-with-unsafe-pointer-source.md>
-[SE-0077]: <https://github.com/apple/swift-evolution/blob/master/proposals/0077-operator-precedence.md>
-[SE-0078]: <https://github.com/apple/swift-evolution/blob/master/proposals/0078-rotate-algorithm.md>
-[SE-0079]: <https://github.com/apple/swift-evolution/blob/master/proposals/0079-upgrade-self-from-weak-to-strong.md>
-[SE-0080]: <https://github.com/apple/swift-evolution/blob/master/proposals/0080-failable-numeric-initializers.md>
-[SE-0081]: <https://github.com/apple/swift-evolution/blob/master/proposals/0081-move-where-expression.md>
-[SE-0082]: <https://github.com/apple/swift-evolution/blob/master/proposals/0082-swiftpm-package-edit.md>
-[SE-0083]: <https://github.com/apple/swift-evolution/blob/master/proposals/0083-remove-bridging-from-dynamic-casts.md>
-[SE-0084]: <https://github.com/apple/swift-evolution/blob/master/proposals/0084-trailing-commas.md>
-[SE-0085]: <https://github.com/apple/swift-evolution/blob/master/proposals/0085-package-manager-command-name.md>
-[SE-0086]: <https://github.com/apple/swift-evolution/blob/master/proposals/0086-drop-foundation-ns.md>
-[SE-0087]: <https://github.com/apple/swift-evolution/blob/master/proposals/0087-lazy-attribute.md>
-[SE-0088]: <https://github.com/apple/swift-evolution/blob/master/proposals/0088-libdispatch-for-swift3.md>
-[SE-0089]: <https://github.com/apple/swift-evolution/blob/master/proposals/0089-rename-string-reflection-init.md>
-[SE-0090]: <https://github.com/apple/swift-evolution/blob/master/proposals/0090-remove-dot-self.md>
-[SE-0091]: <https://github.com/apple/swift-evolution/blob/master/proposals/0091-improving-operators-in-protocols.md>
-[SE-0092]: <https://github.com/apple/swift-evolution/blob/master/proposals/0092-typealiases-in-protocols.md>
-[SE-0093]: <https://github.com/apple/swift-evolution/blob/master/proposals/0093-slice-base.md>
-[SE-0094]: <https://github.com/apple/swift-evolution/blob/master/proposals/0094-sequence-function.md>
-[SE-0095]: <https://github.com/apple/swift-evolution/blob/master/proposals/0095-any-as-existential.md>
-[SE-0096]: <https://github.com/apple/swift-evolution/blob/master/proposals/0096-dynamictype.md>
-[SE-0097]: <https://github.com/apple/swift-evolution/blob/master/proposals/0097-negative-attributes.md>
-[SE-0098]: <https://github.com/apple/swift-evolution/blob/master/proposals/0098-didset-capitalization.md>
-[SE-0099]: <https://github.com/apple/swift-evolution/blob/master/proposals/0099-conditionclauses.md>
-[SE-0100]: <https://github.com/apple/swift-evolution/blob/master/proposals/0100-add-sequence-based-init-and-merge-to-dictionary.md>
-[SE-0101]: <https://github.com/apple/swift-evolution/blob/master/proposals/0101-standardizing-sizeof-naming.md>
-[SE-0102]: <https://github.com/apple/swift-evolution/blob/master/proposals/0102-noreturn-bottom-type.md>
-[SE-0103]: <https://github.com/apple/swift-evolution/blob/master/proposals/0103-make-noescape-default.md>
-[SE-0104]: <https://github.com/apple/swift-evolution/blob/master/proposals/0104-improved-integers.md>
-[SE-0105]: <https://github.com/apple/swift-evolution/blob/master/proposals/0105-remove-where-from-forin-loops.md>
-[SE-0106]: <https://github.com/apple/swift-evolution/blob/master/proposals/0106-rename-osx-to-macos.md>
-[SE-0107]: <https://github.com/apple/swift-evolution/blob/master/proposals/0107-unsaferawpointer.md>
-[SE-0108]: <https://github.com/apple/swift-evolution/blob/master/proposals/0108-remove-assoctype-inference.md>
-[SE-0109]: <https://github.com/apple/swift-evolution/blob/master/proposals/0109-remove-boolean.md>
-[SE-0110]: <https://github.com/apple/swift-evolution/blob/master/proposals/0110-distingish-single-tuple-arg.md>
-[SE-0111]: <https://github.com/apple/swift-evolution/blob/master/proposals/0111-remove-arg-label-type-significance.md>
-[SE-0112]: <https://github.com/apple/swift-evolution/blob/master/proposals/0112-nserror-bridging.md>
-[SE-0113]: <https://github.com/apple/swift-evolution/blob/master/proposals/0113-rounding-functions-on-floatingpoint.md>
-[SE-0114]: <https://github.com/apple/swift-evolution/blob/master/proposals/0114-buffer-naming.md>
-[SE-0115]: <https://github.com/apple/swift-evolution/blob/master/proposals/0115-literal-syntax-protocols.md>
-[SE-0116]: <https://github.com/apple/swift-evolution/blob/master/proposals/0116-id-as-any.md>
-[SE-0117]: <https://github.com/apple/swift-evolution/blob/master/proposals/0117-non-public-subclassable-by-default.md>
-[SE-0118]: <https://github.com/apple/swift-evolution/blob/master/proposals/0118-closure-parameter-names-and-labels.md>
-[SE-0119]: <https://github.com/apple/swift-evolution/blob/master/proposals/0119-extensions-access-modifiers.md>
-[SE-0120]: <https://github.com/apple/swift-evolution/blob/master/proposals/0120-revise-partition-method.md>
-[SE-0121]: <https://github.com/apple/swift-evolution/blob/master/proposals/0121-remove-optional-comparison-operators.md>
-[SE-0122]: <https://github.com/apple/swift-evolution/blob/master/proposals/0122-use-colons-for-subscript-type-declarations.md>
-[SE-0123]: <https://github.com/apple/swift-evolution/blob/master/proposals/0123-disallow-value-to-optional-coercion-in-operator-arguments.md>
-[SE-0124]: <https://github.com/apple/swift-evolution/blob/master/proposals/0124-bitpattern-label-for-int-initializer-objectidentfier.md>
-[SE-0125]: <https://github.com/apple/swift-evolution/blob/master/proposals/0125-remove-nonobjectivecbase.md>
-[SE-0126]: <https://github.com/apple/swift-evolution/blob/master/proposals/0126-refactor-metatypes-repurpose-t-dot-self-and-mirror.md>
-[SE-0127]: <https://github.com/apple/swift-evolution/blob/master/proposals/0127-cleaning-up-stdlib-ptr-buffer.md>
-[SE-0128]: <https://github.com/apple/swift-evolution/blob/master/proposals/0128-unicodescalar-failable-initializer.md>
-[SE-0129]: <https://github.com/apple/swift-evolution/blob/master/proposals/0129-package-manager-test-naming-conventions.md>
-[SE-0130]: <https://github.com/apple/swift-evolution/blob/master/proposals/0130-string-initializers-cleanup.md>
-[SE-0131]: <https://github.com/apple/swift-evolution/blob/master/proposals/0131-anyhashable.md>
-[SE-0132]: <https://github.com/apple/swift-evolution/blob/master/proposals/0132-sequence-end-ops.md>
-[SE-0133]: <https://github.com/apple/swift-evolution/blob/master/proposals/0133-rename-flatten-to-joined.md>
-[SE-0134]: <https://github.com/apple/swift-evolution/blob/master/proposals/0134-rename-string-properties.md>
-[SE-0135]: <https://github.com/apple/swift-evolution/blob/master/proposals/0135-package-manager-support-for-differentiating-packages-by-swift-version.md>
-[SE-0136]: <https://github.com/apple/swift-evolution/blob/master/proposals/0136-memory-layout-of-values.md>
-[SE-0137]: <https://github.com/apple/swift-evolution/blob/master/proposals/0137-avoiding-lock-in.md>
-[SE-0138]: <https://github.com/apple/swift-evolution/blob/master/proposals/0138-unsaferawbufferpointer.md>
-[SE-0139]: <https://github.com/apple/swift-evolution/blob/master/proposals/0139-bridge-nsnumber-and-nsvalue.md>
-[SE-0140]: <https://github.com/apple/swift-evolution/blob/master/proposals/0140-bridge-optional-to-nsnull.md>
-[SE-0141]: <https://github.com/apple/swift-evolution/blob/master/proposals/0141-available-by-swift-version.md>
-[SE-0142]: <https://github.com/apple/swift-evolution/blob/master/proposals/0142-associated-types-constraints.md>
-[SE-0143]: <https://github.com/apple/swift-evolution/blob/master/proposals/0143-conditional-conformances.md>
-[SE-0144]: <https://github.com/apple/swift-evolution/blob/master/proposals/0144-allow-single-dollar-sign-as-valid-identifier.md>
-[SE-0145]: <https://github.com/apple/swift-evolution/blob/master/proposals/0145-package-manager-version-pinning.md>
-[SE-0146]: <https://github.com/apple/swift-evolution/blob/master/proposals/0146-package-manager-product-definitions.md>
-[SE-0147]: <https://github.com/apple/swift-evolution/blob/master/proposals/0147-move-unsafe-initialize-from.md>
-[SE-0148]: <https://github.com/apple/swift-evolution/blob/master/proposals/0148-generic-subscripts.md>
-[SE-0149]: <https://github.com/apple/swift-evolution/blob/master/proposals/0149-package-manager-top-of-tree.md>
-[SE-0150]: <https://github.com/apple/swift-evolution/blob/master/proposals/0150-package-manager-branch-support.md>
-[SE-0151]: <https://github.com/apple/swift-evolution/blob/master/proposals/0151-package-manager-swift-language-compatibility-version.md>
-[SE-0152]: <https://github.com/apple/swift-evolution/blob/master/proposals/0152-package-manager-tools-version.md>
-[SE-0153]: <https://github.com/apple/swift-evolution/blob/master/proposals/0153-compensate-for-the-inconsistency-of-nscopyings-behaviour.md>
-[SE-0154]: <https://github.com/apple/swift-evolution/blob/master/proposals/0154-dictionary-key-and-value-collections.md>
-[SE-0155]: <https://github.com/apple/swift-evolution/blob/master/proposals/0155-normalize-enum-case-representation.md>
-[SE-0156]: <https://github.com/apple/swift-evolution/blob/master/proposals/0156-subclass-existentials.md>
-[SE-0157]: <https://github.com/apple/swift-evolution/blob/master/proposals/0157-recursive-protocol-constraints.md>
-[SE-0158]: <https://github.com/apple/swift-evolution/blob/master/proposals/0158-package-manager-manifest-api-redesign.md>
-[SE-0159]: <https://github.com/apple/swift-evolution/blob/master/proposals/0159-fix-private-access-levels.md>
-[SE-0160]: <https://github.com/apple/swift-evolution/blob/master/proposals/0160-objc-inference.md>
-[SE-0161]: <https://github.com/apple/swift-evolution/blob/master/proposals/0161-key-paths.md>
-[SE-0162]: <https://github.com/apple/swift-evolution/blob/master/proposals/0162-package-manager-custom-target-layouts.md>
-[SE-0163]: <https://github.com/apple/swift-evolution/blob/master/proposals/0163-string-revision-1.md>
-[SE-0164]: <https://github.com/apple/swift-evolution/blob/master/proposals/0164-remove-final-support-in-protocol-extensions.md>
-[SE-0165]: <https://github.com/apple/swift-evolution/blob/master/proposals/0165-dict.md>
-[SE-0166]: <https://github.com/apple/swift-evolution/blob/master/proposals/0166-swift-archival-serialization.md>
-[SE-0167]: <https://github.com/apple/swift-evolution/blob/master/proposals/0167-swift-encoders.md>
-[SE-0168]: <https://github.com/apple/swift-evolution/blob/master/proposals/0168-multi-line-string-literals.md>
-[SE-0169]: <https://github.com/apple/swift-evolution/blob/master/proposals/0169-improve-interaction-between-private-declarations-and-extensions.md>
-[SE-0170]: <https://github.com/apple/swift-evolution/blob/master/proposals/0170-nsnumber_bridge.md>
-[SE-0171]: <https://github.com/apple/swift-evolution/blob/master/proposals/0171-reduce-with-inout.md>
-[SE-0172]: <https://github.com/apple/swift-evolution/blob/master/proposals/0172-one-sided-ranges.md>
-[SE-0173]: <https://github.com/apple/swift-evolution/blob/master/proposals/0173-swap-indices.md>
-[SE-0174]: <https://github.com/apple/swift-evolution/blob/master/proposals/0174-filter-range-replaceable.md>
-[SE-0175]: <https://github.com/apple/swift-evolution/blob/master/proposals/0175-package-manager-revised-dependency-resolution.md>
-[SE-0176]: <https://github.com/apple/swift-evolution/blob/master/proposals/0176-enforce-exclusive-access-to-memory.md>
-[SE-0177]: <https://github.com/apple/swift-evolution/blob/master/proposals/0177-add-clamped-to-method.md>
-[SE-0178]: <https://github.com/apple/swift-evolution/blob/master/proposals/0178-character-unicode-view.md>
-[SE-0179]: <https://github.com/apple/swift-evolution/blob/master/proposals/0179-swift-run-command.md>
-[SE-0180]: <https://github.com/apple/swift-evolution/blob/master/proposals/0180-string-index-overhaul.md>
-[SE-0181]: <https://github.com/apple/swift-evolution/blob/master/proposals/0181-package-manager-cpp-language-version.md>
-[SE-0182]: <https://github.com/apple/swift-evolution/blob/master/proposals/0182-newline-escape-in-strings.md>
-[SE-0183]: <https://github.com/apple/swift-evolution/blob/master/proposals/0183-substring-affordances.md>
-[SE-0184]: <https://github.com/apple/swift-evolution/blob/master/proposals/0184-unsafe-pointers-add-missing.md>
-[SE-0185]: <https://github.com/apple/swift-evolution/blob/master/proposals/0185-synthesize-equatable-hashable.md>
-[SE-0186]: <https://github.com/apple/swift-evolution/blob/master/proposals/0186-remove-ownership-keyword-support-in-protocols.md>
-[SE-0187]: <https://github.com/apple/swift-evolution/blob/master/proposals/0187-introduce-filtermap.md>
-[SE-0188]: <https://github.com/apple/swift-evolution/blob/master/proposals/0188-stdlib-index-types-hashable.md>
-[SE-0189]: <https://github.com/apple/swift-evolution/blob/master/proposals/0189-restrict-cross-module-struct-initializers.md>
-[SE-0190]: <https://github.com/apple/swift-evolution/blob/master/proposals/0190-target-environment-platform-condition.md>
-[SE-0191]: <https://github.com/apple/swift-evolution/blob/master/proposals/0191-eliminate-indexdistance.md>
-[SE-0192]: <https://github.com/apple/swift-evolution/blob/master/proposals/0192-non-exhaustive-enums.md>
-[SE-0193]: <https://github.com/apple/swift-evolution/blob/master/proposals/0193-cross-module-inlining-and-specialization.md>
-[SE-0194]: <https://github.com/apple/swift-evolution/blob/master/proposals/0194-derived-collection-of-enum-cases.md>
-[SE-0195]: <https://github.com/apple/swift-evolution/blob/master/proposals/0195-dynamic-member-lookup.md>
-[SE-0196]: <https://github.com/apple/swift-evolution/blob/master/proposals/0196-diagnostic-directives.md>
-[SE-0197]: <https://github.com/apple/swift-evolution/blob/master/proposals/0197-remove-where.md>
-[SE-0198]: <https://github.com/apple/swift-evolution/blob/master/proposals/0198-playground-quicklook-api-revamp.md>
-[SE-0199]: <https://github.com/apple/swift-evolution/blob/master/proposals/0199-bool-toggle.md>
-[SE-0200]: <https://github.com/apple/swift-evolution/blob/master/proposals/0200-raw-string-escaping.md>
-[SE-0201]: <https://github.com/apple/swift-evolution/blob/master/proposals/0201-package-manager-local-dependencies.md>
-[SE-0202]: <https://github.com/apple/swift-evolution/blob/master/proposals/0202-random-unification.md>
-[SE-0203]: <https://github.com/apple/swift-evolution/blob/master/proposals/0203-rename-sequence-elements-equal.md>
-[SE-0204]: <https://github.com/apple/swift-evolution/blob/master/proposals/0204-add-last-methods.md>
-[SE-0205]: <https://github.com/apple/swift-evolution/blob/master/proposals/0205-withUnsafePointer-for-lets.md>
-[SE-0206]: <https://github.com/apple/swift-evolution/blob/master/proposals/0206-hashable-enhancements.md>
-[SE-0207]: <https://github.com/apple/swift-evolution/blob/master/proposals/0207-containsOnly.md>
-[SE-0208]: <https://github.com/apple/swift-evolution/blob/master/proposals/0208-package-manager-system-library-targets.md>
-[SE-0209]: <https://github.com/apple/swift-evolution/blob/master/proposals/0209-package-manager-swift-lang-version-update.md>
-[SE-0210]: <https://github.com/apple/swift-evolution/blob/master/proposals/0210-key-path-offset.md>
-[SE-0211]: <https://github.com/apple/swift-evolution/blob/master/proposals/0211-unicode-scalar-properties.md>
-[SE-0212]: <https://github.com/apple/swift-evolution/blob/master/proposals/0212-compiler-version-directive.md>
-[SE-0213]: <https://github.com/apple/swift-evolution/blob/master/proposals/0213-literal-init-via-coercion.md>
-[SE-0214]: <https://github.com/apple/swift-evolution/blob/master/proposals/0214-DictionaryLiteral.md>
-[SE-0215]: <https://github.com/apple/swift-evolution/blob/master/proposals/0215-conform-never-to-hashable-and-equatable.md>
-[SE-0216]: <https://github.com/apple/swift-evolution/blob/master/proposals/0216-dynamic-callable.md>
-[SE-0217]: <https://github.com/apple/swift-evolution/blob/master/proposals/0217-bangbang.md>
-[SE-0218]: <https://github.com/apple/swift-evolution/blob/master/proposals/0218-introduce-compact-map-values.md>
-[SE-0219]: <https://github.com/apple/swift-evolution/blob/master/proposals/0219-package-manager-dependency-mirroring.md>
-[SE-0220]: <https://github.com/apple/swift-evolution/blob/master/proposals/0220-count-where.md>
-[SE-0221]: <https://github.com/apple/swift-evolution/blob/master/proposals/0221-character-properties.md>
-[SE-0222]: <https://github.com/apple/swift-evolution/blob/master/proposals/0222-lazy-compactmap-sequence.md>
-[SE-0223]: <https://github.com/apple/swift-evolution/blob/master/proposals/0223-array-uninitialized-initializer.md>
-[SE-0224]: <https://github.com/apple/swift-evolution/blob/master/proposals/0224-ifswift-lessthan-operator.md>
-[SE-0225]: <https://github.com/apple/swift-evolution/blob/master/proposals/0225-binaryinteger-iseven-isodd-ismultiple.md>
-[SE-0226]: <https://github.com/apple/swift-evolution/blob/master/proposals/0226-package-manager-target-based-dep-resolution.md>
+[SE-0001]: <https://github.com/apple/swift-evolution/blob/main/proposals/0001-keywords-as-argument-labels.md>
+[SE-0002]: <https://github.com/apple/swift-evolution/blob/main/proposals/0002-remove-currying.md>
+[SE-0003]: <https://github.com/apple/swift-evolution/blob/main/proposals/0003-remove-var-parameters.md>
+[SE-0004]: <https://github.com/apple/swift-evolution/blob/main/proposals/0004-remove-pre-post-inc-decrement.md>
+[SE-0005]: <https://github.com/apple/swift-evolution/blob/main/proposals/0005-objective-c-name-translation.md>
+[SE-0006]: <https://github.com/apple/swift-evolution/blob/main/proposals/0006-apply-api-guidelines-to-the-standard-library.md>
+[SE-0007]: <https://github.com/apple/swift-evolution/blob/main/proposals/0007-remove-c-style-for-loops.md>
+[SE-0008]: <https://github.com/apple/swift-evolution/blob/main/proposals/0008-lazy-flatmap-for-optionals.md>
+[SE-0009]: <https://github.com/apple/swift-evolution/blob/main/proposals/0009-require-self-for-accessing-instance-members.md>
+[SE-0010]: <https://github.com/apple/swift-evolution/blob/main/proposals/0010-add-staticstring-unicodescalarview.md>
+[SE-0011]: <https://github.com/apple/swift-evolution/blob/main/proposals/0011-replace-typealias-associated.md>
+[SE-0012]: <https://github.com/apple/swift-evolution/blob/main/proposals/0012-add-noescape-to-public-library-api.md>
+[SE-0013]: <https://github.com/apple/swift-evolution/blob/main/proposals/0013-remove-partial-application-super.md>
+[SE-0014]: <https://github.com/apple/swift-evolution/blob/main/proposals/0014-constrained-AnySequence.md>
+[SE-0015]: <https://github.com/apple/swift-evolution/blob/main/proposals/0015-tuple-comparison-operators.md>
+[SE-0016]: <https://github.com/apple/swift-evolution/blob/main/proposals/0016-initializers-for-converting-unsafe-pointers-to-ints.md>
+[SE-0017]: <https://github.com/apple/swift-evolution/blob/main/proposals/0017-convert-unmanaged-to-use-unsafepointer.md>
+[SE-0018]: <https://github.com/apple/swift-evolution/blob/main/proposals/0018-flexible-memberwise-initialization.md>
+[SE-0019]: <https://github.com/apple/swift-evolution/blob/main/proposals/0019-package-manager-testing.md>
+[SE-0020]: <https://github.com/apple/swift-evolution/blob/main/proposals/0020-if-swift-version.md>
+[SE-0021]: <https://github.com/apple/swift-evolution/blob/main/proposals/0021-generalized-naming.md>
+[SE-0022]: <https://github.com/apple/swift-evolution/blob/main/proposals/0022-objc-selectors.md>
+[SE-0023]: <https://github.com/apple/swift-evolution/blob/main/proposals/0023-api-guidelines.md>
+[SE-0024]: <https://github.com/apple/swift-evolution/blob/main/proposals/0024-optional-value-setter.md>
+[SE-0025]: <https://github.com/apple/swift-evolution/blob/main/proposals/0025-scoped-access-level.md>
+[SE-0026]: <https://github.com/apple/swift-evolution/blob/main/proposals/0026-abstract-classes-and-methods.md>
+[SE-0027]: <https://github.com/apple/swift-evolution/blob/main/proposals/0027-string-from-code-units.md>
+[SE-0028]: <https://github.com/apple/swift-evolution/blob/main/proposals/0028-modernizing-debug-identifiers.md>
+[SE-0029]: <https://github.com/apple/swift-evolution/blob/main/proposals/0029-remove-implicit-tuple-splat.md>
+[SE-0030]: <https://github.com/apple/swift-evolution/blob/main/proposals/0030-property-behavior-decls.md>
+[SE-0031]: <https://github.com/apple/swift-evolution/blob/main/proposals/0031-adjusting-inout-declarations.md>
+[SE-0032]: <https://github.com/apple/swift-evolution/blob/main/proposals/0032-sequencetype-find.md>
+[SE-0033]: <https://github.com/apple/swift-evolution/blob/main/proposals/0033-import-objc-constants.md>
+[SE-0034]: <https://github.com/apple/swift-evolution/blob/main/proposals/0034-disambiguating-line.md>
+[SE-0035]: <https://github.com/apple/swift-evolution/blob/main/proposals/0035-limit-inout-capture.md>
+[SE-0036]: <https://github.com/apple/swift-evolution/blob/main/proposals/0036-enum-dot.md>
+[SE-0037]: <https://github.com/apple/swift-evolution/blob/main/proposals/0037-clarify-comments-and-operators.md>
+[SE-0038]: <https://github.com/apple/swift-evolution/blob/main/proposals/0038-swiftpm-c-language-targets.md>
+[SE-0039]: <https://github.com/apple/swift-evolution/blob/main/proposals/0039-playgroundliterals.md>
+[SE-0040]: <https://github.com/apple/swift-evolution/blob/main/proposals/0040-attributecolons.md>
+[SE-0041]: <https://github.com/apple/swift-evolution/blob/main/proposals/0041-conversion-protocol-conventions.md>
+[SE-0042]: <https://github.com/apple/swift-evolution/blob/main/proposals/0042-flatten-method-types.md>
+[SE-0043]: <https://github.com/apple/swift-evolution/blob/main/proposals/0043-declare-variables-in-case-labels-with-multiple-patterns.md>
+[SE-0044]: <https://github.com/apple/swift-evolution/blob/main/proposals/0044-import-as-member.md>
+[SE-0045]: <https://github.com/apple/swift-evolution/blob/main/proposals/0045-scan-takewhile-dropwhile.md>
+[SE-0046]: <https://github.com/apple/swift-evolution/blob/main/proposals/0046-first-label.md>
+[SE-0047]: <https://github.com/apple/swift-evolution/blob/main/proposals/0047-nonvoid-warn.md>
+[SE-0048]: <https://github.com/apple/swift-evolution/blob/main/proposals/0048-generic-typealias.md>
+[SE-0049]: <https://github.com/apple/swift-evolution/blob/main/proposals/0049-noescape-autoclosure-type-attrs.md>
+[SE-0050]: <https://github.com/apple/swift-evolution/blob/main/proposals/0050-floating-point-stride.md>
+[SE-0051]: <https://github.com/apple/swift-evolution/blob/main/proposals/0051-stride-semantics.md>
+[SE-0052]: <https://github.com/apple/swift-evolution/blob/main/proposals/0052-iterator-post-nil-guarantee.md>
+[SE-0053]: <https://github.com/apple/swift-evolution/blob/main/proposals/0053-remove-let-from-function-parameters.md>
+[SE-0054]: <https://github.com/apple/swift-evolution/blob/main/proposals/0054-abolish-iuo.md>
+[SE-0055]: <https://github.com/apple/swift-evolution/blob/main/proposals/0055-optional-unsafe-pointers.md>
+[SE-0056]: <https://github.com/apple/swift-evolution/blob/main/proposals/0056-trailing-closures-in-guard.md>
+[SE-0057]: <https://github.com/apple/swift-evolution/blob/main/proposals/0057-importing-objc-generics.md>
+[SE-0058]: <https://github.com/apple/swift-evolution/blob/main/proposals/0058-objectivecbridgeable.md>
+[SE-0059]: <https://github.com/apple/swift-evolution/blob/main/proposals/0059-updated-set-apis.md>
+[SE-0060]: <https://github.com/apple/swift-evolution/blob/main/proposals/0060-defaulted-parameter-order.md>
+[SE-0061]: <https://github.com/apple/swift-evolution/blob/main/proposals/0061-autoreleasepool-signature.md>
+[SE-0062]: <https://github.com/apple/swift-evolution/blob/main/proposals/0062-objc-keypaths.md>
+[SE-0063]: <https://github.com/apple/swift-evolution/blob/main/proposals/0063-swiftpm-system-module-search-paths.md>
+[SE-0064]: <https://github.com/apple/swift-evolution/blob/main/proposals/0064-property-selectors.md>
+[SE-0065]: <https://github.com/apple/swift-evolution/blob/main/proposals/0065-collections-move-indices.md>
+[SE-0066]: <https://github.com/apple/swift-evolution/blob/main/proposals/0066-standardize-function-type-syntax.md>
+[SE-0067]: <https://github.com/apple/swift-evolution/blob/main/proposals/0067-floating-point-protocols.md>
+[SE-0068]: <https://github.com/apple/swift-evolution/blob/main/proposals/0068-universal-self.md>
+[SE-0069]: <https://github.com/apple/swift-evolution/blob/main/proposals/0069-swift-mutability-for-foundation.md>
+[SE-0070]: <https://github.com/apple/swift-evolution/blob/main/proposals/0070-optional-requirements.md>
+[SE-0071]: <https://github.com/apple/swift-evolution/blob/main/proposals/0071-member-keywords.md>
+[SE-0072]: <https://github.com/apple/swift-evolution/blob/main/proposals/0072-eliminate-implicit-bridging-conversions.md>
+[SE-0073]: <https://github.com/apple/swift-evolution/blob/main/proposals/0073-noescape-once.md>
+[SE-0074]: <https://github.com/apple/swift-evolution/blob/main/proposals/0074-binary-search.md>
+[SE-0075]: <https://github.com/apple/swift-evolution/blob/main/proposals/0075-import-test.md>
+[SE-0076]: <https://github.com/apple/swift-evolution/blob/main/proposals/0076-copying-to-unsafe-mutable-pointer-with-unsafe-pointer-source.md>
+[SE-0077]: <https://github.com/apple/swift-evolution/blob/main/proposals/0077-operator-precedence.md>
+[SE-0078]: <https://github.com/apple/swift-evolution/blob/main/proposals/0078-rotate-algorithm.md>
+[SE-0079]: <https://github.com/apple/swift-evolution/blob/main/proposals/0079-upgrade-self-from-weak-to-strong.md>
+[SE-0080]: <https://github.com/apple/swift-evolution/blob/main/proposals/0080-failable-numeric-initializers.md>
+[SE-0081]: <https://github.com/apple/swift-evolution/blob/main/proposals/0081-move-where-expression.md>
+[SE-0082]: <https://github.com/apple/swift-evolution/blob/main/proposals/0082-swiftpm-package-edit.md>
+[SE-0083]: <https://github.com/apple/swift-evolution/blob/main/proposals/0083-remove-bridging-from-dynamic-casts.md>
+[SE-0084]: <https://github.com/apple/swift-evolution/blob/main/proposals/0084-trailing-commas.md>
+[SE-0085]: <https://github.com/apple/swift-evolution/blob/main/proposals/0085-package-manager-command-name.md>
+[SE-0086]: <https://github.com/apple/swift-evolution/blob/main/proposals/0086-drop-foundation-ns.md>
+[SE-0087]: <https://github.com/apple/swift-evolution/blob/main/proposals/0087-lazy-attribute.md>
+[SE-0088]: <https://github.com/apple/swift-evolution/blob/main/proposals/0088-libdispatch-for-swift3.md>
+[SE-0089]: <https://github.com/apple/swift-evolution/blob/main/proposals/0089-rename-string-reflection-init.md>
+[SE-0090]: <https://github.com/apple/swift-evolution/blob/main/proposals/0090-remove-dot-self.md>
+[SE-0091]: <https://github.com/apple/swift-evolution/blob/main/proposals/0091-improving-operators-in-protocols.md>
+[SE-0092]: <https://github.com/apple/swift-evolution/blob/main/proposals/0092-typealiases-in-protocols.md>
+[SE-0093]: <https://github.com/apple/swift-evolution/blob/main/proposals/0093-slice-base.md>
+[SE-0094]: <https://github.com/apple/swift-evolution/blob/main/proposals/0094-sequence-function.md>
+[SE-0095]: <https://github.com/apple/swift-evolution/blob/main/proposals/0095-any-as-existential.md>
+[SE-0096]: <https://github.com/apple/swift-evolution/blob/main/proposals/0096-dynamictype.md>
+[SE-0097]: <https://github.com/apple/swift-evolution/blob/main/proposals/0097-negative-attributes.md>
+[SE-0098]: <https://github.com/apple/swift-evolution/blob/main/proposals/0098-didset-capitalization.md>
+[SE-0099]: <https://github.com/apple/swift-evolution/blob/main/proposals/0099-conditionclauses.md>
+[SE-0100]: <https://github.com/apple/swift-evolution/blob/main/proposals/0100-add-sequence-based-init-and-merge-to-dictionary.md>
+[SE-0101]: <https://github.com/apple/swift-evolution/blob/main/proposals/0101-standardizing-sizeof-naming.md>
+[SE-0102]: <https://github.com/apple/swift-evolution/blob/main/proposals/0102-noreturn-bottom-type.md>
+[SE-0103]: <https://github.com/apple/swift-evolution/blob/main/proposals/0103-make-noescape-default.md>
+[SE-0104]: <https://github.com/apple/swift-evolution/blob/main/proposals/0104-improved-integers.md>
+[SE-0105]: <https://github.com/apple/swift-evolution/blob/main/proposals/0105-remove-where-from-forin-loops.md>
+[SE-0106]: <https://github.com/apple/swift-evolution/blob/main/proposals/0106-rename-osx-to-macos.md>
+[SE-0107]: <https://github.com/apple/swift-evolution/blob/main/proposals/0107-unsaferawpointer.md>
+[SE-0108]: <https://github.com/apple/swift-evolution/blob/main/proposals/0108-remove-assoctype-inference.md>
+[SE-0109]: <https://github.com/apple/swift-evolution/blob/main/proposals/0109-remove-boolean.md>
+[SE-0110]: <https://github.com/apple/swift-evolution/blob/main/proposals/0110-distingish-single-tuple-arg.md>
+[SE-0111]: <https://github.com/apple/swift-evolution/blob/main/proposals/0111-remove-arg-label-type-significance.md>
+[SE-0112]: <https://github.com/apple/swift-evolution/blob/main/proposals/0112-nserror-bridging.md>
+[SE-0113]: <https://github.com/apple/swift-evolution/blob/main/proposals/0113-rounding-functions-on-floatingpoint.md>
+[SE-0114]: <https://github.com/apple/swift-evolution/blob/main/proposals/0114-buffer-naming.md>
+[SE-0115]: <https://github.com/apple/swift-evolution/blob/main/proposals/0115-literal-syntax-protocols.md>
+[SE-0116]: <https://github.com/apple/swift-evolution/blob/main/proposals/0116-id-as-any.md>
+[SE-0117]: <https://github.com/apple/swift-evolution/blob/main/proposals/0117-non-public-subclassable-by-default.md>
+[SE-0118]: <https://github.com/apple/swift-evolution/blob/main/proposals/0118-closure-parameter-names-and-labels.md>
+[SE-0119]: <https://github.com/apple/swift-evolution/blob/main/proposals/0119-extensions-access-modifiers.md>
+[SE-0120]: <https://github.com/apple/swift-evolution/blob/main/proposals/0120-revise-partition-method.md>
+[SE-0121]: <https://github.com/apple/swift-evolution/blob/main/proposals/0121-remove-optional-comparison-operators.md>
+[SE-0122]: <https://github.com/apple/swift-evolution/blob/main/proposals/0122-use-colons-for-subscript-type-declarations.md>
+[SE-0123]: <https://github.com/apple/swift-evolution/blob/main/proposals/0123-disallow-value-to-optional-coercion-in-operator-arguments.md>
+[SE-0124]: <https://github.com/apple/swift-evolution/blob/main/proposals/0124-bitpattern-label-for-int-initializer-objectidentfier.md>
+[SE-0125]: <https://github.com/apple/swift-evolution/blob/main/proposals/0125-remove-nonobjectivecbase.md>
+[SE-0126]: <https://github.com/apple/swift-evolution/blob/main/proposals/0126-refactor-metatypes-repurpose-t-dot-self-and-mirror.md>
+[SE-0127]: <https://github.com/apple/swift-evolution/blob/main/proposals/0127-cleaning-up-stdlib-ptr-buffer.md>
+[SE-0128]: <https://github.com/apple/swift-evolution/blob/main/proposals/0128-unicodescalar-failable-initializer.md>
+[SE-0129]: <https://github.com/apple/swift-evolution/blob/main/proposals/0129-package-manager-test-naming-conventions.md>
+[SE-0130]: <https://github.com/apple/swift-evolution/blob/main/proposals/0130-string-initializers-cleanup.md>
+[SE-0131]: <https://github.com/apple/swift-evolution/blob/main/proposals/0131-anyhashable.md>
+[SE-0132]: <https://github.com/apple/swift-evolution/blob/main/proposals/0132-sequence-end-ops.md>
+[SE-0133]: <https://github.com/apple/swift-evolution/blob/main/proposals/0133-rename-flatten-to-joined.md>
+[SE-0134]: <https://github.com/apple/swift-evolution/blob/main/proposals/0134-rename-string-properties.md>
+[SE-0135]: <https://github.com/apple/swift-evolution/blob/main/proposals/0135-package-manager-support-for-differentiating-packages-by-swift-version.md>
+[SE-0136]: <https://github.com/apple/swift-evolution/blob/main/proposals/0136-memory-layout-of-values.md>
+[SE-0137]: <https://github.com/apple/swift-evolution/blob/main/proposals/0137-avoiding-lock-in.md>
+[SE-0138]: <https://github.com/apple/swift-evolution/blob/main/proposals/0138-unsaferawbufferpointer.md>
+[SE-0139]: <https://github.com/apple/swift-evolution/blob/main/proposals/0139-bridge-nsnumber-and-nsvalue.md>
+[SE-0140]: <https://github.com/apple/swift-evolution/blob/main/proposals/0140-bridge-optional-to-nsnull.md>
+[SE-0141]: <https://github.com/apple/swift-evolution/blob/main/proposals/0141-available-by-swift-version.md>
+[SE-0142]: <https://github.com/apple/swift-evolution/blob/main/proposals/0142-associated-types-constraints.md>
+[SE-0143]: <https://github.com/apple/swift-evolution/blob/main/proposals/0143-conditional-conformances.md>
+[SE-0144]: <https://github.com/apple/swift-evolution/blob/main/proposals/0144-allow-single-dollar-sign-as-valid-identifier.md>
+[SE-0145]: <https://github.com/apple/swift-evolution/blob/main/proposals/0145-package-manager-version-pinning.md>
+[SE-0146]: <https://github.com/apple/swift-evolution/blob/main/proposals/0146-package-manager-product-definitions.md>
+[SE-0147]: <https://github.com/apple/swift-evolution/blob/main/proposals/0147-move-unsafe-initialize-from.md>
+[SE-0148]: <https://github.com/apple/swift-evolution/blob/main/proposals/0148-generic-subscripts.md>
+[SE-0149]: <https://github.com/apple/swift-evolution/blob/main/proposals/0149-package-manager-top-of-tree.md>
+[SE-0150]: <https://github.com/apple/swift-evolution/blob/main/proposals/0150-package-manager-branch-support.md>
+[SE-0151]: <https://github.com/apple/swift-evolution/blob/main/proposals/0151-package-manager-swift-language-compatibility-version.md>
+[SE-0152]: <https://github.com/apple/swift-evolution/blob/main/proposals/0152-package-manager-tools-version.md>
+[SE-0153]: <https://github.com/apple/swift-evolution/blob/main/proposals/0153-compensate-for-the-inconsistency-of-nscopyings-behaviour.md>
+[SE-0154]: <https://github.com/apple/swift-evolution/blob/main/proposals/0154-dictionary-key-and-value-collections.md>
+[SE-0155]: <https://github.com/apple/swift-evolution/blob/main/proposals/0155-normalize-enum-case-representation.md>
+[SE-0156]: <https://github.com/apple/swift-evolution/blob/main/proposals/0156-subclass-existentials.md>
+[SE-0157]: <https://github.com/apple/swift-evolution/blob/main/proposals/0157-recursive-protocol-constraints.md>
+[SE-0158]: <https://github.com/apple/swift-evolution/blob/main/proposals/0158-package-manager-manifest-api-redesign.md>
+[SE-0159]: <https://github.com/apple/swift-evolution/blob/main/proposals/0159-fix-private-access-levels.md>
+[SE-0160]: <https://github.com/apple/swift-evolution/blob/main/proposals/0160-objc-inference.md>
+[SE-0161]: <https://github.com/apple/swift-evolution/blob/main/proposals/0161-key-paths.md>
+[SE-0162]: <https://github.com/apple/swift-evolution/blob/main/proposals/0162-package-manager-custom-target-layouts.md>
+[SE-0163]: <https://github.com/apple/swift-evolution/blob/main/proposals/0163-string-revision-1.md>
+[SE-0164]: <https://github.com/apple/swift-evolution/blob/main/proposals/0164-remove-final-support-in-protocol-extensions.md>
+[SE-0165]: <https://github.com/apple/swift-evolution/blob/main/proposals/0165-dict.md>
+[SE-0166]: <https://github.com/apple/swift-evolution/blob/main/proposals/0166-swift-archival-serialization.md>
+[SE-0167]: <https://github.com/apple/swift-evolution/blob/main/proposals/0167-swift-encoders.md>
+[SE-0168]: <https://github.com/apple/swift-evolution/blob/main/proposals/0168-multi-line-string-literals.md>
+[SE-0169]: <https://github.com/apple/swift-evolution/blob/main/proposals/0169-improve-interaction-between-private-declarations-and-extensions.md>
+[SE-0170]: <https://github.com/apple/swift-evolution/blob/main/proposals/0170-nsnumber_bridge.md>
+[SE-0171]: <https://github.com/apple/swift-evolution/blob/main/proposals/0171-reduce-with-inout.md>
+[SE-0172]: <https://github.com/apple/swift-evolution/blob/main/proposals/0172-one-sided-ranges.md>
+[SE-0173]: <https://github.com/apple/swift-evolution/blob/main/proposals/0173-swap-indices.md>
+[SE-0174]: <https://github.com/apple/swift-evolution/blob/main/proposals/0174-filter-range-replaceable.md>
+[SE-0175]: <https://github.com/apple/swift-evolution/blob/main/proposals/0175-package-manager-revised-dependency-resolution.md>
+[SE-0176]: <https://github.com/apple/swift-evolution/blob/main/proposals/0176-enforce-exclusive-access-to-memory.md>
+[SE-0177]: <https://github.com/apple/swift-evolution/blob/main/proposals/0177-add-clamped-to-method.md>
+[SE-0178]: <https://github.com/apple/swift-evolution/blob/main/proposals/0178-character-unicode-view.md>
+[SE-0179]: <https://github.com/apple/swift-evolution/blob/main/proposals/0179-swift-run-command.md>
+[SE-0180]: <https://github.com/apple/swift-evolution/blob/main/proposals/0180-string-index-overhaul.md>
+[SE-0181]: <https://github.com/apple/swift-evolution/blob/main/proposals/0181-package-manager-cpp-language-version.md>
+[SE-0182]: <https://github.com/apple/swift-evolution/blob/main/proposals/0182-newline-escape-in-strings.md>
+[SE-0183]: <https://github.com/apple/swift-evolution/blob/main/proposals/0183-substring-affordances.md>
+[SE-0184]: <https://github.com/apple/swift-evolution/blob/main/proposals/0184-unsafe-pointers-add-missing.md>
+[SE-0185]: <https://github.com/apple/swift-evolution/blob/main/proposals/0185-synthesize-equatable-hashable.md>
+[SE-0186]: <https://github.com/apple/swift-evolution/blob/main/proposals/0186-remove-ownership-keyword-support-in-protocols.md>
+[SE-0187]: <https://github.com/apple/swift-evolution/blob/main/proposals/0187-introduce-filtermap.md>
+[SE-0188]: <https://github.com/apple/swift-evolution/blob/main/proposals/0188-stdlib-index-types-hashable.md>
+[SE-0189]: <https://github.com/apple/swift-evolution/blob/main/proposals/0189-restrict-cross-module-struct-initializers.md>
+[SE-0190]: <https://github.com/apple/swift-evolution/blob/main/proposals/0190-target-environment-platform-condition.md>
+[SE-0191]: <https://github.com/apple/swift-evolution/blob/main/proposals/0191-eliminate-indexdistance.md>
+[SE-0192]: <https://github.com/apple/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md>
+[SE-0193]: <https://github.com/apple/swift-evolution/blob/main/proposals/0193-cross-module-inlining-and-specialization.md>
+[SE-0194]: <https://github.com/apple/swift-evolution/blob/main/proposals/0194-derived-collection-of-enum-cases.md>
+[SE-0195]: <https://github.com/apple/swift-evolution/blob/main/proposals/0195-dynamic-member-lookup.md>
+[SE-0196]: <https://github.com/apple/swift-evolution/blob/main/proposals/0196-diagnostic-directives.md>
+[SE-0197]: <https://github.com/apple/swift-evolution/blob/main/proposals/0197-remove-where.md>
+[SE-0198]: <https://github.com/apple/swift-evolution/blob/main/proposals/0198-playground-quicklook-api-revamp.md>
+[SE-0199]: <https://github.com/apple/swift-evolution/blob/main/proposals/0199-bool-toggle.md>
+[SE-0200]: <https://github.com/apple/swift-evolution/blob/main/proposals/0200-raw-string-escaping.md>
+[SE-0201]: <https://github.com/apple/swift-evolution/blob/main/proposals/0201-package-manager-local-dependencies.md>
+[SE-0202]: <https://github.com/apple/swift-evolution/blob/main/proposals/0202-random-unification.md>
+[SE-0203]: <https://github.com/apple/swift-evolution/blob/main/proposals/0203-rename-sequence-elements-equal.md>
+[SE-0204]: <https://github.com/apple/swift-evolution/blob/main/proposals/0204-add-last-methods.md>
+[SE-0205]: <https://github.com/apple/swift-evolution/blob/main/proposals/0205-withUnsafePointer-for-lets.md>
+[SE-0206]: <https://github.com/apple/swift-evolution/blob/main/proposals/0206-hashable-enhancements.md>
+[SE-0207]: <https://github.com/apple/swift-evolution/blob/main/proposals/0207-containsOnly.md>
+[SE-0208]: <https://github.com/apple/swift-evolution/blob/main/proposals/0208-package-manager-system-library-targets.md>
+[SE-0209]: <https://github.com/apple/swift-evolution/blob/main/proposals/0209-package-manager-swift-lang-version-update.md>
+[SE-0210]: <https://github.com/apple/swift-evolution/blob/main/proposals/0210-key-path-offset.md>
+[SE-0211]: <https://github.com/apple/swift-evolution/blob/main/proposals/0211-unicode-scalar-properties.md>
+[SE-0212]: <https://github.com/apple/swift-evolution/blob/main/proposals/0212-compiler-version-directive.md>
+[SE-0213]: <https://github.com/apple/swift-evolution/blob/main/proposals/0213-literal-init-via-coercion.md>
+[SE-0214]: <https://github.com/apple/swift-evolution/blob/main/proposals/0214-DictionaryLiteral.md>
+[SE-0215]: <https://github.com/apple/swift-evolution/blob/main/proposals/0215-conform-never-to-hashable-and-equatable.md>
+[SE-0216]: <https://github.com/apple/swift-evolution/blob/main/proposals/0216-dynamic-callable.md>
+[SE-0217]: <https://github.com/apple/swift-evolution/blob/main/proposals/0217-bangbang.md>
+[SE-0218]: <https://github.com/apple/swift-evolution/blob/main/proposals/0218-introduce-compact-map-values.md>
+[SE-0219]: <https://github.com/apple/swift-evolution/blob/main/proposals/0219-package-manager-dependency-mirroring.md>
+[SE-0220]: <https://github.com/apple/swift-evolution/blob/main/proposals/0220-count-where.md>
+[SE-0221]: <https://github.com/apple/swift-evolution/blob/main/proposals/0221-character-properties.md>
+[SE-0222]: <https://github.com/apple/swift-evolution/blob/main/proposals/0222-lazy-compactmap-sequence.md>
+[SE-0223]: <https://github.com/apple/swift-evolution/blob/main/proposals/0223-array-uninitialized-initializer.md>
+[SE-0224]: <https://github.com/apple/swift-evolution/blob/main/proposals/0224-ifswift-lessthan-operator.md>
+[SE-0225]: <https://github.com/apple/swift-evolution/blob/main/proposals/0225-binaryinteger-iseven-isodd-ismultiple.md>
+[SE-0226]: <https://github.com/apple/swift-evolution/blob/main/proposals/0226-package-manager-target-based-dep-resolution.md>
+[SE-0227]: <https://github.com/apple/swift-evolution/blob/main/proposals/0227-identity-keypath.md>
+[SE-0228]: <https://github.com/apple/swift-evolution/blob/main/proposals/0228-fix-expressiblebystringinterpolation.md>
+[SE-0230]: <https://github.com/apple/swift-evolution/blob/main/proposals/0230-flatten-optional-try.md>
+[SE-0235]: <https://github.com/apple/swift-evolution/blob/main/proposals/0235-add-result.md>
+[SE-0242]: <https://github.com/apple/swift-evolution/blob/main/proposals/0242-default-values-memberwise.md>
+[SE-0244]: <https://github.com/apple/swift-evolution/blob/main/proposals/0244-opaque-result-types.md>
+[SE-0245]: <https://github.com/apple/swift-evolution/blob/main/proposals/0245-array-uninitialized-initializer.md>
+[SE-0249]: <https://github.com/apple/swift-evolution/blob/main/proposals/0249-key-path-literal-function-expressions.md>
+[SE-0252]: <https://github.com/apple/swift-evolution/blob/main/proposals/0252-keypath-dynamic-member-lookup.md>
+[SE-0253]: <https://github.com/apple/swift-evolution/blob/main/proposals/0253-callable.md>
+[SE-0254]: <https://github.com/apple/swift-evolution/blob/main/proposals/0254-static-subscripts.md>
+[SE-0266]: <https://github.com/apple/swift-evolution/blob/main/proposals/0266-synthesized-comparable-for-enumerations.md>
+[SE-0267]: <https://github.com/apple/swift-evolution/blob/main/proposals/0267-where-on-contextually-generic.md>
+[SE-0268]: <https://github.com/apple/swift-evolution/blob/main/proposals/0268-didset-semantics.md>
+[SE-0269]: <https://github.com/apple/swift-evolution/blob/main/proposals/0269-implicit-self-explicit-capture.md>
+[SE-0276]: <https://github.com/apple/swift-evolution/blob/main/proposals/0276-multi-pattern-catch-clauses.md>
+[SE-0279]: <https://github.com/apple/swift-evolution/blob/main/proposals/0279-multiple-trailing-closures.md>
+[SE-0280]: <https://github.com/apple/swift-evolution/blob/main/proposals/0280-enum-cases-as-protocol-witnesses.md>
+[SE-0284]: <https://github.com/apple/swift-evolution/blob/main/proposals/0284-multiple-variadic-parameters.md>
+[SE-0286]: <https://github.com/apple/swift-evolution/blob/main/proposals/0286-forward-scan-trailing-closures.md>
+[SE-0287]: <https://github.com/apple/swift-evolution/blob/main/proposals/0287-implicit-member-chains.md>
+[SE-0293]: <https://github.com/apple/swift-evolution/blob/main/proposals/0293-extend-property-wrappers-to-function-and-closure-parameters.md>
+[SE-0296]: <https://github.com/apple/swift-evolution/blob/main/proposals/0296-async-await.md>
+[SE-0297]: <https://github.com/apple/swift-evolution/blob/main/proposals/0297-concurrency-objc.md>
+[SE-0298]: <https://github.com/apple/swift-evolution/blob/main/proposals/0298-asyncsequence.md>
+[SE-0299]: <https://github.com/apple/swift-evolution/blob/main/proposals/0299-extend-generic-static-member-lookup.md>
+[SE-0300]: <https://github.com/apple/swift-evolution/blob/main/proposals/0300-continuation.md>
+[SE-0306]: <https://github.com/apple/swift-evolution/blob/main/proposals/0306-actors.md>
+[SE-0310]: <https://github.com/apple/swift-evolution/blob/main/proposals/0310-effectful-readonly-properties.md>
+[SE-0313]: <https://github.com/apple/swift-evolution/blob/main/proposals/0313-actor-isolation-control.md>
 
+[SR-75]: <https://bugs.swift.org/browse/SR-75>
 [SR-106]: <https://bugs.swift.org/browse/SR-106>
 [SR-419]: <https://bugs.swift.org/browse/SR-419>
+[SR-631]: <https://bugs.swift.org/browse/SR-631>
+[SR-695]: <https://bugs.swift.org/browse/SR-695>
 [SR-1009]: <https://bugs.swift.org/browse/SR-1009>
 [SR-1446]: <https://bugs.swift.org/browse/SR-1446>
 [SR-1529]: <https://bugs.swift.org/browse/SR-1529>
 [SR-2131]: <https://bugs.swift.org/browse/SR-2131>
+[SR-2176]: <https://bugs.swift.org/browse/SR-2176>
+[SR-2189]: <https://bugs.swift.org/browse/SR-2189>
 [SR-2388]: <https://bugs.swift.org/browse/SR-2388>
 [SR-2394]: <https://bugs.swift.org/browse/SR-2394>
 [SR-2608]: <https://bugs.swift.org/browse/SR-2608>
+[SR-2672]: <https://bugs.swift.org/browse/SR-2672>
+[SR-2688]: <https://bugs.swift.org/browse/SR-2688>
+[SR-2790]: <https://bugs.swift.org/browse/SR-2790>
+[SR-4206]: <https://bugs.swift.org/browse/SR-4206>
 [SR-4248]: <https://bugs.swift.org/browse/SR-4248>
+[SR-5581]: <https://bugs.swift.org/browse/SR-5581>
+[SR-5719]: <https://bugs.swift.org/browse/SR-5719>
+[SR-6118]: <https://bugs.swift.org/browse/SR-6118>
+[SR-7083]: <https://bugs.swift.org/browse/SR-7083>
+[SR-7139]: <https://bugs.swift.org/browse/SR-7139>
 [SR-7251]: <https://bugs.swift.org/browse/SR-7251>
+[SR-7601]: <https://bugs.swift.org/browse/SR-7601>
+[SR-7799]: <https://bugs.swift.org/browse/SR-7799>
+[SR-8109]: <https://bugs.swift.org/browse/SR-8109>
+[SR-8546]: <https://bugs.swift.org/browse/SR-8546>
+[SR-8974]: <https://bugs.swift.org/browse/SR-8974>
+[SR-9043]: <https://bugs.swift.org/browse/SR-9043>
+[SR-9827]: <https://bugs.swift.org/browse/SR-9827>
+[SR-10069]: <https://bugs.swift.org/browse/SR-10069>
+[SR-11298]: <https://bugs.swift.org/browse/SR-11298>
+[SR-11429]: <https://bugs.swift.org/browse/SR-11429>
+[SR-11700]: <https://bugs.swift.org/browse/SR-11700>
+[SR-11841]: <https://bugs.swift.org/browse/SR-11841>

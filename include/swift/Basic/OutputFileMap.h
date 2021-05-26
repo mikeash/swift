@@ -17,7 +17,6 @@
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
@@ -46,8 +45,8 @@ public:
 
   /// Loads an OutputFileMap from the given \p Path into the receiver, if
   /// possible.
-  static llvm::Expected<OutputFileMap> loadFromPath(StringRef Path,
-                                                    StringRef workingDirectory);
+  static llvm::Expected<OutputFileMap>
+  loadFromPath(StringRef Path, StringRef workingDirector);
 
   static llvm::Expected<OutputFileMap>
   loadFromBuffer(StringRef Data, StringRef workingDirectory);
@@ -85,7 +84,7 @@ public:
   void write(llvm::raw_ostream &os, ArrayRef<StringRef> inputs) const;
 
 private:
-  /// \brief Parses the given \p Buffer and returns either an OutputFileMap or
+  /// Parses the given \p Buffer and returns either an OutputFileMap or
   /// error, taking ownership of \p Buffer in the process.
   static llvm::Expected<OutputFileMap>
   parse(std::unique_ptr<llvm::MemoryBuffer> Buffer, StringRef workingDirectory);

@@ -1,6 +1,9 @@
 // RUN: %target-swift-frontend -typecheck %s
 
-// REQUIRES: objc_interop
+// REQUIRES: libdispatch
+// UNSUPPORTED: OS=linux-gnu
+// UNSUPPORTED: OS=linux-android
+// UNSUPPORTED: OS=openbsd
 
 import Dispatch
 

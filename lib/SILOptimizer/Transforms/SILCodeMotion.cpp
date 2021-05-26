@@ -11,21 +11,21 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-codemotion"
-#include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/AST/Module.h"
 #include "swift/Basic/BlotMapVector.h"
+#include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SIL/SILVisitor.h"
-#include "swift/SIL/DebugUtils.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
+#include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
@@ -60,7 +60,8 @@ static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
   // argument to the refcount instruction.
   SILValue EnumVal = DefOfEnum ? DefOfEnum : I->getOperand(0);
 
-  SILType ArgType = EnumVal->getType().getEnumElementType(EnumDecl, Mod);
+  SILType ArgType = EnumVal->getType().getEnumElementType(
+      EnumDecl, Mod, TypeExpansionContext(Builder.getFunction()));
 
   auto *UEDI =
     Builder.createUncheckedEnumData(I->getLoc(), EnumVal, EnumDecl, ArgType);
@@ -69,7 +70,7 @@ static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
 
   // If our payload is trivial, we do not need to insert any retain or release
   // operations.
-  if (UEDITy.isTrivial(Mod))
+  if (UEDITy.isTrivial(*I->getFunction()))
     return;
 
   ++NumRefCountOpsSimplified;
@@ -130,8 +131,7 @@ public:
   BBEnumTagDataflowState(const BBEnumTagDataflowState &Other) = default;
   ~BBEnumTagDataflowState() = default;
 
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
-                            "only for use within the debugger");
+  SWIFT_DEBUG_DUMP;
 
   bool init(EnumCaseDataflowContext &Context, SILBasicBlock *NewBB);
 
@@ -861,7 +861,7 @@ bool BBEnumTagDataflowState::init(EnumCaseDataflowContext &NewContext,
 //                            Generic Sinking Code
 //===----------------------------------------------------------------------===//
 
-/// \brief Hoist release on a SILArgument to its predecessors.
+/// Hoist release on a SILArgument to its predecessors.
 static bool hoistSILArgumentReleaseInst(SILBasicBlock *BB) {
   // There is no block to hoist releases to.
   if (BB->pred_empty())
@@ -906,12 +906,12 @@ static bool hoistSILArgumentReleaseInst(SILBasicBlock *BB) {
 
 static const int SinkSearchWindow = 6;
 
-/// \brief Returns True if we can sink this instruction to another basic block.
+/// Returns True if we can sink this instruction to another basic block.
 static bool canSinkInstruction(SILInstruction *Inst) {
   return !Inst->hasUsesOfAnyResult() && !isa<TermInst>(Inst);
 }
 
-/// \brief Returns true if this instruction is a skip barrier, which means that
+/// Returns true if this instruction is a skip barrier, which means that
 /// we can't sink other instructions past it.
 static bool isSinkBarrier(SILInstruction *Inst) {
   if (isa<TermInst>(Inst))
@@ -938,7 +938,7 @@ enum OperandRelation {
   EqualAfterMove
 };
 
-/// \brief Find a root value for operand \p In. This function inspects a sil
+/// Find a root value for operand \p In. This function inspects a sil
 /// value and strips trivial conversions such as values that are passed
 /// as arguments to basic blocks with a single predecessor or type casts.
 /// This is a shallow one-step search and not a deep recursive search.
@@ -947,7 +947,7 @@ enum OperandRelation {
 /// the only possible incoming value.
 ///
 /// bb1:
-///  %3 = unchecked_enum_data %0 : $Optional<X>, #Optional.Some!enumelt.1
+///  %3 = unchecked_enum_data %0 : $Optional<X>, #Optional.Some!enumelt
 ///  checked_cast_br [exact] %3 : $X to $X, bb4, bb5 // id: %4
 ///
 /// bb4(%10 : $X):                                    // Preds: bb1
@@ -991,7 +991,7 @@ static SILValue findValueShallowRoot(const SILValue &In) {
   return In;
 }
 
-/// \brief Search for an instruction that is identical to \p Iden by scanning
+/// Search for an instruction that is identical to \p Iden by scanning
 /// \p BB starting at the end of the block, stopping on sink barriers.
 /// The \p opRelation must be consistent for all operand comparisons.
 SILInstruction *findIdenticalInBlock(SILBasicBlock *BB, SILInstruction *Iden,
@@ -1044,7 +1044,7 @@ SILInstruction *findIdenticalInBlock(SILBasicBlock *BB, SILInstruction *Iden,
     if (InstToSink == BB->begin())
       return nullptr;
 
-    SkipBudget--;
+    --SkipBudget;
     InstToSink = std::prev(InstToSink);
     LLVM_DEBUG(llvm::dbgs() << "Continuing scan. Next inst: " << *InstToSink);
   }
@@ -1230,7 +1230,7 @@ static bool sinkArgument(EnumCaseDataflowContext &Context, SILBasicBlock *BB, un
     Clones.push_back(SI);
   }
 
-  auto *Undef = SILUndef::get(FSI->getType(), BB->getModule());
+  auto *Undef = SILUndef::get(FSI->getType(), *BB->getParent());
 
   // Delete the debug info of the instruction that we are about to sink.
   deleteAllDebugUses(FSI);
@@ -1245,7 +1245,7 @@ static bool sinkArgument(EnumCaseDataflowContext &Context, SILBasicBlock *BB, un
     BB->getArgument(ArgNum)->replaceAllUsesWith(FSI);
 
     const auto &ArgType = FSI->getOperand(*DifferentOperandIndex)->getType();
-    BB->replacePhiArgument(ArgNum, ArgType, ValueOwnershipKind::Owned);
+    BB->replacePhiArgument(ArgNum, ArgType, OwnershipKind::Owned);
 
     // Update all branch instructions in the predecessors to pass the new
     // argument to this BB.
@@ -1261,7 +1261,7 @@ static bool sinkArgument(EnumCaseDataflowContext &Context, SILBasicBlock *BB, un
       TI->setOperand(ArgNum, CloneInst->getOperand(*DifferentOperandIndex));
       // Now delete the clone as we only needed it operand.
       if (CloneInst != FSI)
-        recursivelyDeleteTriviallyDeadInstructions(CloneInst);
+        eliminateDeadInstruction(CloneInst);
       ++CloneIt;
     }
     assert(CloneIt == Clones.end() && "Clone/pred mismatch");
@@ -1329,7 +1329,7 @@ static bool sinkArgumentsFromPredecessors(EnumCaseDataflowContext &Context,
   return Changed;
 }
 
-/// \brief canonicalize retain/release instructions and make them amenable to
+/// canonicalize retain/release instructions and make them amenable to
 /// sinking by selecting canonical pointers. We reduce the number of possible
 /// inputs by replacing values that are unlikely to be a canonical values.
 /// Reducing the search space increases the chances of matching ref count
@@ -1384,7 +1384,7 @@ static bool sinkCodeFromPredecessors(EnumCaseDataflowContext &Context,
   for (auto P : BB->getPredecessorBlocks()) {
     if (auto *BI = dyn_cast<BranchInst>(P->getTerminator())) {
       auto Args = BI->getArgs();
-      for (size_t idx = 0, size = Args.size(); idx < size; idx++) {
+      for (size_t idx = 0, size = Args.size(); idx < size; ++idx) {
         valueToArgIdxMap[{Args[idx], P}] = idx;
       }
     }
@@ -1431,7 +1431,7 @@ static bool sinkCodeFromPredecessors(EnumCaseDataflowContext &Context,
           // Replace operand values (which are passed to the successor block)
           // with corresponding block arguments.
           for (size_t idx = 0, numOps = InstToSink->getNumOperands();
-               idx < numOps; idx++) {
+               idx < numOps; ++idx) {
             ValueInBlock OpInFirstPred(InstToSink->getOperand(idx), FirstPred);
             assert(valueToArgIdxMap.count(OpInFirstPred) != 0);
             int argIdx = valueToArgIdxMap[OpInFirstPred];
@@ -1445,7 +1445,7 @@ static bool sinkCodeFromPredecessors(EnumCaseDataflowContext &Context,
             Context.blotValue(Result);
           }
           I->eraseFromParent();
-          NumSunk++;
+          ++NumSunk;
         }
 
         // Restart the scan.
@@ -1468,7 +1468,7 @@ static bool sinkCodeFromPredecessors(EnumCaseDataflowContext &Context,
       return Changed;
     }
 
-    SkipBudget--;
+    --SkipBudget;
     InstToSink = std::prev(InstToSink);
     LLVM_DEBUG(llvm::dbgs() << "Continuing scan. Next inst: " << *InstToSink);
   }
@@ -1530,7 +1530,7 @@ static bool tryToSinkRefCountAcrossSwitch(SwitchEnumInst *Switch,
   }
 
   RV->eraseFromParent();
-  NumSunk++;
+  ++NumSunk;
   return true;
 }
 
@@ -1616,7 +1616,7 @@ static bool tryToSinkRefCountAcrossSelectEnum(CondBranchInst *CondBr,
   }
 
   I->eraseFromParent();
-  NumSunk++;
+  ++NumSunk;
   return true;
 }
 
@@ -1774,6 +1774,10 @@ public:
   /// The entry point to the transformation.
   void run() override {
     auto *F = getFunction();
+    // Skip functions with ownership for now.
+    if (F->hasOwnership())
+      return;
+
     auto *AA = getAnalysis<AliasAnalysis>();
     auto *PO = getAnalysis<PostOrderAnalysis>()->get(F);
     auto *RCIA = getAnalysis<RCIdentityAnalysis>()->get(getFunction());

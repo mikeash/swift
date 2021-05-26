@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 /// A collection of indices for an arbitrary collection
-@_fixed_layout
+@frozen
 public struct DefaultIndices<Elements: Collection> {
   @usableFromInline
   internal var _elements: Elements
@@ -81,6 +81,23 @@ extension DefaultIndices: Collection {
   public var indices: Indices {
     return self
   }
+  
+  @_alwaysEmitIntoClient
+  public func index(_ i: Index, offsetBy distance: Int) -> Index {
+    return _elements.index(i, offsetBy: distance)
+  }
+
+  @_alwaysEmitIntoClient
+  public func index(
+    _ i: Index, offsetBy distance: Int, limitedBy limit: Index
+  ) -> Index? {
+    return _elements.index(i, offsetBy: distance, limitedBy: limit)
+  }
+
+  @_alwaysEmitIntoClient
+  public func distance(from start: Index, to end: Index) -> Int {
+    return _elements.distance(from: start, to: end)
+  }
 }
 
 extension DefaultIndices: BidirectionalCollection
@@ -127,3 +144,6 @@ extension Collection where Indices == DefaultIndices<Self> {
       endIndex: self.endIndex)
   }
 }
+
+extension DefaultIndices: Sendable
+  where Elements: Sendable, Elements.Index: Sendable { }

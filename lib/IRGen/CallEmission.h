@@ -30,13 +30,19 @@ namespace irgen {
 class Explosion;
 class LoadableTypeInfo;
 struct WitnessMetadata;
+class FunctionPointer;
 
 /// A plan for emitting a series of calls.
 class CallEmission {
+  enum class State { Emitting, Finished };
+  State state = State::Emitting;
+
 public:
   IRGenFunction &IGF;
 
-private:
+protected:
+  llvm::Value *selfValue;
+
   /// The builtin/special arguments to pass to the call.
   SmallVector<llvm::Value*, 8> Args;
 
@@ -57,21 +63,25 @@ private:
   /// RemainingArgsForCallee, at least between calls.
   bool EmittedCall;
 
-  void setFromCallee();
+  virtual void setFromCallee();
   void emitToUnmappedMemory(Address addr);
   void emitToUnmappedExplosion(Explosion &out);
+  virtual void emitCallToUnmappedExplosion(llvm::CallInst *call, Explosion &out) = 0;
   void emitYieldsToExplosion(Explosion &out);
-  llvm::CallSite emitCallSite();
+  virtual FunctionPointer getCalleeFunctionPointer() = 0;
+  llvm::CallInst *emitCallSite();
+
+  virtual llvm::CallInst *createCall(const FunctionPointer &fn,
+                                     ArrayRef<llvm::Value *> args) = 0;
+
+  CallEmission(IRGenFunction &IGF, llvm::Value *selfValue, Callee &&callee)
+      : IGF(IGF), selfValue(selfValue), CurCallee(std::move(callee)) {}
 
 public:
-  CallEmission(IRGenFunction &IGF, Callee &&callee)
-      : IGF(IGF), CurCallee(std::move(callee)) {
-    setFromCallee();
-  }
   CallEmission(const CallEmission &other) = delete;
   CallEmission(CallEmission &&other);
   CallEmission &operator=(const CallEmission &other) = delete;
-  ~CallEmission();
+  virtual ~CallEmission();
 
   const Callee &getCallee() const { return CurCallee; }
 
@@ -79,15 +89,26 @@ public:
     return CurCallee.getSubstitutions();
   }
 
+  virtual void begin();
+  virtual void end();
+  virtual SILType getParameterType(unsigned index) = 0;
   /// Set the arguments to the function from an explosion.
-  void setArgs(Explosion &arg, bool isOutlined,
-               WitnessMetadata *witnessMetadata = nullptr);
+  virtual void setArgs(Explosion &arg, bool isOutlined,
+                       WitnessMetadata *witnessMetadata);
+  virtual Address getCalleeErrorSlot(SILType errorType, bool isCalleeAsync) = 0;
 
   void addAttribute(unsigned Index, llvm::Attribute::AttrKind Attr);
 
   void emitToMemory(Address addr, const LoadableTypeInfo &substResultTI,
                     bool isOutlined);
   void emitToExplosion(Explosion &out, bool isOutlined);
+
+  llvm::CallInst *emitCoroutineAsOrdinaryFunction() {
+    assert(IsCoroutine);
+    IsCoroutine = false;
+
+    return emitCallSite();
+  }
 
   TemporarySet claimTemporaries() {
     // Move the actual temporary set out.
@@ -99,6 +120,9 @@ public:
     return result;
   }
 };
+
+std::unique_ptr<CallEmission>
+getCallEmission(IRGenFunction &IGF, llvm::Value *selfValue, Callee &&callee);
 
 } // end namespace irgen
 } // end namespace swift

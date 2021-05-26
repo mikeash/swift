@@ -87,6 +87,9 @@ public:
     assert(!first->hasTypeVariable() && !second->hasTypeVariable() &&
            "Cannot compute join of types involving type variables");
 
+    assert(!first->hasPlaceholder() && !second->hasPlaceholder() &&
+           "Cannot compute join of types involving type placeholders");
+
     assert(first->getWithoutSpecifierType()->isEqual(first) &&
            "Expected simple type!");
     assert(second->getWithoutSpecifierType()->isEqual(second) &&
@@ -314,7 +317,7 @@ CanType TypeJoin::visitFunctionType(CanType second) {
   auto secondExtInfo = secondFnTy->getExtInfo();
 
   // FIXME: Properly handle these attributes.
-  if (firstExtInfo.withNoEscape(false) != secondExtInfo.withNoEscape(false))
+  if (!firstExtInfo.isEqualTo(secondExtInfo, useClangTypes(First)))
     return Unimplemented;
 
   if (!AnyFunctionType::equalParams(firstFnTy->getParams(),

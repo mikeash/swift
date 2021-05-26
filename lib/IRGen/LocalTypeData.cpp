@@ -41,8 +41,7 @@ LocalTypeDataKind LocalTypeDataKind::getCachingKind() const {
 
   // Map protocol conformances to their root normal conformance.
   auto conformance = getConcreteProtocolConformance();
-  return forConcreteProtocolWitnessTable(
-                                     conformance->getRootNormalConformance());
+  return forConcreteProtocolWitnessTable(conformance->getRootConformance());
 }
 
 LocalTypeDataCache &IRGenFunction::getOrCreateLocalTypeData() {
@@ -333,18 +332,21 @@ static void maybeEmitDebugInfoForLocalTypeData(IRGenFunction &IGF,
   if (key.Kind != LocalTypeDataKind::forFormalTypeMetadata())
     return;
 
-  // Only for archetypes, and not for opened archetypes.
+  // Only for archetypes, and not for opened/opaque archetypes.
   auto type = dyn_cast<ArchetypeType>(key.Type);
   if (!type)
     return;
-  if (type->getOpenedExistentialType())
+  if (!isa<PrimaryArchetypeType>(type))
     return;
+
+  auto *typeParam = type->getInterfaceType()->castTo<GenericTypeParamType>();
+  auto name = typeParam->getName().str();
 
   llvm::Value *data = value.getMetadata();
 
-  // At -O0, create an alloca to keep the type alive.
-  auto name = type->getFullName();
-  if (!IGF.IGM.IRGen.Opts.shouldOptimize()) {
+  // At -O0, create an alloca to keep the type alive. Not for async functions
+  // though; see the comment in IRGenFunctionSIL::emitShadowCopyIfNeeded().
+  if (!IGF.IGM.IRGen.Opts.shouldOptimize() && !IGF.isAsync()) {
     auto alloca =
         IGF.createAlloca(data->getType(), IGF.IGM.getPointerAlignment(), name);
     IGF.Builder.CreateStore(data, alloca);
@@ -355,19 +357,10 @@ static void maybeEmitDebugInfoForLocalTypeData(IRGenFunction &IGF,
   if (!IGF.IGM.DebugInfo)
     return;
 
-  // Emit debug info for the metadata.
-  llvm::SmallString<8> AssocType;
-  auto *oocTy = type->mapTypeOutOfContext().getPointer();
-  {
-    llvm::raw_svector_ostream OS(AssocType);
-    while (auto *dependentMemberType = dyn_cast<DependentMemberType>(oocTy)) {
-      OS << '.' << dependentMemberType->getName();
-      oocTy = dependentMemberType->getBase().getPointer();
-    }
-  }
-  auto *typeParam = cast<GenericTypeParamType>(oocTy);
-  IGF.IGM.DebugInfo->emitTypeMetadata(IGF, data, typeParam->getDepth(),
-                                      typeParam->getIndex(), AssocType);
+  IGF.IGM.DebugInfo->emitTypeMetadata(IGF, data,
+                                      typeParam->getDepth(),
+                                      typeParam->getIndex(),
+                                      name);
 }
 
 void
@@ -505,7 +498,7 @@ void LocalTypeDataCache::addAbstractForTypeMetadata(IRGenFunction &IGF,
     bool hasLimitedInterestingConformances(CanType type) const override {
       return false;
     }
-    GenericSignature::ConformsToArray
+    GenericSignature::RequiredProtocols
     getInterestingConformances(CanType type) const override {
       llvm_unreachable("no limits");
     }
@@ -568,7 +561,7 @@ addAbstractForFulfillments(IRGenFunction &IGF, FulfillmentMap &&fulfillments,
       // the type metadata for Int by chasing through N layers of metadata
       // just because that path happens to be in the cache.
       if (!type->hasArchetype() &&
-          isTypeMetadataAccessTrivial(IGF.IGM, type)) {
+          !shouldCacheTypeMetadataAccess(IGF.IGM, type)) {
         continue;
       }
 
@@ -716,6 +709,11 @@ void LocalTypeDataKind::print(llvm::raw_ostream &out) const {
     out << "ValueWitnessTable";
   } else {
     assert(isSingletonKind());
+    if (Value >= ValueWitnessDiscriminatorBase) {
+      auto witness = ValueWitness(Value - ValueWitnessDiscriminatorBase);
+      out << "Discriminator(" << getValueWitnessName(witness) << ")";
+      return;
+    }
     ValueWitness witness = ValueWitness(Value - ValueWitnessBase);
     out << getValueWitnessName(witness);
   }

@@ -23,10 +23,11 @@ namespace swift {
   /// The DWARF version emitted by the Swift compiler.
   const unsigned DWARFVersion = 4;
 
-  static const char MachOASTSegmentName[] = "__SWIFT";
-  static const char MachOASTSectionName[] = "__ast";
+  static const char MachOASTSegmentName[] = "__DWARF";
+  static const char MachOASTSectionName[] = "__swift_ast";
   static const char ELFASTSectionName[] = ".swift_ast";
   static const char COFFASTSectionName[] = "swiftast";
+  static const char WasmASTSectionName[] = ".swift_ast";
 } // end namespace swift
 
 #endif // SWIFT_BASIC_DWARF_H

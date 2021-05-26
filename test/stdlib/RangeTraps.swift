@@ -74,7 +74,68 @@ RangeTraps.test("CountablePartialRangeFrom")
     _ = it.next()
 }
 
+RangeTraps.test("nanLowerBound")
+  .code {
+  expectCrashLater()
+  _ = Double.nan ... 0
+}
 
+RangeTraps.test("nanUpperBound")
+  .code {
+  expectCrashLater()
+  _ = 0 ... Double.nan
+}
+
+RangeTraps.test("nanLowerBoundPartial")
+  .code {
+  expectCrashLater()
+  _ = Double.nan ..< 0
+}
+
+RangeTraps.test("nanUpperBoundPartial")
+  .code {
+  expectCrashLater()
+  _ = 0 ..< Double.nan
+}
+
+RangeTraps.test("fromNaN")
+  .code {
+  expectCrashLater()
+  _ = Double.nan...
+}
+
+RangeTraps.test("toNaN")
+  .code {
+  expectCrashLater()
+  _ = ..<Double.nan
+}
+
+RangeTraps.test("throughNaN")
+  .code {
+  expectCrashLater()
+  _ = ...Double.nan
+}
+
+if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
+  // Debug check was introduced in https://github.com/apple/swift/pull/34961
+  RangeTraps.test("UncheckedHalfOpen")
+  .xfail(.custom(
+      { !_isDebugAssertConfiguration() },
+      reason: "assertions are disabled in Release and Unchecked mode"))
+  .code {
+    expectCrashLater()
+    var range = Range(uncheckedBounds: (lower: 1, upper: 0))
+  }
+
+  RangeTraps.test("UncheckedClosed")
+  .xfail(.custom(
+      { !_isDebugAssertConfiguration() },
+      reason: "assertions are disabled in Release and Unchecked mode"))
+  .code {
+    expectCrashLater()
+    var range = ClosedRange(uncheckedBounds: (lower: 1, upper: 0))
+  }
+}
 
 runAllTests()
 

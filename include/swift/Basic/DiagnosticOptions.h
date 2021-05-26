@@ -32,12 +32,18 @@ public:
     VerifyAndApplyFixes
   } VerifyMode = NoVerify;
 
+  enum FormattingStyle { LLVM, Swift };
+
   /// Indicates whether to allow diagnostics for \c <unknown> locations if
   /// \c VerifyMode is not \c NoVerify.
   bool VerifyIgnoreUnknown = false;
 
   /// Indicates whether diagnostic passes should be skipped.
   bool SkipDiagnosticPasses = false;
+
+  /// Additional non-source files which will have diagnostics emitted in them,
+  /// and which should be scanned for expectations by the diagnostic verifier.
+  std::vector<std::string> AdditionalVerifierFiles;
 
   /// Keep emitting subsequent diagnostics after a fatal error.
   bool ShowDiagnosticsAfterFatalError = false;
@@ -51,6 +57,25 @@ public:
 
   /// Treat all warnings as errors
   bool WarningsAsErrors = false;
+
+  /// When printing diagnostics, include the diagnostic name (diag::whatever) at
+  /// the end.
+  bool PrintDiagnosticNames = false;
+
+  /// If set to true, include educational notes in printed output if available.
+  /// Educational notes are documentation which supplement diagnostics.
+  bool PrintEducationalNotes = false;
+
+  /// Whether to emit diagnostics in the terse LLVM style or in a more
+  /// descriptive style that's specific to Swift (currently experimental).
+  FormattingStyle PrintedFormattingStyle = FormattingStyle::LLVM;
+
+  std::string DiagnosticDocumentationPath = "";
+
+  std::string LocalizationCode = "";
+
+  /// Path to a directory of diagnostic localization tables.
+  std::string LocalizationPath = "";
 
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.

@@ -1,10 +1,22 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-build-swift -o %t/Error -DPTR_SIZE_%target-ptrsize -module-name main %s
+// RUN: %target-build-swift -o %t/Error -DPTR_SIZE_%target-ptrsize -module-name main %/s
+// RUN: %target-codesign %t/Error
 // RUN: %target-run %t/Error
 // REQUIRES: executable_test
 
 import StdlibUnittest
 
+func shouldCheckErrorLocation() -> Bool {
+  // Location information for runtime traps is only emitted in debug builds.
+  guard _isDebugAssertConfiguration() else { return false }
+  // The runtime error location format changed after the 5.3 release.
+  // (https://github.com/apple/swift/pull/34665)
+  if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
+    return true
+  } else {
+    return false
+  }
+}
 
 var ErrorTests = TestSuite("Error")
 
@@ -15,7 +27,7 @@ protocol OtherProtocol {
   var otherProperty: String { get }
 }
 
-protocol OtherClassProtocol : class {
+protocol OtherClassProtocol : AnyObject {
   var otherClassProperty: String { get }
 }
 
@@ -108,7 +120,7 @@ enum SillyError: Error { case JazzHands }
 ErrorTests.test("try!")
   .skip(.custom({ _isFastAssertConfiguration() },
                 reason: "trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches(_isDebugAssertConfiguration()
+  .crashOutputMatches(shouldCheckErrorLocation()
                         ? "'try!' expression unexpectedly raised an error: "
                           + "main.SillyError.JazzHands"
                         : "")
@@ -120,8 +132,8 @@ ErrorTests.test("try!")
 ErrorTests.test("try!/location")
   .skip(.custom({ _isFastAssertConfiguration() },
                 reason: "trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches(_isDebugAssertConfiguration()
-                        ? "test/stdlib/Error.swift, line 128"
+  .crashOutputMatches(shouldCheckErrorLocation()
+                        ? "main/Error.swift:140"
                         : "")
   .code {
     expectCrashLater()
@@ -188,6 +200,42 @@ ErrorTests.test("test dealloc empty error box") {
     expectEqual(foo.value, "makeFoo throw error")
   } catch {
     expectUnreachableCatch(error)
+  }
+}
+
+var errors: [Error] = []
+
+@inline(never)
+func throwNegativeOne() throws {
+  throw UnsignedError.negativeOne
+}
+
+@inline(never)
+func throwJazzHands() throws {
+  throw SillyError.JazzHands
+}
+
+ErrorTests.test("willThrow") {
+  if #available(macOS 10.15.4, iOS 13.4, watchOS 6.2, tvOS 13.4, *) {
+    // Error isn't allowed in a @convention(c) function when ObjC interop is
+    // not available, so pass it through an OpaquePointer.
+    typealias WillThrow = @convention(c) (OpaquePointer) -> Void
+    let willThrow = pointerToSwiftCoreSymbol(name: "_swift_willThrow")!
+    let callback: WillThrow = {
+      errors.append(unsafeBitCast($0, to: Error.self))
+    }
+    willThrow.storeBytes(of: callback, as: WillThrow.self)
+    expectTrue(errors.isEmpty)
+    do {
+      try throwNegativeOne()
+    } catch {}
+    expectEqual(UnsignedError.self, type(of: errors.last!))
+
+    do {
+      try throwJazzHands()
+    } catch {}
+    expectEqual(2, errors.count)
+    expectEqual(SillyError.self, type(of: errors.last!))
   }
 }
 

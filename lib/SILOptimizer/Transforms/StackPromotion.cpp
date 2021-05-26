@@ -10,15 +10,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/SILOptimizer/PassManager/Passes.h"
-#include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "swift/SILOptimizer/Analysis/EscapeAnalysis.h"
-#include "swift/SILOptimizer/Utils/Local.h"
-#include "swift/SILOptimizer/Utils/StackNesting.h"
-#include "swift/SIL/SILArgument.h"
-#include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/CFG.h"
+#include "swift/SIL/SILArgument.h"
+#include "swift/SIL/SILBuilder.h"
+#include "swift/SILOptimizer/Analysis/EscapeAnalysis.h"
+#include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/StackNesting.h"
+#include "swift/SILOptimizer/Utils/ValueLifetime.h"
 #include "llvm/ADT/Statistic.h"
 
 #define DEBUG_TYPE "stack-promotion"
@@ -54,6 +55,10 @@ private:
 
 void StackPromotion::run() {
   SILFunction *F = getFunction();
+  // FIXME: We should be able to support ownership.
+  if (F->hasOwnership())
+    return;
+
   LLVM_DEBUG(llvm::dbgs() << "** StackPromotion in " << F->getName() << " **\n");
 
   auto *EA = PM->getAnalysis<EscapeAnalysis>();
@@ -68,8 +73,7 @@ void StackPromotion::run() {
     return;
 
   // Make sure that all stack allocating instructions are nested correctly.
-  StackNesting SN;
-  if (SN.correctStackNesting(F) == StackNesting::Changes::CFG) {
+  if (StackNesting::fixNesting(F) == StackNesting::Changes::CFG) {
     invalidateAnalysis(SILAnalysis::InvalidationKind::BranchesAndInstructions);
   } else {
     invalidateAnalysis(SILAnalysis::InvalidationKind::Instructions);
@@ -103,32 +107,20 @@ bool StackPromotion::tryPromoteAlloc(AllocRefInst *ARI, EscapeAnalysis *EA,
     return false;
 
   auto *ConGraph = EA->getConnectionGraph(ARI->getFunction());
-  auto *Node = ConGraph->getNodeOrNull(ARI, EA);
-  if (!Node)
+  auto *contentNode = ConGraph->getValueContent(ARI);
+  if (!contentNode)
     return false;
 
   // The most important check: does the object escape the current function?
-  if (Node->escapes())
+  if (contentNode->escapes())
     return false;
 
   LLVM_DEBUG(llvm::dbgs() << "Promote " << *ARI);
 
   // Collect all use-points of the allocation. These are refcount instructions
   // and apply instructions.
-  llvm::SmallVector<SILNode *, 8> BaseUsePoints;
   llvm::SmallVector<SILInstruction *, 8> UsePoints;
-  ConGraph->getUsePoints(Node, BaseUsePoints);
-  for (SILNode *UsePoint : BaseUsePoints) {
-    if (SILInstruction *I = dyn_cast<SILInstruction>(UsePoint)) {
-      UsePoints.push_back(I);
-    } else {
-      // Also block arguments can be use points.
-      SILBasicBlock *UseBB = cast<SILPhiArgument>(UsePoint)->getParent();
-      // For simplicity we just add the first instruction of the block as use
-      // point.
-      UsePoints.push_back(&UseBB->front());
-    }
-  }
+  ConGraph->getUsePoints(contentNode, UsePoints);
 
   ValueLifetimeAnalysis VLA(ARI, UsePoints);
   // Check if there is a use point before the allocation (this can happen e.g.
@@ -147,7 +139,7 @@ bool StackPromotion::tryPromoteAlloc(AllocRefInst *ARI, EscapeAnalysis *EA,
     LLVM_DEBUG(llvm::dbgs() << "  uses don't post-dom allocation -> don't promote");
     return false;
   }
-  NumStackPromoted++;
+  ++NumStackPromoted;
 
   // We set the [stack] attribute in the alloc_ref.
   ARI->setStackAllocatable();

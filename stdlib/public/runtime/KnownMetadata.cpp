@@ -16,10 +16,16 @@
 
 #include "swift/Runtime/Metadata.h"
 #include "swift/Runtime/HeapObject.h"
+#include "swift/Runtime/Numeric.h"
 #include "MetadataImpl.h"
 #include "Private.h"
 #include <cstring>
 #include <climits>
+
+namespace swift {
+class AsyncTask;
+class Job;
+}
 
 using namespace swift;
 using namespace metadataimpl;
@@ -38,10 +44,11 @@ namespace {
     char data[16];
   };
 
-  struct alignas(32) int256_like {
+  static_assert(MaximumAlignment == 16, "max alignment was hardcoded");
+  struct alignas(16) int256_like {
     char data[32];
   };
-  struct alignas(64) int512_like {
+  struct alignas(16) int512_like {
     char data[64];
   };
 
@@ -55,6 +62,7 @@ namespace ctypes {
     // Type definitions that map each names Swift builtin type to their
     // C counterparts.
     using Bi1_ = uint8_t;
+    using Bi7_ = uint8_t;
     using Bi8_ = uint8_t;
     using Bi16_ = uint16_t;
     using Bi32_ = uint32_t;
@@ -65,6 +73,7 @@ namespace ctypes {
     using Bi512_ = int512_like;
 
     using Bw = intptr_t;
+    using BL_ = IntegerLiteral;
 
     using Bf16_ = uint16_t;
     using Bf32_ = float;
@@ -76,6 +85,19 @@ namespace ctypes {
     /// with this, but the type isn't copyable, so most of the value
     /// operations are meaningless.
     using BB = ValueBuffer;
+
+    // Types that are defined in the _Concurrency library
+
+    // Default actor storage type.
+    struct alignas(2 * alignof(void*)) BD {
+      void *storage[NumWords_DefaultActor];
+    };
+
+    // ExecutorRef type.
+    struct Be {
+      HeapObject *Identity;
+      uintptr_t Implementation;
+    };
   }
 }
 
@@ -90,6 +112,12 @@ namespace pointer_types {
     /// The value-witness table for BridgeObject.
     using Bb = BridgeObjectBox;
 
+    // RawUnsafeContinuation type.
+    using Bc = RawPointerBox;
+
+    // Job type.
+    using Bj = RawPointerBox;
+
 #if SWIFT_OBJC_INTEROP
     /*** Objective-C pointers *************************************************/
 
@@ -98,6 +126,8 @@ namespace pointer_types {
 
     /// The basic value-witness table for ObjC object pointers.
     using BO = ObjCRetainableBox;
+#else
+    using BO = UnknownObjectRetainableBox;
 #endif
 
   }
@@ -120,8 +150,9 @@ namespace {
   SET_FIXED_ALIGNMENT(uint32_t, 4)
   SET_FIXED_ALIGNMENT(uint64_t, 8)
   SET_FIXED_ALIGNMENT(int128_like, 16)
-  SET_FIXED_ALIGNMENT(int256_like, 32)
-  SET_FIXED_ALIGNMENT(int512_like, 64)
+  static_assert(MaximumAlignment == 16, "max alignment was hardcoded");
+  SET_FIXED_ALIGNMENT(int256_like, 16)
+  SET_FIXED_ALIGNMENT(int512_like, 16)
 
 #undef SET_FIXED_ALIGNMENT
 
@@ -150,7 +181,7 @@ const ValueWitnessTable swift::VALUE_WITNESS_SYM(Symbol) =                     \
                                     BuiltinType<ctypes::Symbol>::Alignment>>::table;
 
 #define BUILTIN_POINTER_TYPE(Symbol, Name)                 \
-const ExtraInhabitantsValueWitnessTable swift::VALUE_WITNESS_SYM(Symbol) =     \
+const ValueWitnessTable swift::VALUE_WITNESS_SYM(Symbol) =     \
   ValueWitnessTableForBox<pointer_types::Symbol>::table;
 
 #define BUILTIN_VECTOR_TYPE(ElementSymbol, _, Width)                           \
@@ -162,7 +193,7 @@ const ExtraInhabitantsValueWitnessTable swift::VALUE_WITNESS_SYM(Symbol) =     \
 #include "swift/Runtime/BuiltinTypes.def"
 
 /// The value-witness table for pointer-aligned unmanaged pointer types.
-const ExtraInhabitantsValueWitnessTable swift::METATYPE_VALUE_WITNESS_SYM(Bo) =
+const ValueWitnessTable swift::METATYPE_VALUE_WITNESS_SYM(Bo) =
   ValueWitnessTableForBox<PointerPointerBox>::table;
 
 /*** Functions ***************************************************************/
@@ -175,12 +206,12 @@ namespace {
     static constexpr unsigned numExtraInhabitants =
       FunctionPointerBox::numExtraInhabitants;
 
-    static void storeExtraInhabitant(char *dest, int index) {
-      FunctionPointerBox::storeExtraInhabitant((void**) dest, index);
+    static void storeExtraInhabitantTag(char *dest, unsigned tag) {
+      FunctionPointerBox::storeExtraInhabitantTag((void**) dest, tag);
     }
 
-    static int getExtraInhabitantIndex(const char *src) {
-      return FunctionPointerBox::getExtraInhabitantIndex((void * const *) src);
+    static unsigned getExtraInhabitantTag(const char *src) {
+      return FunctionPointerBox::getExtraInhabitantTag((void * const *) src);
     }
   };
   /// @noescape function types.
@@ -190,28 +221,28 @@ namespace {
     static constexpr unsigned numExtraInhabitants =
         FunctionPointerBox::numExtraInhabitants;
 
-    static void storeExtraInhabitant(char *dest, int index) {
-      FunctionPointerBox::storeExtraInhabitant((void **)dest, index);
+    static void storeExtraInhabitantTag(char *dest, unsigned tag) {
+      FunctionPointerBox::storeExtraInhabitantTag((void **)dest, tag);
     }
 
-    static int getExtraInhabitantIndex(const char *src) {
-      return FunctionPointerBox::getExtraInhabitantIndex((void *const *)src);
+    static unsigned getExtraInhabitantTag(const char *src) {
+      return FunctionPointerBox::getExtraInhabitantTag((void *const *)src);
     }
   };
 } // end anonymous namespace
 
 /// The basic value-witness table for escaping function types.
-const ExtraInhabitantsValueWitnessTable
+const ValueWitnessTable
   swift::VALUE_WITNESS_SYM(FUNCTION_MANGLING) =
     ValueWitnessTableForBox<ThickFunctionBox>::table;
 
 /// The basic value-witness table for @noescape function types.
-const ExtraInhabitantsValueWitnessTable
+const ValueWitnessTable
   swift::VALUE_WITNESS_SYM(NOESCAPE_FUNCTION_MANGLING) =
     ValueWitnessTableForBox<TrivialThickFunctionBox>::table;
 
 /// The basic value-witness table for thin function types.
-const ExtraInhabitantsValueWitnessTable
+const ValueWitnessTable
   swift::VALUE_WITNESS_SYM(THIN_FUNCTION_MANGLING) =
     ValueWitnessTableForBox<FunctionPointerBox>::table;
 

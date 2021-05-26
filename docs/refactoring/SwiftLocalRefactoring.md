@@ -1,3 +1,5 @@
+# Swift Local Refactoring
+
 Xcode 9 includes a brand new refactoring engine. It can transform code locally
 within a single Swift source file, or globally, such as renaming a method or property
 that occurs in multiple files and even different languages. The logic behind local refactorings is
@@ -243,7 +245,7 @@ is built alongside the compiler.
 
 Let's again take String Localization as an example. The above code
 snippet is a test for contextual refactoring actions.
-Similar tests can be found in [test/refactoring/RefactoringKind/](https://github.com/apple/swift/tree/master/test/refactoring/RefactoringKind).
+Similar tests can be found in [test/refactoring/RefactoringKind/](https://github.com/apple/swift/tree/main/test/refactoring/RefactoringKind).
 
 Let's take a look at the `RUN` line in more detail, starting with the use of the `%refactor` utility:
 
@@ -277,7 +279,7 @@ with interpolation.
 We should also test that when applying the refactoring, the automated code
 change matches our expectations. As a preparation, we need to teach [swift-refactor]
 a refactoring kind flag to specify the action we are testing with. To achieve this,
-the following entry is added in [swift-refactor.cpp](https://github.com/apple/swift/blob/master/tools/swift-refactor/swift-refactor.cpp):
+the following entry is added in [swift-refactor.cpp](https://github.com/apple/swift/blob/main/tools/swift-refactor/swift-refactor.cpp):
 
 ~~~cpp
   clEnumValN(RefactoringKind::LocalizeString, "localize-string", "Perform String Localization refactoring"),
@@ -319,7 +321,7 @@ After implementing all of above pieces in the Swift codebase, we
 are ready to test/use the newly added refactoring in Xcode by integrating with
 a locally-built open source toolchain.
 
-1. Run [build-toolchain](https://github.com/apple/swift/blob/master/utils/build-toolchain)
+1. Run [build-toolchain](https://github.com/apple/swift/blob/main/utils/build-toolchain)
 to build the open source toolchain locally.
 
 2. Untar and copy the toolchain to `/Library/Developer/Toolchains/`.
@@ -334,9 +336,9 @@ This post just touches on some of the things that are now possible to implement 
 If you are excited about extending the refactoring engine to implement additional transformations,
 Swift's [issue database](https://bugs.swift.org) contains [several ideas of refactoring transformations](https://bugs.swift.org/issues/?jql=labels%3DStarterProposal%20AND%20labels%3DRefactoring%20AND%20resolution%3DUnresolved) awaiting implementations.
 
-For further help with implementing refactoring transformations, please see the [documentation] or feel free to ask questions on the [swift-dev](https://lists.swift.org/mailman/listinfo/swift-dev) mailing list.
+For further help with implementing refactoring transformations, please feel free to ask questions on the [Swift forums](https://forums.swift.org/c/development/compiler/9).
 
-[sourcekitd]: https://github.com/apple/swift/tree/master/tools/SourceKit
+[sourcekitd]: https://github.com/apple/swift/tree/main/tools/SourceKit
 [ResolvedCursorInfo]: https://github.com/apple/swift/blob/60a91bb7360dde5ce9531889e0ed10a2edbc961a/include/swift/IDE/Utils.h#L158
 [RangeInfo]: https://github.com/apple/swift/blob/60a91bb7360dde5ce9531889e0ed10a2edbc961a/include/swift/IDE/Utils.h#L344
 [performChange]: https://github.com/apple/swift/blob/60a91bb7360dde5ce9531889e0ed10a2edbc961a/lib/IDE/Refactoring.cpp#L599
@@ -345,5 +347,4 @@ For further help with implementing refactoring transformations, please see the [
 [DiagnosticsRefactoring.def]: https://github.com/apple/swift/blob/60a91bb7360dde5ce9531889e0ed10a2edbc961a/include/swift/AST/DiagnosticsRefactoring.def
 [swift-refactor]: https://github.com/apple/swift/tree/60a91bb7360dde5ce9531889e0ed10a2edbc961a/tools/swift-refactor
 [Refactoring.cpp]: https://github.com/apple/swift/blob/60a91bb7360dde5ce9531889e0ed10a2edbc961a/lib/IDE/Refactoring.cpp
-[documentation]: https://github.com/apple/swift/blob/master/docs/Refactoring.md
 [EditConsumer]: https://github.com/apple/swift/blob/60a91bb7360dde5ce9531889e0ed10a2edbc961a/include/swift/IDE/Utils.h#L506

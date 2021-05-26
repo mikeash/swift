@@ -83,8 +83,14 @@ private:
   /// The exit blocks of the function.
   llvm::SmallPtrSet<SILBasicBlock *, 2> ExitBlocks;
 
-  EpilogueARCBlockState &getState(SILBasicBlock *BB) {
-    return IndexToStateMap[*PO->getPONumber(BB)];
+  /// Returns the EpligoyeARCBlockState for \p BB. If \p BB is unreachable,
+  /// returns None
+  Optional<EpilogueARCBlockState *> getState(SILBasicBlock *BB) {
+    // poNumber will be None for unreachable blocks
+    auto poNumber = PO->getPONumber(BB);
+    if (poNumber.hasValue())
+      return &IndexToStateMap[*poNumber];
+    return None;
   }
 
   /// Return true if this is a function exiting block this epilogue ARC
@@ -113,7 +119,10 @@ private:
   }
 
   SILValue getArg(SILBasicBlock *BB) {
-    SILValue A = getState(BB).LocalArg;
+    auto state = getState(BB);
+    if (!state)
+      return SILValue();
+    SILValue A = state.getValue()->LocalArg;
     if (A)
       return A;
     return Arg;
@@ -200,9 +209,11 @@ public:
     // We are checking for retain. If this is a self-recursion. call
     // to the function (which returns an owned value) can be treated as
     // the retain instruction.
-    if (auto *AI = dyn_cast<ApplyInst>(II))
-     if (AI->getCalleeFunction() == II->getParent()->getParent())
-       return true;
+    if (auto *AI = dyn_cast<ApplyInst>(II)) {
+      return AI->getCalleeFunction() == II->getParent()->getParent() &&
+             RCFI->getRCIdentityRoot(AI) ==
+             RCFI->getRCIdentityRoot(getArg(AI->getParent()));
+    }
     // Check whether this is a retain instruction and the argument it
     // retains.
     return isRetainInstruction(II) &&
@@ -302,7 +313,7 @@ public:
   
   virtual std::unique_ptr<EpilogueARCFunctionInfo>
   newFunctionAnalysis(SILFunction *F) override {
-    return llvm::make_unique<EpilogueARCFunctionInfo>(F, PO, AA, RC);
+    return std::make_unique<EpilogueARCFunctionInfo>(F, PO, AA, RC);
   }
 
   virtual bool shouldInvalidate(SILAnalysis::InvalidationKind K) override {

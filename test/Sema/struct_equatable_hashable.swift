@@ -48,9 +48,8 @@ struct CustomHashValue: Hashable {
   let x: Int
   let y: Int
 
-  var hashValue: Int { return 0 }
-
   static func ==(x: CustomHashValue, y: CustomHashValue) -> Bool { return true }
+  func hash(into hasher: inout Hasher) {}
 }
 
 func customHashValue() {
@@ -115,14 +114,17 @@ struct StructWithoutExplicitConformance {
 }
 
 func structWithoutExplicitConformance() {
-  if StructWithoutExplicitConformance(a: 1, b: "b") == StructWithoutExplicitConformance(a: 2, b: "a") { } // expected-error{{binary operator '==' cannot be applied to two 'StructWithoutExplicitConformance' operands}}
-  // expected-note @-1 {{overloads for '==' exist with these partially matching parameter lists: }}
+  // FIXME(rdar://problem/64844584) - on iOS simulator this diagnostic is flaky
+  // This diagnostic is about `Equatable` because it's considered the best possible solution among other ones for operator `==`.
+  if StructWithoutExplicitConformance(a: 1, b: "b") == StructWithoutExplicitConformance(a: 2, b: "a") { }
+  // expected-error@-1 {{requires that 'StructWithoutExplicitConformance' conform to 'Equatable'}}
 }
 
 // Structs with non-hashable/equatable stored properties don't derive conformance.
 struct NotHashable {}
 struct StructWithNonHashablePayload: Hashable { // expected-error 2 {{does not conform}}
-  let a: NotHashable
+  let a: NotHashable // expected-note {{stored property type 'NotHashable' does not conform to protocol 'Hashable', preventing synthesized conformance of 'StructWithNonHashablePayload' to 'Hashable'}}
+  // expected-note@-1 {{stored property type 'NotHashable' does not conform to protocol 'Equatable', preventing synthesized conformance of 'StructWithNonHashablePayload' to 'Equatable'}}
 }
 
 // ...but computed properties and static properties are not considered.
@@ -152,7 +154,7 @@ func genericHashable() {
 // But it should be an error if the generic argument doesn't have the necessary
 // constraints to satisfy the conditions for derivation.
 struct GenericNotHashable<T: Equatable>: Hashable { // expected-error 2 {{does not conform to protocol 'Hashable'}}
-  let value: T
+  let value: T // expected-note 2 {{stored property type 'T' does not conform to protocol 'Hashable', preventing synthesized conformance of 'GenericNotHashable<T>' to 'Hashable'}}
 }
 func genericNotHashable() {
   if GenericNotHashable<String>(value: "a") == GenericNotHashable<String>(value: "b") { }
@@ -179,7 +181,8 @@ extension StructConformsAndImplementsInExtension : Equatable {
 
 // No explicit conformance and it cannot be derived.
 struct NotExplicitlyHashableAndCannotDerive {
-  let v: NotHashable
+  let v: NotHashable // expected-note {{stored property type 'NotHashable' does not conform to protocol 'Hashable', preventing synthesized conformance of 'NotExplicitlyHashableAndCannotDerive' to 'Hashable'}}
+  // expected-note@-1 {{stored property type 'NotHashable' does not conform to protocol 'Equatable', preventing synthesized conformance of 'NotExplicitlyHashableAndCannotDerive' to 'Equatable'}}
 }
 extension NotExplicitlyHashableAndCannotDerive : Hashable {}  // expected-error 2 {{does not conform}}
 
@@ -192,10 +195,10 @@ extension OtherFileNonconforming: Hashable {
   static func ==(lhs: OtherFileNonconforming, rhs: OtherFileNonconforming) -> Bool {
     return true
   }
-  var hashValue: Int { return 0 }
+  func hash(into hasher: inout Hasher) {}
 }
 // ...but synthesis in a type defined in another file doesn't work yet.
-extension YetOtherFileNonconforming: Equatable {} // expected-error {{cannot be automatically synthesized in an extension in a different file to the type}}
+extension YetOtherFileNonconforming: Equatable {} // expected-error {{extension outside of file declaring struct 'YetOtherFileNonconforming' prevents automatic synthesis of '==' for protocol 'Equatable'}}
 
 // Verify that we can add Hashable conformance in an extension by only
 // implementing hash(into:)
@@ -234,7 +237,8 @@ extension GenericDeriveExtension: Hashable where T: Hashable {}
 
 // Incorrectly/insufficiently conditional shouldn't work
 struct BadGenericDeriveExtension<T> {
-    let value: T
+    let value: T // expected-note {{stored property type 'T' does not conform to protocol 'Hashable', preventing synthesized conformance of 'BadGenericDeriveExtension<T>' to 'Hashable'}}
+// expected-note@-1 {{stored property type 'T' does not conform to protocol 'Equatable', preventing synthesized conformance of 'BadGenericDeriveExtension<T>' to 'Equatable'}}
 }
 extension BadGenericDeriveExtension: Equatable {}
 // expected-error@-1 {{type 'BadGenericDeriveExtension<T>' does not conform to protocol 'Equatable'}}
@@ -251,7 +255,7 @@ extension UnusedGenericDeriveExtension: Hashable {}
 
 // Cross-file synthesis is still disallowed for conditional cases
 extension GenericOtherFileNonconforming: Equatable where T: Equatable {}
-// expected-error@-1{{implementation of 'Equatable' cannot be automatically synthesized in an extension in a different file to the type}}
+// expected-error@-1{{extension outside of file declaring generic struct 'GenericOtherFileNonconforming' prevents automatic synthesis of '==' for protocol 'Equatable'}}
 
 // rdar://problem/41852654
 
@@ -261,6 +265,82 @@ extension GenericOtherFileNonconforming: Equatable where T: Equatable {}
 protocol ImplierMain: Equatable {}
 struct ImpliedMain: ImplierMain {}
 extension ImpliedOther: ImplierMain {}
+
+
+// Hashable conformances that rely on a manual implementation of `hashValue`
+// should produce a deprecation warning.
+struct OldSchoolStruct: Hashable {
+  static func ==(left: OldSchoolStruct, right: OldSchoolStruct) -> Bool {
+    return true
+  }
+  var hashValue: Int { return 42 }
+  // expected-warning@-1{{'Hashable.hashValue' is deprecated as a protocol requirement; conform type 'OldSchoolStruct' to 'Hashable' by implementing 'hash(into:)' instead}}
+}
+enum OldSchoolEnum: Hashable {
+  case foo
+  case bar
+
+  static func ==(left: OldSchoolEnum, right: OldSchoolEnum) -> Bool {
+    return true
+  }
+  var hashValue: Int { return 23 }
+  // expected-warning@-1{{'Hashable.hashValue' is deprecated as a protocol requirement; conform type 'OldSchoolEnum' to 'Hashable' by implementing 'hash(into:)' instead}}
+}
+class OldSchoolClass: Hashable {
+  static func ==(left: OldSchoolClass, right: OldSchoolClass) -> Bool {
+    return true
+  }
+  var hashValue: Int { return -9000 }
+  // expected-warning@-1{{'Hashable.hashValue' is deprecated as a protocol requirement; conform type 'OldSchoolClass' to 'Hashable' by implementing 'hash(into:)' instead}}
+}
+
+// However, it's okay to implement `hashValue` as long as `hash(into:)` is also
+// provided.
+struct MixedStruct: Hashable {
+  static func ==(left: MixedStruct, right: MixedStruct) -> Bool {
+    return true
+  }
+  func hash(into hasher: inout Hasher) {}
+  var hashValue: Int { return 42 }
+}
+enum MixedEnum: Hashable {
+  case foo
+  case bar
+  static func ==(left: MixedEnum, right: MixedEnum) -> Bool {
+    return true
+  }
+  func hash(into hasher: inout Hasher) {}
+  var hashValue: Int { return 23 }
+}
+class MixedClass: Hashable {
+  static func ==(left: MixedClass, right: MixedClass) -> Bool {
+    return true
+  }
+  func hash(into hasher: inout Hasher) {}
+  var hashValue: Int { return -9000 }
+}
+
+// Ensure equatable and hashable works with weak/unowned properties as well
+struct Foo: Equatable, Hashable {
+    weak var foo: Bar?
+    unowned var bar: Bar
+}
+
+class Bar {
+   let bar: String
+
+   init(bar: String) {
+     self.bar = bar
+   }
+}
+
+extension Bar: Equatable, Hashable {
+  static func == (lhs: Bar, rhs: Bar) -> Bool {
+        return lhs.bar == rhs.bar
+  }
+
+  func hash(into hasher: inout Hasher) {}
+}
 
 // FIXME: Remove -verify-ignore-unknown.
 // <unknown>:0: error: unexpected error produced: invalid redeclaration of 'hashValue'

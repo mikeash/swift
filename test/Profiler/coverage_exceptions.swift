@@ -1,4 +1,16 @@
 // RUN: %target-swift-frontend -Xllvm -sil-full-demangle -profile-generate -profile-coverage-mapping -emit-sorted-sil -emit-sil -module-name coverage_catch %s | %FileCheck %s
+// RUN: %target-swift-frontend -profile-generate -profile-coverage-mapping -emit-ir %s
+
+struct S {
+  // CHECK-LABEL: sil_coverage_map {{.*}}// coverage_catch.S.init() -> coverage_catch.S
+  init() {     // CHECK: [[@LINE]]:10 -> [[@LINE+6]]:4 : 0
+    do {       // CHECK: [[@LINE]]:8 -> [[@LINE+2]]:6 : 0
+      throw SomeErr.Err1
+    } catch {
+      // CHECK: [[@LINE-1]]:13 -> [[@LINE+1]]:6 : 1
+    } // CHECK: [[@LINE]]:6 -> [[@LINE+1]]:4 : 0
+  }
+}
 
 enum SomeErr : Error {
   case Err1
@@ -58,6 +70,7 @@ func goo(_ b: Bool) -> Int { // CHECK-NEXT: [[@LINE]]:28 {{.*}} : 0
   do {                       // CHECK-NEXT: [[@LINE]]:6 -> [[@LINE+2]]:4 : 0
     throw SomeErr.Err1
   } catch {                  // CHECK-NEXT: [[@LINE]]:11 {{.*}} : 1
+                             // CHECK-NEXT: [[@LINE+1]]:8 {{.*}} : 1
     if b {                   // CHECK-NEXT: [[@LINE]]:10 {{.*}} : 2
       return 1
     }                        // CHECK-NEXT: [[@LINE]]:6 {{.*}} : (1 - 2)
@@ -108,15 +121,4 @@ func joo() -> Int {
 
   } while false // CHECK: [[@LINE]]:11 {{.*}} : (1 - 2)
   return 1
-}
-
-struct S {
-  // CHECK: sil_coverage_map {{.*}}// __ntd_S_line:[[@LINE-1]]
-  init() {
-    do {
-      throw SomeErr.Err1
-    } catch {
-      // CHECK: [[@LINE-1]]:13 -> [[@LINE+1]]:6 : 1
-    } // CHECK: [[@LINE]]:6 -> [[@LINE+1]]:4 : 0
-  }
 }

@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -19,6 +19,7 @@
 #ifndef SWIFT_STDLIB_SHIMS_LIBCSHIMS_H
 #define SWIFT_STDLIB_SHIMS_LIBCSHIMS_H
 
+#include "SwiftStdbool.h"
 #include "SwiftStdint.h"
 #include "SwiftStddef.h"
 #include "Visibility.h"
@@ -28,23 +29,7 @@
 #endif
 
 #ifdef __cplusplus
-namespace swift { extern "C" {
-#endif
-
-// This declaration might not be universally correct.
-// We verify its correctness for the current platform in the runtime code.
-#if defined(__linux__)
-# if defined(__ANDROID__) && !defined(__aarch64__)
-typedef __swift_uint16_t __swift_mode_t;
-# else
-typedef __swift_uint32_t __swift_mode_t;
-# endif
-#elif defined(__APPLE__)
-typedef __swift_uint16_t __swift_mode_t;
-#elif defined(_WIN32)
-typedef __swift_int32_t __swift_mode_t;
-#else  // just guessing
-typedef __swift_uint16_t __swift_mode_t;
+extern "C" {
 #endif
 
 
@@ -57,10 +42,18 @@ __swift_size_t _swift_stdlib_fwrite_stdout(const void *ptr, __swift_size_t size,
 
 // General utilities <stdlib.h>
 // Memory management functions
-static inline void _swift_stdlib_free(void *ptr) {
-  extern void free(void *);
+static inline void _swift_stdlib_free(void *_Nullable ptr) {
+  extern void free(void *_Nullable);
   free(ptr);
 }
+
+// <unistd.h>
+SWIFT_RUNTIME_STDLIB_SPI
+__swift_ssize_t _swift_stdlib_read(int fd, void *buf, __swift_size_t nbyte);
+SWIFT_RUNTIME_STDLIB_SPI
+__swift_ssize_t _swift_stdlib_write(int fd, const void *buf, __swift_size_t nbyte);
+SWIFT_RUNTIME_STDLIB_SPI
+int _swift_stdlib_close(int fd);
 
 // String handling <string.h>
 SWIFT_READONLY
@@ -77,7 +70,11 @@ static inline __swift_size_t _swift_stdlib_strlen_unsigned(const unsigned char *
 SWIFT_READONLY
 static inline int _swift_stdlib_memcmp(const void *s1, const void *s2,
                                        __swift_size_t n) {
+#if defined(__APPLE__)
+  extern int memcmp(const void * _Nullable, const void * _Nullable, __swift_size_t);
+#else
   extern int memcmp(const void *, const void *, __swift_size_t);
+#endif
   return memcmp(s1, s2, n);
 }
 
@@ -92,15 +89,17 @@ static inline int _swift_stdlib_memcmp(const void *s1, const void *s2,
 
 // Non-standard extensions
 #if defined(__APPLE__)
+#define HAS_MALLOC_SIZE 1
 static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
   extern __swift_size_t malloc_size(const void *);
   return malloc_size(ptr);
 }
 #elif defined(__linux__) || defined(__CYGWIN__) || defined(__ANDROID__) \
-   || defined(__HAIKU__) || defined(__FreeBSD__)
+   || defined(__HAIKU__) || defined(__FreeBSD__) || defined(__wasi__)
+#define HAS_MALLOC_SIZE 1
 static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
 #if defined(__ANDROID__)
-#if __ANDROID_API__ >= 17
+#if !defined(__ANDROID_API__) || __ANDROID_API__ >= 17
   extern __swift_size_t malloc_usable_size(const void *ptr);
 #endif
 #else
@@ -109,13 +108,22 @@ static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
   return malloc_usable_size(CONST_CAST(void *, ptr));
 }
 #elif defined(_WIN32)
+#define HAS_MALLOC_SIZE 1
 static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
   extern __swift_size_t _msize(void *ptr);
   return _msize(CONST_CAST(void *, ptr));
 }
 #else
-#error No malloc_size analog known for this platform/libc.
+#define HAS_MALLOC_SIZE 0
+
+static inline __swift_size_t _swift_stdlib_malloc_size(const void *ptr) {
+  return 0;
+}
 #endif
+
+static inline __swift_bool _swift_stdlib_has_malloc_size() {
+  return HAS_MALLOC_SIZE != 0;
+}
 
 // Math library functions
 static inline SWIFT_ALWAYS_INLINE
@@ -125,7 +133,12 @@ float _stdlib_remainderf(float _self, float _other) {
   
 static inline SWIFT_ALWAYS_INLINE
 float _stdlib_squareRootf(float _self) {
+#if defined(_WIN32) && (defined(_M_IX86) || defined(__i386__))
+  typedef float __m128 __attribute__((__vector_size__(16), __aligned__(16)));
+  return __builtin_ia32_sqrtss(__extension__ (__m128){ _self, 0, 0, 0 })[0];
+#else
   return __builtin_sqrtf(_self);
+#endif
 }
 
 static inline SWIFT_ALWAYS_INLINE
@@ -160,7 +173,7 @@ long double lgammal_r(long double x, int *psigngam);
 #endif // defined(__APPLE__)
 
 #ifdef __cplusplus
-}} // extern "C", namespace swift
+} // extern "C"
 #endif
 
 #if __has_feature(nullability)

@@ -17,40 +17,21 @@
 #ifndef SWIFT_LAYOUT_CONSTRAINT_H
 #define SWIFT_LAYOUT_CONSTRAINT_H
 
+#include "swift/AST/LayoutConstraintKind.h"
+#include "swift/AST/PrintOptions.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringRef.h"
-#include "swift/AST/PrintOptions.h"
 
 namespace swift {
 
 enum class AllocationArena;
 class ASTContext;
 class ASTPrinter;
-
-/// Describes a layout constraint information.
-enum class LayoutConstraintKind : uint8_t {
-  // It is not a known layout constraint.
-  UnknownLayout,
-  // It is a layout constraint representing a trivial type of an unknown size.
-  TrivialOfExactSize,
-  // It is a layout constraint representing a trivial type of an unknown size.
-  TrivialOfAtMostSize,
-  // It is a layout constraint representing a trivial type of an unknown size.
-  Trivial,
-  // It is a layout constraint representing a reference counted class instance.
-  Class,
-  // It is a layout constraint representing a reference counted native class
-  // instance.
-  NativeClass,
-  // It is a layout constraint representing a reference counted object.
-  RefCountedObject,
-  // It is a layout constraint representing a native reference counted object.
-  NativeRefCountedObject,
-  LastLayout = NativeRefCountedObject,
-};
 
 /// This is a class representing the layout constraint.
 class LayoutConstraintInfo : public llvm::FoldingSetNode {
@@ -281,7 +262,7 @@ class LayoutConstraint {
 
   explicit operator bool() const { return Ptr != 0; }
 
-  void dump() const;
+  SWIFT_DEBUG_DUMP;
   void dump(raw_ostream &os, unsigned indent = 0) const;
 
   void print(raw_ostream &OS, const PrintOptions &PO = PrintOptions()) const;
@@ -289,6 +270,10 @@ class LayoutConstraint {
 
   /// Return the layout constraint as a string, for use in diagnostics only.
   std::string getString(const PrintOptions &PO = PrintOptions()) const;
+
+  friend llvm::hash_code hash_value(const LayoutConstraint &layout) {
+    return hash_value(layout.getPointer());
+  }
 
   bool operator==(LayoutConstraint rhs) const {
     if (isNull() && rhs.isNull())

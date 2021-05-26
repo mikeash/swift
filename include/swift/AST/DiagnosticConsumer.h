@@ -25,10 +25,11 @@
 
 namespace swift {
   class DiagnosticArgument;
+  class DiagnosticEngine;
   class SourceManager;
   enum class DiagID : uint32_t;
 
-/// \brief Describes the kind of diagnostic.
+/// Describes the kind of diagnostic.
 ///
 enum class DiagnosticKind : uint8_t {
   Error,
@@ -37,10 +38,28 @@ enum class DiagnosticKind : uint8_t {
   Note
 };
 
-/// \brief Extra information carried along with a diagnostic, which may or
-/// may not be of interest to a given diagnostic consumer.
+/// Information about a diagnostic passed to DiagnosticConsumers.
 struct DiagnosticInfo {
   DiagID ID = DiagID(0);
+  SourceLoc Loc;
+  DiagnosticKind Kind;
+  StringRef FormatString;
+  ArrayRef<DiagnosticArgument> FormatArgs;
+  StringRef Category;
+
+  /// Only used when directing diagnostics to different outputs.
+  /// In batch mode a diagnostic may be
+  /// located in a non-primary file, but there will be no .dia file for a
+  /// non-primary. If valid, this argument contains a location within a buffer
+  /// that corresponds to a primary input. The .dia file for that primary can be
+  /// used for the diagnostic, as if it had occurred at this location.
+  SourceLoc BufferIndirectlyCausingDiagnostic;
+
+  /// DiagnosticInfo of notes which are children of this diagnostic, if any
+  ArrayRef<DiagnosticInfo *> ChildDiagnosticInfo;
+
+  /// Paths to "educational note" diagnostic documentation in the toolchain.
+  ArrayRef<std::string> EducationalNotePaths;
 
   /// Represents a fix-it, a replacement of one range of text with another.
   class FixIt {
@@ -48,21 +67,38 @@ struct DiagnosticInfo {
     std::string Text;
 
   public:
-    FixIt(CharSourceRange R, StringRef Str)
-        : Range(R), Text(Str) {}
+    FixIt(CharSourceRange R, StringRef Str, ArrayRef<DiagnosticArgument> Args);
 
     CharSourceRange getRange() const { return Range; }
     StringRef getText() const { return Text; }
   };
 
-  /// \brief Extra source ranges that are attached to the diagnostic.
+  /// Extra source ranges that are attached to the diagnostic.
   ArrayRef<CharSourceRange> Ranges;
 
-  /// \brief Extra source ranges that are attached to the diagnostic.
+  /// Extra source ranges that are attached to the diagnostic.
   ArrayRef<FixIt> FixIts;
+
+  /// This is a note which has a parent error or warning
+  bool IsChildNote = false;
+
+  DiagnosticInfo() {}
+
+  DiagnosticInfo(DiagID ID, SourceLoc Loc, DiagnosticKind Kind,
+                 StringRef FormatString,
+                 ArrayRef<DiagnosticArgument> FormatArgs, StringRef Category,
+                 SourceLoc BufferIndirectlyCausingDiagnostic,
+                 ArrayRef<DiagnosticInfo *> ChildDiagnosticInfo,
+                 ArrayRef<CharSourceRange> Ranges, ArrayRef<FixIt> FixIts,
+                 bool IsChildNote)
+      : ID(ID), Loc(Loc), Kind(Kind), FormatString(FormatString),
+        FormatArgs(FormatArgs), Category(Category),
+        BufferIndirectlyCausingDiagnostic(BufferIndirectlyCausingDiagnostic),
+        ChildDiagnosticInfo(ChildDiagnosticInfo), Ranges(Ranges),
+        FixIts(FixIts), IsChildNote(IsChildNote) {}
 };
   
-/// \brief Abstract interface for classes that present diagnostics to the user.
+/// Abstract interface for classes that present diagnostics to the user.
 class DiagnosticConsumer {
 protected:
   static llvm::SMLoc getRawLoc(SourceLoc Loc);
@@ -78,29 +114,21 @@ protected:
 
 public:
   virtual ~DiagnosticConsumer();
-  
-  /// \brief Invoked whenever the frontend emits a diagnostic.
+
+  /// Invoked whenever the frontend emits a diagnostic.
   ///
   /// \param SM The source manager associated with the source locations in
   /// this diagnostic.
   ///
-  /// \param Loc The source location associated with this diagnostic. This
-  /// location may be invalid, if the diagnostic is not directly related to
-  /// the source (e.g., if it comes from command-line parsing).
-  ///
-  /// \param Kind The severity of the diagnostic (error, warning, note).
-  ///
-  /// \param FormatArgs The diagnostic format string arguments.
-  ///
-  /// \param Info Extra information associated with the diagnostic.
-  virtual void handleDiagnostic(SourceManager &SM, SourceLoc Loc,
-                                DiagnosticKind Kind,
-                                StringRef FormatString,
-                                ArrayRef<DiagnosticArgument> FormatArgs,
+  /// \param Info Information describing the diagnostic.
+  virtual void handleDiagnostic(SourceManager &SM,
                                 const DiagnosticInfo &Info) = 0;
 
   /// \returns true if an error occurred while finishing-up.
   virtual bool finishProcessing() { return false; }
+
+  /// Flush any in-flight diagnostics.
+  virtual void flush() {}
 
   /// In batch mode, any error causes failure for all primary files, but
   /// anyone consulting .dia files will only see an error for a particular
@@ -112,17 +140,22 @@ public:
   virtual void informDriverOfIncompleteBatchModeCompilation() {}
 };
   
-/// \brief DiagnosticConsumer that discards all diagnostics.
+/// DiagnosticConsumer that discards all diagnostics.
 class NullDiagnosticConsumer : public DiagnosticConsumer {
 public:
-  void handleDiagnostic(SourceManager &SM, SourceLoc Loc,
-                        DiagnosticKind Kind,
-                        StringRef FormatString,
-                        ArrayRef<DiagnosticArgument> FormatArgs,
-                        const DiagnosticInfo &Info) override;
+  void handleDiagnostic(SourceManager &SM, const DiagnosticInfo &Info) override;
 };
 
-/// \brief DiagnosticConsumer that funnels diagnostics in certain files to
+/// DiagnosticConsumer that forwards diagnostics to the consumers of
+// another DiagnosticEngine.
+class ForwardingDiagnosticConsumer : public DiagnosticConsumer {
+  DiagnosticEngine &TargetEngine;
+public:
+  ForwardingDiagnosticConsumer(DiagnosticEngine &Target);
+  void handleDiagnostic(SourceManager &SM, const DiagnosticInfo &Info) override;
+};
+
+/// DiagnosticConsumer that funnels diagnostics in certain files to
 /// particular sub-consumers.
 ///
 /// The intended use case for such a consumer is "batch mode" compilations,
@@ -161,8 +194,12 @@ public:
     std::string inputFileName;
 
     /// The consumer (if any) for diagnostics associated with the inputFileName.
-    /// A null pointer for the DiagnosticConsumer means that diagnostics for
-    /// this file should not be emitted.
+    /// A null pointer for the DiagnosticConsumer means that this file is a
+    /// non-primary one in batch mode and we have no .dia file for it.
+    /// If there is a responsible primary when the diagnostic is handled
+    /// it will be shunted to that primary's .dia file.
+    /// Otherwise it will be suppressed, assuming that the diagnostic will
+    /// surface in another frontend job that compiles that file as a primary.
     std::unique_ptr<DiagnosticConsumer> consumer;
 
     // Has this subconsumer ever handled a diagnostic that is an error?
@@ -177,18 +214,13 @@ public:
                 std::unique_ptr<DiagnosticConsumer> consumer)
         : inputFileName(inputFileName), consumer(std::move(consumer)) {}
 
-    void handleDiagnostic(SourceManager &SM, SourceLoc Loc,
-                          DiagnosticKind Kind,
-                          StringRef FormatString,
-                          ArrayRef<DiagnosticArgument> FormatArgs,
-                          const DiagnosticInfo &Info) {
+    void handleDiagnostic(SourceManager &SM, const DiagnosticInfo &Info) {
       if (!getConsumer())
         return;
-      hasAnErrorBeenConsumed |= Kind == DiagnosticKind::Error;
-      getConsumer()->handleDiagnostic(SM, Loc, Kind, FormatString, FormatArgs,
-                                      Info);
+      hasAnErrorBeenConsumed |= Info.Kind == DiagnosticKind::Error;
+      getConsumer()->handleDiagnostic(SM, Info);
     }
-    
+
     void informDriverOfIncompleteBatchModeCompilation() {
       if (!hasAnErrorBeenConsumed && getConsumer())
         getConsumer()->informDriverOfIncompleteBatchModeCompilation();
@@ -273,11 +305,7 @@ private:
       SmallVectorImpl<Subconsumer> &consumers);
 
 public:
-  void handleDiagnostic(SourceManager &SM, SourceLoc Loc,
-                        DiagnosticKind Kind,
-                        StringRef FormatString,
-                        ArrayRef<DiagnosticArgument> FormatArgs,
-                        const DiagnosticInfo &Info) override;
+  void handleDiagnostic(SourceManager &SM, const DiagnosticInfo &Info) override;
 
   bool finishProcessing() override;
 
@@ -295,6 +323,12 @@ private:
   /// a particular consumer if diagnostic goes there.
   Optional<FileSpecificDiagnosticConsumer::Subconsumer *>
   subconsumerForLocation(SourceManager &SM, SourceLoc loc);
+
+  Optional<FileSpecificDiagnosticConsumer::Subconsumer *>
+  findSubconsumer(SourceManager &SM, const DiagnosticInfo &Info);
+
+  Optional<FileSpecificDiagnosticConsumer::Subconsumer *>
+  findSubconsumerForNonNote(SourceManager &SM, const DiagnosticInfo &Info);
 };
   
 } // end namespace swift

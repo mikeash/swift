@@ -1,5 +1,5 @@
-from Child import Child
-from Node import Node  # noqa: I201
+from .Child import Child
+from .Node import Node  # noqa: I201
 
 COMMON_NODES = [
     Node('Decl', kind='Syntax'),
@@ -39,14 +39,16 @@ COMMON_NODES = [
 
     # code-block-item-list -> code-block-item code-block-item-list?
     Node('CodeBlockItemList', kind='SyntaxCollection',
-         element='CodeBlockItem'),
+         element='CodeBlockItem', elements_separated_by_newline=True),
 
     # code-block -> '{' stmt-list '}'
     Node('CodeBlock', kind='Syntax',
          traits=['Braced', 'WithStatements'],
          children=[
              Child('LeftBrace', kind='LeftBraceToken'),
-             Child('Statements', kind='CodeBlockItemList'),
-             Child('RightBrace', kind='RightBraceToken'),
+             Child('Statements', kind='CodeBlockItemList',
+                   collection_element_name='Statement', is_indented=True),
+             Child('RightBrace', kind='RightBraceToken', 
+                   requires_leading_newline=True),
          ]),
 ]

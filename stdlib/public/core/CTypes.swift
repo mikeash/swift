@@ -56,6 +56,12 @@ public typealias CLong = Int
 /// The C 'long long' type.
 public typealias CLongLong = Int64
 
+#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+/// The C '_Float16' type.
+@available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
+public typealias CFloat16 = Float16
+#endif
+
 /// The C 'float' type.
 public typealias CFloat = Float
 
@@ -87,6 +93,14 @@ public typealias CLongDouble = Float80
 // Long Double type equivalent to Double type.
 public typealias CLongDouble = Double
 #endif
+#elseif os(Android)
+// On Android, long double is Float128 for AAPCS64, which we don't have yet in
+// Swift (SR-9072); and Double for ARMv7.
+#if arch(arm)
+public typealias CLongDouble = Double
+#endif
+#elseif os(OpenBSD)
+public typealias CLongDouble = Float80
 #endif
 
 // FIXME: Is it actually UTF-32 on Darwin?
@@ -109,8 +123,8 @@ public typealias CBool = Bool
 ///
 /// Opaque pointers are used to represent C pointers to types that
 /// cannot be represented in Swift, such as incomplete struct types.
-@_fixed_layout
-public struct OpaquePointer {
+@frozen
+public struct OpaquePointer: Sendable {
   @usableFromInline
   internal var _rawValue: Builtin.RawPointer
 
@@ -135,7 +149,7 @@ public struct OpaquePointer {
 
   /// Converts a typed `UnsafePointer` to an opaque C pointer.
   @_transparent
-  public init<T>(_ from: UnsafePointer<T>) {
+  public init<T>(@_nonEphemeral _ from: UnsafePointer<T>) {
     self._rawValue = from._rawValue
   }
 
@@ -143,14 +157,14 @@ public struct OpaquePointer {
   ///
   /// The result is `nil` if `from` is `nil`.
   @_transparent
-  public init?<T>(_ from: UnsafePointer<T>?) {
+  public init?<T>(@_nonEphemeral _ from: UnsafePointer<T>?) {
     guard let unwrapped = from else { return nil }
     self.init(unwrapped)
   }
 
   /// Converts a typed `UnsafeMutablePointer` to an opaque C pointer.
   @_transparent
-  public init<T>(_ from: UnsafeMutablePointer<T>) {
+  public init<T>(@_nonEphemeral _ from: UnsafeMutablePointer<T>) {
     self._rawValue = from._rawValue
   }
 
@@ -158,7 +172,7 @@ public struct OpaquePointer {
   ///
   /// The result is `nil` if `from` is `nil`.
   @_transparent
-  public init?<T>(_ from: UnsafeMutablePointer<T>?) {
+  public init?<T>(@_nonEphemeral _ from: UnsafeMutablePointer<T>?) {
     guard let unwrapped = from else { return nil }
     self.init(unwrapped)
   }
@@ -183,7 +197,7 @@ extension OpaquePointer: Hashable {
   }
 }
 
-extension OpaquePointer : CustomDebugStringConvertible {
+extension OpaquePointer: CustomDebugStringConvertible {
   /// A textual representation of the pointer, suitable for debugging.
   public var debugDescription: String {
     return _rawPointerToString(_rawValue)
@@ -219,7 +233,40 @@ extension UInt {
 }
 
 /// A wrapper around a C `va_list` pointer.
-@_fixed_layout
+#if arch(arm64) && !(os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Windows))
+@frozen
+public struct CVaListPointer: Sendable {
+  @usableFromInline // unsafe-performance
+  internal var _value: (__stack: UnsafeMutablePointer<Int>?,
+                        __gr_top: UnsafeMutablePointer<Int>?,
+                        __vr_top: UnsafeMutablePointer<Int>?,
+                        __gr_off: Int32,
+                        __vr_off: Int32)
+
+  @inlinable // unsafe-performance
+  public // @testable
+  init(__stack: UnsafeMutablePointer<Int>?,
+       __gr_top: UnsafeMutablePointer<Int>?,
+       __vr_top: UnsafeMutablePointer<Int>?,
+       __gr_off: Int32,
+       __vr_off: Int32) {
+    _value = (__stack, __gr_top, __vr_top, __gr_off, __vr_off)
+  }
+}
+
+extension CVaListPointer: CustomDebugStringConvertible {
+  public var debugDescription: String {
+    return "(\(_value.__stack.debugDescription), " +
+           "\(_value.__gr_top.debugDescription), " +
+           "\(_value.__vr_top.debugDescription), " +
+           "\(_value.__gr_off), " +
+           "\(_value.__vr_off))"
+  }
+}
+
+#else
+
+@frozen
 public struct CVaListPointer {
   @usableFromInline // unsafe-performance
   internal var _value: UnsafeMutableRawPointer
@@ -231,13 +278,19 @@ public struct CVaListPointer {
   }
 }
 
-extension CVaListPointer : CustomDebugStringConvertible {
+extension CVaListPointer: CustomDebugStringConvertible {
   /// A textual representation of the pointer, suitable for debugging.
   public var debugDescription: String {
     return _value.debugDescription
   }
 }
 
+#endif
+
+/// Copy `size` bytes of memory from `src` into `dest`.
+///
+/// The memory regions `src..<src + size` and
+/// `dest..<dest + size` should not overlap.
 @inlinable
 internal func _memcpy(
   dest destination: UnsafeMutableRawPointer,
@@ -252,10 +305,10 @@ internal func _memcpy(
     /*volatile:*/ false._value)
 }
 
-/// Copy `count` bytes of memory from `src` into `dest`.
+/// Copy `size` bytes of memory from `src` into `dest`.
 ///
-/// The memory regions `source..<source + count` and
-/// `dest..<dest + count` may overlap.
+/// The memory regions `src..<src + size` and
+/// `dest..<dest + size` may overlap.
 @inlinable
 internal func _memmove(
   dest destination: UnsafeMutableRawPointer,

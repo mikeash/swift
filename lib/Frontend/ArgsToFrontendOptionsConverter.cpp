@@ -60,44 +60,100 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (const Arg *A = Args.getLastArg(OPT_index_store_path)) {
     Opts.IndexStorePath = A->getValue();
   }
-
+  if (const Arg *A = Args.getLastArg(OPT_prebuilt_module_cache_path)) {
+    Opts.PrebuiltModuleCachePath = A->getValue();
+  }
+  if (const Arg *A = Args.getLastArg(OPT_backup_module_interface_path)) {
+    Opts.BackupModuleInterfaceDir = A->getValue();
+  }
+  if (const Arg *A = Args.getLastArg(OPT_bridging_header_directory_for_print)) {
+    Opts.BridgingHeaderDirForPrint = A->getValue();
+  }
   Opts.IndexSystemModules |= Args.hasArg(OPT_index_system_modules);
+  Opts.IndexIgnoreStdlib |= Args.hasArg(OPT_index_ignore_stdlib);
 
   Opts.EmitVerboseSIL |= Args.hasArg(OPT_emit_verbose_sil);
   Opts.EmitSortedSIL |= Args.hasArg(OPT_emit_sorted_sil);
+  Opts.PrintFullConvention |=
+      Args.hasArg(OPT_experimental_print_full_convention);
 
   Opts.EnableTesting |= Args.hasArg(OPT_enable_testing);
-  Opts.EnableResilience |= Args.hasArg(OPT_enable_resilience);
+  Opts.EnablePrivateImports |= Args.hasArg(OPT_enable_private_imports);
+  Opts.EnableLibraryEvolution |= Args.hasArg(OPT_enable_library_evolution);
+  Opts.FrontendParseableOutput |= Args.hasArg(OPT_frontend_parseable_output);
 
-  Opts.TrackSystemDeps |= Args.hasArg(OPT_track_system_dependencies);
+  // FIXME: Remove this flag
+  Opts.EnableLibraryEvolution |= Args.hasArg(OPT_enable_resilience);
+
+  Opts.EnableImplicitDynamic |= Args.hasArg(OPT_enable_implicit_dynamic);
+
+  if (Args.hasArg(OPT_track_system_dependencies)) {
+    Opts.IntermoduleDependencyTracking =
+        IntermoduleDepTrackingMode::IncludeSystem;
+  }
+
+  if (const Arg *A = Args.getLastArg(OPT_bad_file_descriptor_retry_count)) {
+    unsigned limit;
+    if (StringRef(A->getValue()).getAsInteger(10, limit)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+      return true;
+    }
+    Opts.BadFileDescriptorRetryCount = limit;
+  }
+
+  if (auto A = Args.getLastArg(OPT_user_module_version)) {
+    StringRef raw(A->getValue());
+    while(raw.count('.') > 3) {
+      raw = raw.rsplit('.').first;
+    }
+    if (Opts.UserModuleVersion.tryParse(raw)) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+    }
+  }
+
+  Opts.DisableImplicitModules |= Args.hasArg(OPT_disable_implicit_swift_modules);
+
+  Opts.ImportPrescan |= Args.hasArg(OPT_import_prescan);
+
+  Opts.DisableCrossModuleIncrementalBuild |=
+      Args.hasArg(OPT_disable_incremental_imports);
+
+  // Always track system dependencies when scanning dependencies.
+  if (const Arg *ModeArg = Args.getLastArg(OPT_modes_Group)) {
+    if (ModeArg->getOption().matches(OPT_scan_dependencies)) {
+      Opts.IntermoduleDependencyTracking =
+          IntermoduleDepTrackingMode::IncludeSystem;
+    }
+  }
+
+  Opts.SerializeModuleInterfaceDependencyHashes |=
+    Args.hasArg(OPT_serialize_module_interface_dependency_hashes);
+
+  Opts.RemarkOnRebuildFromModuleInterface |=
+    Args.hasArg(OPT_Rmodule_interface_rebuild);
 
   computePrintStatsOptions();
   computeDebugTimeOptions();
   computeTBDOptions();
 
-  setUnsignedIntegerArgument(OPT_warn_long_function_bodies, 10,
-                             Opts.WarnLongFunctionBodies);
-  setUnsignedIntegerArgument(OPT_warn_long_expression_type_checking, 10,
-                             Opts.WarnLongExpressionTypeChecking);
-  setUnsignedIntegerArgument(OPT_solver_expression_time_threshold_EQ, 10,
-                             Opts.SolverExpressionTimeThreshold);
-  setUnsignedIntegerArgument(OPT_switch_checking_invocation_threshold_EQ, 10,
-                             Opts.SwitchCheckingInvocationThreshold);
-
-  Opts.DebuggerTestingTransform = Args.hasArg(OPT_debugger_testing_transform);
-
-  computePlaygroundOptions();
-
-  // This can be enabled independently of the playground transform.
-  Opts.PCMacro |= Args.hasArg(OPT_pc_macro);
+  Opts.CheckOnoneSupportCompleteness = Args.hasArg(OPT_check_onone_completeness);
 
   Opts.ParseStdlib |= Args.hasArg(OPT_parse_stdlib);
 
+  Opts.IgnoreSwiftSourceInfo |= Args.hasArg(OPT_ignore_module_source_info);
   computeHelpOptions();
+
+  if (Args.hasArg(OPT_print_target_info)) {
+    Opts.PrintTargetInfo = true;
+  }
 
   if (const Arg *A = Args.getLastArg(OPT_verify_generic_signatures)) {
     Opts.VerifyGenericSignaturesInModule = A->getValue();
   }
+
+  Opts.AllowModuleWithCompilerErrors |= Args.hasArg(OPT_experimental_allow_module_with_compiler_errors);
 
   computeDumpScopeMapLocations();
 
@@ -119,10 +175,32 @@ bool ArgsToFrontendOptionsConverter::convert(
   } else {
     HaveNewInputsAndOutputs = true;
     Opts.InputsAndOutputs = std::move(inputsAndOutputs).getValue();
+    if (Opts.AllowModuleWithCompilerErrors)
+      Opts.InputsAndOutputs.setShouldRecoverMissingInputs();
+  }
+
+  if (Args.hasArg(OPT_parse_sil) || Opts.InputsAndOutputs.shouldTreatAsSIL()) {
+    Opts.InputMode = FrontendOptions::ParseInputMode::SIL;
+  } else if (Opts.InputsAndOutputs.shouldTreatAsModuleInterface()) {
+    Opts.InputMode = FrontendOptions::ParseInputMode::SwiftModuleInterface;
+  } else if (Args.hasArg(OPT_parse_as_library)) {
+    Opts.InputMode = FrontendOptions::ParseInputMode::SwiftLibrary;
+  } else {
+    Opts.InputMode = FrontendOptions::ParseInputMode::Swift;
   }
 
   if (Opts.RequestedAction == FrontendOptions::ActionType::NoneAction) {
     Opts.RequestedAction = determineRequestedAction(Args);
+  }
+
+  if (Opts.RequestedAction == FrontendOptions::ActionType::CompileModuleFromInterface ||
+      Opts.RequestedAction == FrontendOptions::ActionType::TypecheckModuleFromInterface) {
+    // The situations where we use this action, e.g. explicit module building and
+    // generating prebuilt module cache, don't need synchronization. We should avoid
+    // using lock files for them.
+    Opts.DisableInterfaceFileLock = true;
+  } else {
+    Opts.DisableInterfaceFileLock |= Args.hasArg(OPT_disable_interface_lockfile);
   }
 
   if (Opts.RequestedAction == FrontendOptions::ActionType::Immediate &&
@@ -131,7 +209,7 @@ bool ArgsToFrontendOptionsConverter::convert(
     return true;
   }
 
-  if (setUpInputKindAndImmediateArgs())
+  if (setUpImmediateArgs())
     return true;
 
   if (computeModuleName())
@@ -144,21 +222,50 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (checkUnusedSupplementaryOutputPaths())
     return true;
 
+  if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction) &&
+      (Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies) ||
+       Args.hasArg(OPT_experimental_skip_all_function_bodies) ||
+       Args.hasArg(
+         OPT_experimental_skip_non_inlinable_function_bodies_without_types))) {
+    Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_skipping_function_bodies);
+    return true;
+  }
+
+  if (const Arg *A = Args.getLastArg(OPT_module_abi_name))
+    Opts.ModuleABIName = A->getValue();
+
   if (const Arg *A = Args.getLastArg(OPT_module_link_name))
     Opts.ModuleLinkName = A->getValue();
 
-  Opts.AlwaysSerializeDebuggingOptions |=
-      Args.hasArg(OPT_serialize_debugging_options);
+  if (const Arg *A = Args.getLastArg(OPT_access_notes_path))
+    Opts.AccessNotesPath = A->getValue();
+
+  if (const Arg *A = Args.getLastArg(OPT_serialize_debugging_options,
+                                     OPT_no_serialize_debugging_options)) {
+    Opts.SerializeOptionsForDebugging =
+        A->getOption().matches(OPT_serialize_debugging_options);
+  }
+
   Opts.EnableSourceImport |= Args.hasArg(OPT_enable_source_import);
   Opts.ImportUnderlyingModule |= Args.hasArg(OPT_import_underlying_module);
-  Opts.EnableParseableModuleInterface |=
-      Args.hasArg(OPT_enable_parseable_module_interface);
-  Opts.EnableSerializationNestedTypeLookupTable &=
-      !Args.hasArg(OPT_disable_serialization_nested_type_lookup_table);
+  Opts.EnableIncrementalDependencyVerifier |= Args.hasArg(OPT_verify_incremental_dependencies);
+  Opts.UseSharedResourceFolder = !Args.hasArg(OPT_use_static_resource_dir);
+  Opts.DisableBuildingInterface = Args.hasArg(OPT_disable_building_interface);
 
   computeImportObjCHeaderOptions();
-  computeImplicitImportModuleNames();
+  computeImplicitImportModuleNames(OPT_import_module, /*isTestable=*/false);
+  computeImplicitImportModuleNames(OPT_testable_import_module, /*isTestable=*/true);
   computeLLVMArgs();
+
+  Opts.EmitSymbolGraph |= Args.hasArg(OPT_emit_symbol_graph);
+  
+  if (const Arg *A = Args.getLastArg(OPT_emit_symbol_graph_dir)) {
+    Opts.SymbolGraphOutputDir = A->getValue();
+  }
+  
+  Opts.SkipInheritedDocs = Args.hasArg(OPT_skip_inherited_docs);
+
+  Opts.Static = Args.hasArg(OPT_static);
 
   return false;
 }
@@ -196,10 +303,6 @@ void ArgsToFrontendOptionsConverter::computePrintStatsOptions() {
 
 void ArgsToFrontendOptionsConverter::computeDebugTimeOptions() {
   using namespace options;
-  Opts.DebugTimeFunctionBodies |= Args.hasArg(OPT_debug_time_function_bodies);
-  Opts.DebugTimeExpressionTypeChecking |=
-      Args.hasArg(OPT_debug_time_expression_type_checking);
-  Opts.DebugTimeCompilation |= Args.hasArg(OPT_debug_time_compilation);
   if (const Arg *A = Args.getLastArg(OPT_stats_output_dir)) {
     Opts.StatsOutputDir = A->getValue();
     if (Args.getLastArg(OPT_trace_stats_events)) {
@@ -230,28 +333,6 @@ void ArgsToFrontendOptionsConverter::computeTBDOptions() {
                      A->getOption().getPrefixedName(), value);
     }
   }
-}
-
-void ArgsToFrontendOptionsConverter::setUnsignedIntegerArgument(
-    options::ID optionID, unsigned radix, unsigned &valueToSet) {
-  if (const Arg *A = Args.getLastArg(optionID)) {
-    unsigned attempt;
-    if (StringRef(A->getValue()).getAsInteger(radix, attempt)) {
-      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
-                     A->getAsString(Args), A->getValue());
-    } else {
-      valueToSet = attempt;
-    }
-  }
-}
-
-void ArgsToFrontendOptionsConverter::computePlaygroundOptions() {
-  using namespace options;
-  Opts.PlaygroundTransform |= Args.hasArg(OPT_playground);
-  if (Args.hasArg(OPT_disable_playground_transform))
-    Opts.PlaygroundTransform = false;
-  Opts.PlaygroundHighPerformance |=
-      Args.hasArg(OPT_playground_high_performance);
 }
 
 void ArgsToFrontendOptionsConverter::computeHelpOptions() {
@@ -312,6 +393,10 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
       // (Setting up module output will be handled below.)
       return FrontendOptions::ActionType::EmitModuleOnly;
     }
+
+    if (args.hasArg(OPT_version))
+      return FrontendOptions::ActionType::PrintVersion;
+
     return FrontendOptions::ActionType::NoneAction;
   }
   Option Opt = A->getOption();
@@ -319,6 +404,8 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::EmitObject;
   if (Opt.matches(OPT_emit_assembly))
     return FrontendOptions::ActionType::EmitAssembly;
+  if (Opt.matches(OPT_emit_irgen))
+    return FrontendOptions::ActionType::EmitIRGen;
   if (Opt.matches(OPT_emit_ir))
     return FrontendOptions::ActionType::EmitIR;
   if (Opt.matches(OPT_emit_bc))
@@ -335,6 +422,8 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::EmitPCH;
   if (Opt.matches(OPT_emit_imported_modules))
     return FrontendOptions::ActionType::EmitImportedModules;
+  if (Opt.matches(OPT_scan_dependencies))
+    return FrontendOptions::ActionType::ScanDependencies;
   if (Opt.matches(OPT_parse))
     return FrontendOptions::ActionType::Parse;
   if (Opt.matches(OPT_resolve_imports))
@@ -359,16 +448,25 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::DumpTypeInfo;
   if (Opt.matches(OPT_print_ast))
     return FrontendOptions::ActionType::PrintAST;
+  if (Opt.matches(OPT_emit_pcm))
+    return FrontendOptions::ActionType::EmitPCM;
+  if (Opt.matches(OPT_dump_pcm))
+    return FrontendOptions::ActionType::DumpPCM;
 
   if (Opt.matches(OPT_repl) || Opt.matches(OPT_deprecated_integrated_repl))
     return FrontendOptions::ActionType::REPL;
   if (Opt.matches(OPT_interpret))
     return FrontendOptions::ActionType::Immediate;
-
+  if (Opt.matches(OPT_compile_module_from_interface))
+    return FrontendOptions::ActionType::CompileModuleFromInterface;
+  if (Opt.matches(OPT_typecheck_module_from_interface))
+    return FrontendOptions::ActionType::TypecheckModuleFromInterface;
+  if (Opt.matches(OPT_emit_supported_features))
+    return FrontendOptions::ActionType::PrintFeature;
   llvm_unreachable("Unhandled mode option");
 }
 
-bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
+bool ArgsToFrontendOptionsConverter::setUpImmediateArgs() {
   using namespace options;
   bool treatAsSIL =
       Args.hasArg(OPT_parse_sil) || Opts.InputsAndOutputs.shouldTreatAsSIL();
@@ -376,7 +474,7 @@ bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
   if (Opts.InputsAndOutputs.verifyInputs(
           Diags, treatAsSIL,
           Opts.RequestedAction == FrontendOptions::ActionType::REPL,
-          Opts.RequestedAction == FrontendOptions::ActionType::NoneAction)) {
+          !FrontendOptions::doesActionRequireInputs(Opts.RequestedAction))) {
     return true;
   }
   if (Opts.RequestedAction == FrontendOptions::ActionType::Immediate) {
@@ -388,19 +486,6 @@ bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
       }
     }
   }
-
-  if (treatAsSIL)
-    Opts.InputKind = InputFileKind::SIL;
-  else if (Opts.InputsAndOutputs.shouldTreatAsLLVM())
-    Opts.InputKind = InputFileKind::LLVM;
-  else if (Opts.InputsAndOutputs.shouldTreatAsModuleInterface())
-    Opts.InputKind = InputFileKind::SwiftModuleInterface;
-  else if (Args.hasArg(OPT_parse_as_library))
-    Opts.InputKind = InputFileKind::SwiftLibrary;
-  else if (Opts.RequestedAction == FrontendOptions::ActionType::REPL)
-    Opts.InputKind = InputFileKind::SwiftREPL;
-  else
-    Opts.InputKind = InputFileKind::Swift;
 
   return false;
 }
@@ -445,15 +530,15 @@ bool ArgsToFrontendOptionsConverter::computeFallbackModuleName() {
   }
   // In order to pass some tests, must leave ModuleName empty.
   if (!Opts.InputsAndOutputs.hasInputs()) {
-    Opts.ModuleName = StringRef();
+    Opts.ModuleName = std::string();
     // FIXME: This is a bug that should not happen, but does in tests.
     // The compiler should bail out earlier, where "no frontend action was
     // selected".
     return false;
   }
   Optional<std::vector<std::string>> outputFilenames =
-      OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(Args,
-                                                                       Diags);
+      OutputFilesComputer::getOutputFilenamesFromCommandLineOrFilelist(
+        Args, Diags, options::OPT_o, options::OPT_output_filelist);
 
   std::string nameToStem =
       outputFilenames && outputFilenames->size() == 1 &&
@@ -462,21 +547,24 @@ bool ArgsToFrontendOptionsConverter::computeFallbackModuleName() {
           ? outputFilenames->front()
           : Opts.InputsAndOutputs.getFilenameOfFirstInput();
 
-  Opts.ModuleName = llvm::sys::path::stem(nameToStem);
+  Opts.ModuleName = llvm::sys::path::stem(nameToStem).str();
   return false;
 }
 
 bool ArgsToFrontendOptionsConverter::
     computeMainAndSupplementaryOutputFilenames() {
   std::vector<std::string> mainOutputs;
+  std::vector<std::string> mainOutputForIndexUnits;
   std::vector<SupplementaryOutputPaths> supplementaryOutputs;
   const bool hadError = ArgsToFrontendOutputsConverter(
                             Args, Opts.ModuleName, Opts.InputsAndOutputs, Diags)
-                            .convert(mainOutputs, supplementaryOutputs);
+                            .convert(mainOutputs, mainOutputForIndexUnits,
+                                     supplementaryOutputs);
   if (hadError)
     return true;
   Opts.InputsAndOutputs.setMainAndSupplementaryOutputs(mainOutputs,
-                                                       supplementaryOutputs);
+                                                       supplementaryOutputs,
+                                                       mainOutputForIndexUnits);
   return false;
 }
 
@@ -514,9 +602,26 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_module_doc);
     return true;
   }
+  // If we cannot emit module doc, we cannot emit source information file either.
+  if (!FrontendOptions::canActionEmitModuleDoc(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasModuleSourceInfoOutputPath()) {
+     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_module_source_info);
+     return true;
+   }
   if (!FrontendOptions::canActionEmitInterface(Opts.RequestedAction) &&
-      Opts.InputsAndOutputs.hasParseableInterfaceOutputPath()) {
+      (Opts.InputsAndOutputs.hasModuleInterfaceOutputPath() ||
+       Opts.InputsAndOutputs.hasPrivateModuleInterfaceOutputPath())) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_interface);
+    return true;
+  }
+  if (!FrontendOptions::canActionEmitModuleSummary(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasModuleSummaryOutputPath()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_module_summary);
+    return true;
+  }
+  if (!FrontendOptions::canActionEmitModule(Opts.RequestedAction) &&
+      !Opts.SymbolGraphOutputDir.empty()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_symbol_graph);
     return true;
   }
   return false;
@@ -529,10 +634,17 @@ void ArgsToFrontendOptionsConverter::computeImportObjCHeaderOptions() {
     Opts.SerializeBridgingHeader |= !Opts.InputsAndOutputs.hasPrimaryInputs();
   }
 }
-void ArgsToFrontendOptionsConverter::computeImplicitImportModuleNames() {
+void ArgsToFrontendOptionsConverter::
+computeImplicitImportModuleNames(OptSpecifier id, bool isTestable) {
   using namespace options;
-  for (const Arg *A : Args.filtered(OPT_import_module)) {
-    Opts.ImplicitImportModuleNames.push_back(A->getValue());
+  for (const Arg *A : Args.filtered(id)) {
+    auto *moduleStr = A->getValue();
+    if (!Lexer::isIdentifier(moduleStr)) {
+      Diags.diagnose(SourceLoc(), diag::error_bad_module_name, moduleStr,
+                     /*suggestModuleNameFlag*/ false);
+      continue;
+    }
+    Opts.ImplicitImportModuleNames.emplace_back(moduleStr, isTestable);
   }
 }
 void ArgsToFrontendOptionsConverter::computeLLVMArgs() {

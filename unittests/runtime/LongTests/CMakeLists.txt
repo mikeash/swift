@@ -16,15 +16,22 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
 #      ${FOUNDATION_LIBRARY}
 #      swiftStdlibUnittest${SWIFT_PRIMARY_VARIANT_SUFFIX}
 #      )
+
+    # Link the Objective-C runtime.
+    list(APPEND PLATFORM_TARGET_LINK_LIBRARIES "objc")
   elseif(SWIFT_HOST_VARIANT STREQUAL "linux")
-    list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
-      "atomic"
-      )
+    if(SWIFT_HOST_VARIANT_ARCH MATCHES "armv6|armv7|i686")
+      list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
+        "atomic"
+        )
+    endif()
   elseif(SWIFT_HOST_VARIANT STREQUAL "freebsd")
     find_library(EXECINFO_LIBRARY execinfo)
     list(APPEND PLATFORM_TARGET_LINK_LIBRARIES
       ${EXECINFO_LIBRARY}
       )
+  elseif(SWIFT_HOST_VARIANT STREQUAL windows)
+    list(APPEND PLATFORM_TARGET_LINK_LIBRARIES DbgHelp)
   endif()
 
   add_swift_unittest(SwiftRuntimeLongTests
@@ -36,6 +43,8 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
     # from the swiftCore dylib, so we need to link to both the runtime archive
     # and the stdlib.
     $<TARGET_OBJECTS:swiftRuntime${SWIFT_PRIMARY_VARIANT_SUFFIX}>
+    $<TARGET_OBJECTS:swiftLLVMSupport${SWIFT_PRIMARY_VARIANT_SUFFIX}>
+    $<TARGET_OBJECTS:swiftDemangling${SWIFT_PRIMARY_VARIANT_SUFFIX}>
     )
 
   # The local stdlib implementation provides definitions of the swiftCore
@@ -44,7 +53,8 @@ if(("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "${SWIFT_PRIMARY_VARIANT_SDK}") AND
   # interfaces.
   target_compile_definitions(SwiftRuntimeLongTests
                              PRIVATE
-                               swiftCore_EXPORTS)
+                               swiftCore_EXPORTS
+                               SWIFT_INLINE_NAMESPACE=__runtime)
 
   # FIXME: cross-compile for all variants.
   target_link_libraries(SwiftRuntimeLongTests

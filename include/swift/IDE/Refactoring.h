@@ -81,13 +81,14 @@ enum class RenameAvailableKind {
   Unavailable_decl_from_clang,
 };
 
-struct RenameAvailabiliyInfo {
+struct RenameAvailabilityInfo {
   RefactoringKind Kind;
   RenameAvailableKind AvailableKind;
-  RenameAvailabiliyInfo(RefactoringKind Kind, RenameAvailableKind AvailableKind) :
-    Kind(Kind), AvailableKind(AvailableKind) {}
-  RenameAvailabiliyInfo(RefactoringKind Kind) :
-    RenameAvailabiliyInfo(Kind, RenameAvailableKind::Available) {}
+  RenameAvailabilityInfo(RefactoringKind Kind,
+                         RenameAvailableKind AvailableKind)
+      : Kind(Kind), AvailableKind(AvailableKind) {}
+  RenameAvailabilityInfo(RefactoringKind Kind)
+      : RenameAvailabilityInfo(Kind, RenameAvailableKind::Available) {}
 };
 
 class FindRenameRangesConsumer {
@@ -130,20 +131,26 @@ int findLocalRenameRanges(SourceFile *SF, RangeConfig Range,
                           FindRenameRangesConsumer &RenameConsumer,
                           DiagnosticConsumer &DiagConsumer);
 
-ArrayRef<RefactoringKind>
-collectAvailableRefactorings(SourceFile *SF, RangeConfig Range,
-                             bool &RangeStartMayNeedRename,
-                             std::vector<RefactoringKind> &Scratch,
-                             llvm::ArrayRef<DiagnosticConsumer*> DiagConsumers);
+void collectAvailableRefactorings(
+    SourceFile *SF, RangeConfig Range, bool &RangeStartMayNeedRename,
+    llvm::SmallVectorImpl<RefactoringKind> &Kinds,
+    llvm::ArrayRef<DiagnosticConsumer *> DiagConsumers);
 
-ArrayRef<RefactoringKind>
-collectAvailableRefactorings(SourceFile *SF, ResolvedCursorInfo CursorInfo,
-                             std::vector<RefactoringKind> &Scratch,
-                             bool ExcludeRename);
+void collectAvailableRefactorings(const ResolvedCursorInfo &CursorInfo,
+                                  llvm::SmallVectorImpl<RefactoringKind> &Kinds,
+                                  bool ExcludeRename);
 
-ArrayRef<RenameAvailabiliyInfo>
-collectRenameAvailabilityInfo(const ValueDecl *VD,
-                              std::vector<RenameAvailabiliyInfo> &Scratch);
+/// Stores information about the reference that rename availability is being
+/// queried on.
+struct RenameRefInfo {
+  SourceFile *SF; ///< The source file containing the reference.
+  SourceLoc Loc; ///< The reference's source location.
+  bool IsArgLabel; ///< Whether Loc is on an arg label, rather than base name.
+};
+
+void collectRenameAvailabilityInfo(
+    const ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
+    llvm::SmallVectorImpl<RenameAvailabilityInfo> &Infos);
 
 } // namespace ide
 } // namespace swift

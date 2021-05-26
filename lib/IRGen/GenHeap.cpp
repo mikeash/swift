@@ -17,6 +17,7 @@
 
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/Path.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -27,10 +28,12 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/SIL/SILModule.h"
 
 #include "ConstantBuilder.h"
 #include "Explosion.h"
 #include "GenClass.h"
+#include "GenPointerAuth.h"
 #include "GenProto.h"
 #include "GenType.h"
 #include "IRGenDebugInfo.h"
@@ -52,6 +55,10 @@ namespace {
                                 FixedTypeInfo> { \
     llvm::PointerIntPair<llvm::Type*, 1, bool> ValueTypeAndIsOptional; \
   public: \
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM, \
+                                        SILType T) const override { \
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T); \
+    } \
     Nativeness##Name##ReferenceTypeInfo(llvm::Type *valueType, \
                                     llvm::Type *type, \
                                     Size size, Alignment alignment, \
@@ -136,6 +143,10 @@ namespace {
                              alignment, IsNotPOD, IsFixedSize), \
         ValueTypeAndIsOptional(valueType, isOptional) {} \
     enum { IsScalarPOD = false }; \
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,                    \
+                                          SILType T) const override {          \
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);             \
+    } \
     llvm::Type *getScalarType() const { \
       return ValueTypeAndIsOptional.getPointer(); \
     } \
@@ -246,18 +257,19 @@ HeapLayout::HeapLayout(IRGenModule &IGM, LayoutStrategy strategy,
                        ArrayRef<SILType> fieldTypes,
                        ArrayRef<const TypeInfo *> fieldTypeInfos,
                        llvm::StructType *typeToFill,
-                       NecessaryBindings &&bindings)
-  : StructLayout(IGM, /*decl=*/nullptr, LayoutKind::HeapObject, strategy,
-                 fieldTypeInfos, typeToFill),
-    ElementTypes(fieldTypes.begin(), fieldTypes.end()),
-    Bindings(std::move(bindings))
-{
+                       NecessaryBindings &&bindings, unsigned bindingsIndex)
+    : StructLayout(IGM, /*decl=*/nullptr, LayoutKind::HeapObject, strategy,
+                   fieldTypeInfos, typeToFill),
+      ElementTypes(fieldTypes.begin(), fieldTypes.end()),
+      Bindings(std::move(bindings)), BindingsIndex(bindingsIndex) {
 #ifndef NDEBUG
   assert(fieldTypeInfos.size() == fieldTypes.size()
          && "type infos don't match types");
   if (!Bindings.empty()) {
-    assert(fieldTypeInfos.size() >= 1 && "no field for bindings");
-    auto fixedBindingsField = dyn_cast<FixedTypeInfo>(fieldTypeInfos[0]);
+    assert(fieldTypeInfos.size() >= (bindingsIndex + 1) &&
+           "no field for bindings");
+    auto fixedBindingsField =
+        dyn_cast<FixedTypeInfo>(fieldTypeInfos[bindingsIndex]);
     assert(fixedBindingsField
            && "bindings field is not fixed size");
     assert(fixedBindingsField->getFixedSize()
@@ -274,14 +286,14 @@ static llvm::Value *calcInitOffset(swift::irgen::IRGenFunction &IGF,
                                    const swift::irgen::HeapLayout &layout) {
   llvm::Value *offset = nullptr;
   if (i == 0) {
-    auto startoffset = layout.getSize();
-    offset = llvm::ConstantInt::get(IGF.IGM.SizeTy, startoffset.getValue());
+    auto startOffset = layout.getHeaderSize();
+    offset = llvm::ConstantInt::get(IGF.IGM.SizeTy, startOffset.getValue());
     return offset;
   }
   auto &prevElt = layout.getElement(i - 1);
   auto prevType = layout.getElementTypes()[i - 1];
   // Start calculating offsets from the last fixed-offset field.
-  Size lastFixedOffset = layout.getElement(i - 1).getByteOffset();
+  Size lastFixedOffset = layout.getElement(i - 1).getByteOffsetDuringLayout();
   if (auto *fixedType = dyn_cast<FixedTypeInfo>(&prevElt.getType())) {
     // If the last fixed-offset field is also fixed-size, we can
     // statically compute the end of the fixed-offset fields.
@@ -315,6 +327,7 @@ HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
                                     elt.getType().getAlignmentMask(IGF, eltTy));
         LLVM_FALLTHROUGH;
       case ElementLayout::Kind::Empty:
+      case ElementLayout::Kind::EmptyTailAllocatedCType:
       case ElementLayout::Kind::Fixed:
         // Don't need to dynamically calculate this offset.
         Offsets.push_back(nullptr);
@@ -413,7 +426,8 @@ static llvm::Function *createDtorFn(IRGenModule &IGM,
   if (layout.hasBindings()) {
     // The type metadata bindings should be at a fixed offset, so we can pass
     // None for NonFixedOffsets. If we didn't, we'd have a chicken-egg problem.
-    auto bindingsAddr = layout.getElement(0).project(IGF, structAddr, None);
+    auto bindingsAddr = layout.getElement(layout.getBindingsIndex())
+                            .project(IGF, structAddr, None);
     layout.getBindings().restore(IGF, bindingsAddr, MetadataState::Complete);
   }
 
@@ -470,7 +484,8 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
   ConstantInitBuilder builder(IGM);
   auto fields = builder.beginStruct(IGM.FullBoxMetadataStructTy);
 
-  fields.add(dtorFn);
+  fields.addSignedPointer(dtorFn, IGM.getOptions().PointerAuth.HeapDestructors,
+                          PointerAuthEntity::Special::HeapDestructor);
   fields.addNullPointer(IGM.WitnessTablePtrTy);
   {
     auto kindStruct = fields.beginStruct(IGM.TypeMetadataStructTy);
@@ -1076,7 +1091,7 @@ RESULT IRGenFunction::emit##KIND(TYPE1 val1, ReferenceCounting style) {        \
   llvm_unreachable("bad refcounting style");                                   \
 }
 
-#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+#define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
   DEFINE_BINARY_OPERATION(Name##CopyInit, void, Address, Address) \
   DEFINE_BINARY_OPERATION(Name##TakeInit, void, Address, Address) \
   DEFINE_BINARY_OPERATION(Name##CopyAssign, void, Address, Address) \
@@ -1086,8 +1101,6 @@ RESULT IRGenFunction::emit##KIND(TYPE1 val1, ReferenceCounting style) {        \
   DEFINE_BINARY_OPERATION(Name##LoadStrong, llvm::Value *, Address,llvm::Type*)\
   DEFINE_BINARY_OPERATION(Name##TakeStrong, llvm::Value *, Address,llvm::Type*)\
   DEFINE_UNARY_OPERATION(Name##Destroy, void, Address)
-#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
-  NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
 #include "swift/AST/ReferenceStorage.def"
 
 
@@ -1228,11 +1241,37 @@ llvm::Constant *IRGenModule::getFixLifetimeFn() {
                             llvm::Attribute::NoInline);
 
   // Give the function an empty body.
-  auto entry = llvm::BasicBlock::Create(LLVMContext, "", fixLifetime);
-  llvm::ReturnInst::Create(LLVMContext, entry);
+  auto entry = llvm::BasicBlock::Create(getLLVMContext(), "", fixLifetime);
+  llvm::ReturnInst::Create(getLLVMContext(), entry);
   
   FixLifetimeFn = fixLifetime;
   return fixLifetime;
+}
+
+llvm::Constant *IRGenModule::getFixedClassInitializationFn() {
+  if (FixedClassInitializationFn)
+    return *FixedClassInitializationFn;
+  
+  // If ObjC interop is disabled, we don't need to do fixed class
+  // initialization.
+  llvm::Constant *fn;
+  if (!ObjCInterop) {
+    fn = nullptr;
+  } else {
+    // In new enough ObjC runtimes, objc_opt_self provides a direct fast path
+    // to realize a class.
+    if (getAvailabilityContext()
+         .isContainedIn(Context.getSwift51Availability())) {
+      fn = getObjCOptSelfFn();
+    }
+    // Otherwise, the Swift runtime always provides a `get
+    else {
+      fn = getGetInitializedObjCClassFn();
+    }
+  }
+  
+  FixedClassInitializationFn = fn;
+  return fn;
 }
 
 /// Fix the lifetime of a live value. This communicates to the LLVM level ARC
@@ -1330,11 +1369,16 @@ emitIsUniqueCall(llvm::Value *value, SourceLoc loc, bool isNonNull) {
 llvm::Value *IRGenFunction::emitIsEscapingClosureCall(
     llvm::Value *value, SourceLoc sourceLoc, unsigned verificationType) {
   auto loc = SILLocation::decode(sourceLoc, IGM.Context.SourceMgr);
-  auto line = llvm::ConstantInt::get(IGM.Int32Ty, loc.Line);
-  auto col = llvm::ConstantInt::get(IGM.Int32Ty, loc.Column);
-  auto filename = IGM.getAddrOfGlobalString(loc.Filename);
+  auto line = llvm::ConstantInt::get(IGM.Int32Ty, loc.line);
+  auto col = llvm::ConstantInt::get(IGM.Int32Ty, loc.column);
+
+  // Only output the filepath in debug mode. It is going to leak into the
+  // executable. This is the same behavior as asserts.
+  auto filename = IGM.IRGen.Opts.shouldOptimize()
+                      ? IGM.getAddrOfGlobalString("")
+                      : IGM.getAddrOfGlobalString(loc.filename);
   auto filenameLength =
-      llvm::ConstantInt::get(IGM.Int32Ty, loc.Filename.size());
+      llvm::ConstantInt::get(IGM.Int32Ty, loc.filename.size());
   auto type = llvm::ConstantInt::get(IGM.Int32Ty, verificationType);
   llvm::CallInst *call =
       Builder.CreateCall(IGM.getIsEscapingClosureAtFileLocationFn(),
@@ -1453,7 +1497,9 @@ public:
     }
 
     auto boxDescriptor = IGF.IGM.getAddrOfBoxDescriptor(
-        boxedInterfaceType.getASTType());
+        boxedInterfaceType,
+        env ? env->getGenericSignature().getCanonicalSignature()
+            : CanGenericSignature());
     llvm::Value *allocation = IGF.emitUnmanagedAlloc(layout, name,
                                                      boxDescriptor);
     Address rawAddr = project(IGF, allocation, boxedType);
@@ -1520,8 +1566,8 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // TODO: Multi-field boxes
   assert(T->getLayout()->getFields().size() == 1
          && "multi-field boxes not implemented yet");
-  auto &eltTI = IGM.getTypeInfoForLowered(
-    T->getFieldLoweredType(IGM.getSILModule(), 0));
+  auto &eltTI = IGM.getTypeInfoForLowered(getSILBoxFieldLoweredType(
+      IGM.getMaximalTypeExpansionContext(), T, IGM.getSILModule().Types, 0));
   if (!eltTI.isFixedSize()) {
     if (!NonFixedBoxTI)
       NonFixedBoxTI = new NonFixedBoxTypeInfo(IGM);
@@ -1569,7 +1615,9 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // Produce a tailored box metadata for the type.
   assert(T->getLayout()->getFields().size() == 1
          && "multi-field boxes not implemented yet");
-  return new FixedBoxTypeInfo(IGM, T->getFieldType(IGM.getSILModule(), 0));
+  return new FixedBoxTypeInfo(
+      IGM, getSILBoxFieldType(IGM.getMaximalTypeExpansionContext(),
+                              T, IGM.getSILModule().Types, 0));
 }
 
 OwnedAddress
@@ -1579,9 +1627,12 @@ irgen::emitAllocateBox(IRGenFunction &IGF, CanSILBoxType boxType,
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
   assert(boxType->getLayout()->getFields().size() == 1
          && "multi-field boxes not implemented yet");
-  return boxTI.allocate(IGF,
-                      boxType->getFieldType(IGF.IGM.getSILModule(), 0), env,
-                      name);
+  return boxTI.allocate(
+      IGF,
+      getSILBoxFieldType(
+          IGF.IGM.getMaximalTypeExpansionContext(),
+          boxType, IGF.IGM.getSILModule().Types, 0),
+      env, name);
 }
 
 void irgen::emitDeallocateBox(IRGenFunction &IGF,
@@ -1590,8 +1641,10 @@ void irgen::emitDeallocateBox(IRGenFunction &IGF,
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
   assert(boxType->getLayout()->getFields().size() == 1
          && "multi-field boxes not implemented yet");
-  return boxTI.deallocate(IGF, box,
-                          boxType->getFieldType(IGF.IGM.getSILModule(), 0));
+  return boxTI.deallocate(
+      IGF, box,
+      getSILBoxFieldType(IGF.IGM.getMaximalTypeExpansionContext(), boxType,
+                         IGF.IGM.getSILModule().Types, 0));
 }
 
 Address irgen::emitProjectBox(IRGenFunction &IGF,
@@ -1600,8 +1653,10 @@ Address irgen::emitProjectBox(IRGenFunction &IGF,
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
   assert(boxType->getLayout()->getFields().size() == 1
          && "multi-field boxes not implemented yet");
-  return boxTI.project(IGF, box,
-                       boxType->getFieldType(IGF.IGM.getSILModule(), 0));
+  return boxTI.project(
+      IGF, box,
+      getSILBoxFieldType(IGF.IGM.getMaximalTypeExpansionContext(), boxType,
+                         IGF.IGM.getSILModule().Types, 0));
 }
 
 Address irgen::emitAllocateExistentialBoxInBuffer(
@@ -1678,19 +1733,50 @@ void IRGenFunction::emit##ID(llvm::Value *value, Address src) {       \
 #undef DEFINE_STORE_WEAK_OP
 #undef NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE_HELPER
 
-llvm::Value *IRGenFunction::getLocalSelfMetadata() {
-  assert(LocalSelf && "no local self metadata");
+llvm::Value *IRGenFunction::getDynamicSelfMetadata() {
+  assert(SelfValue && "no local self metadata");
+
+  // If we already have a metatype, just return it.
+  if (SelfKind == SwiftMetatype)
+    return SelfValue;
+
+  // We need to materialize a metatype. Emit the code for that once at the
+  // top of the function and cache the result.
+
+  // This is a slight optimization in the case of repeated access, but also
+  // needed for correctness; when an @objc convenience initializer replaces
+  // the 'self' value, we don't keep track of what the new 'self' value is
+  // in IRGen, so we can't just grab the first function argument and assume
+  // it's a valid 'self' at the point where DynamicSelfType metadata is needed.
+
+  // Note that if DynamicSelfType was modeled properly as an opened archetype,
+  // none of this would be an issue since it would be always be associated
+  // with the correct value.
+
+  llvm::IRBuilderBase::InsertPointGuard guard(Builder);
+  auto insertPt = isa<llvm::Instruction>(SelfValue)
+                      ? std::next(llvm::BasicBlock::iterator(
+                            cast<llvm::Instruction>(SelfValue)))
+                      : CurFn->getEntryBlock().begin();
+  Builder.SetInsertPoint(&CurFn->getEntryBlock(), insertPt);
+
   switch (SelfKind) {
   case SwiftMetatype:
-    return LocalSelf;
+    llvm_unreachable("Already handled");
   case ObjCMetatype:
-    return emitObjCMetadataRefForMetadata(*this, LocalSelf);
+    SelfValue = emitObjCMetadataRefForMetadata(*this, SelfValue);
+    SelfKind = SwiftMetatype;
+    break;
   case ObjectReference:
-    return emitDynamicTypeOfOpaqueHeapObject(*this, LocalSelf,
-                                             MetatypeRepresentation::Thick);
+    SelfValue = emitDynamicTypeOfHeapObject(*this, SelfValue,
+                                MetatypeRepresentation::Thick,
+                                SILType::getPrimitiveObjectType(SelfType),
+                                /*allow artificial*/ false);
+    SelfKind = SwiftMetatype;
+    break;
   }
 
-  llvm_unreachable("Not a valid LocalSelfKind.");
+  return SelfValue;
 }
 
 /// Given a non-tagged object pointer, load a pointer to its class object.
@@ -1806,9 +1892,25 @@ llvm::Value *irgen::emitHeapMetadataRefForHeapObject(IRGenFunction &IGF,
 
 /// Given an opaque class instance pointer, produce the type metadata reference
 /// as a %type*.
-llvm::Value *irgen::emitDynamicTypeOfOpaqueHeapObject(IRGenFunction &IGF,
+///
+/// You should only use this if you have an untyped object pointer with absolutely no type information.
+/// Generally, it's better to use \c emitDynamicTypeOfHeapObject, which will
+/// use the most efficient possible access pattern to get the dynamic type based on
+/// the static type information.
+static llvm::Value *emitDynamicTypeOfOpaqueHeapObject(IRGenFunction &IGF,
                                                   llvm::Value *object,
                                                   MetatypeRepresentation repr) {
+  if (!IGF.IGM.ObjCInterop) {
+    // Without objc interop, getting the dynamic type of an object is always
+    // just a load of the isa pointer.
+
+    assert(repr == MetatypeRepresentation::Thick
+           && "objc metatypes should not occur without objc interop, "
+              "and thin metadata should not be requested here");
+    return emitLoadOfHeapMetadataRef(IGF, object, IsaEncoding::Pointer,
+                                     /*suppressCast*/ false);
+  }
+  
   object = IGF.Builder.CreateBitCast(object, IGF.IGM.ObjCPtrTy);
   llvm::CallInst *metadata;
   
@@ -1879,14 +1981,6 @@ llvm::Value *irgen::emitDynamicTypeOfHeapObject(IRGenFunction &IGF,
   llvm_unreachable("unhandled ISA encoding");
 }
 
-static ClassDecl *getRootClass(ClassDecl *theClass) {
-  while (theClass->hasSuperclass()) {
-    theClass = theClass->getSuperclassDecl();
-    assert(theClass && "base type of class not a class?");
-  }
-  return theClass;
-}
-
 /// What isa encoding mechanism does a type have?
 IsaEncoding irgen::getIsaEncodingForType(IRGenModule &IGM,
                                          CanType type) {
@@ -1896,7 +1990,7 @@ IsaEncoding irgen::getIsaEncodingForType(IRGenModule &IGM,
 
   if (auto theClass = type->getClassOrBoundGenericClass()) {
     // We can access the isas of pure Swift classes directly.
-    if (getRootClass(theClass)->hasKnownSwiftImplementation())
+    if (!theClass->checkAncestry(AncestryFlags::ClangImported))
       return IsaEncoding::Pointer;
     // For ObjC or mixed classes, we need to use object_getClass.
     return IsaEncoding::ObjC;
@@ -1904,7 +1998,7 @@ IsaEncoding irgen::getIsaEncodingForType(IRGenModule &IGM,
   
   // Existentials use the encoding of the enclosed dynamic type.
   if (type->isAnyExistentialType()) {
-    return getIsaEncodingForType(IGM, ArchetypeType::getOpened(type));
+    return getIsaEncodingForType(IGM, OpenedArchetypeType::getAny(type));
   }
 
   if (auto archetype = dyn_cast<ArchetypeType>(type)) {

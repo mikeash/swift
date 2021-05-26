@@ -736,7 +736,7 @@ public:
   }
 
   llvm::Optional<sma::GenericSignature>
-  convertToGenericSignature(GenericSignature *GS) {
+  convertToGenericSignature(GenericSignature GS) {
     if (!GS)
       return None;
     sma::GenericSignature ResultGS;
@@ -769,9 +769,11 @@ public:
   }
 
   std::vector<sma::TypeName> collectProtocolConformances(NominalTypeDecl *NTD) {
+    const auto AllProtocols = NTD->getAllProtocols();
     std::vector<sma::TypeName> Result;
-    for (const auto *PD : NTD->getAllProtocols()) {
-      Result.emplace_back(convertToTypeName(PD->getDeclaredType()));
+    Result.reserve(AllProtocols.size());
+    for (const auto *PD : AllProtocols) {
+      Result.emplace_back(convertToTypeName(PD->getDeclaredInterfaceType()));
     }
     return Result;
   }
@@ -831,7 +833,7 @@ public:
   void visitTypeAliasDecl(TypeAliasDecl *TAD) {
     auto ResultTD = std::make_shared<sma::TypealiasDecl>();
     ResultTD->Name = convertToIdentifier(TAD->getName());
-    ResultTD->Type = convertToTypeName(TAD->getUnderlyingTypeLoc().getType());
+    ResultTD->Type = convertToTypeName(TAD->getUnderlyingType());
     // FIXME
     // ResultTD->Attributes = ?;
     Result.Typealiases.emplace_back(std::move(ResultTD));
@@ -929,8 +931,7 @@ int swift::doGenerateModuleAPIDescription(StringRef MainExecutablePath,
   PrintOptions Options = PrintOptions::printEverything();
 
   ModuleDecl *M = CI.getMainModule();
-  M->getMainSourceFile(Invocation.getSourceFileKind()).print(llvm::outs(),
-                                                             Options);
+  M->getMainSourceFile().print(llvm::outs(), Options);
 
   auto SMAModel = createSMAModel(M);
   llvm::yaml::Output YOut(llvm::outs());

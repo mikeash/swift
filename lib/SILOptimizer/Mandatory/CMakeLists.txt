@@ -1,21 +1,29 @@
-silopt_register_sources(
+target_sources(swiftSILOptimizer PRIVATE
   AccessEnforcementSelection.cpp
   AccessMarkerElimination.cpp
   AddressLowering.cpp
+  CapturePromotion.cpp
+  ClosureLifetimeFixup.cpp
   ConstantPropagation.cpp
   DefiniteInitialization.cpp
-  DIMemoryUseCollectorOwnership.cpp
+  DIMemoryUseCollector.cpp
   DataflowDiagnostics.cpp
   DiagnoseInfiniteRecursion.cpp
+  DiagnoseInvalidEscapingCaptures.cpp
+  DiagnoseLifetimeIssues.cpp
   DiagnoseStaticExclusivity.cpp
   DiagnoseUnreachable.cpp
-  GuaranteedARCOpts.cpp
+  Differentiation.cpp
   IRGenPrepare.cpp
+  LowerHopToActor.cpp
   MandatoryInlining.cpp
+  NestedSemanticFunctionCheck.cpp
+  OptimizeHopToExecutor.cpp
   PredictableMemOpt.cpp
   PMOMemoryUseCollector.cpp
-  SemanticARCOpts.cpp
-  ClosureLifetimeFixup.cpp
   RawSILInstLowering.cpp
-  MandatoryOptUtils.cpp
-)
+  SILGenCleanup.cpp
+  YieldOnceCheck.cpp
+  MandatoryCombine.cpp
+  OSLogOptimization.cpp
+  OwnershipModelEliminator.cpp)

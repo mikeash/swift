@@ -14,7 +14,7 @@
 #define SWIFT_FRONTEND_SUPPLEMENTARYOUTPUTPATHS_H
 
 #include "swift/Basic/LLVM.h"
-#include "llvm/ADT/Optional.h"
+#include "llvm/IR/Function.h"
 
 #include <string>
 
@@ -36,10 +36,19 @@ struct SupplementaryOutputPaths {
   ///
   /// This binary format is used to describe the interface of a module when
   /// imported by client source code. The swiftmodule format is described in
-  /// docs/Serialization.rst.
+  /// docs/Serialization.md.
   ///
   /// \sa swift::serialize
   std::string ModuleOutputPath;
+
+  /// The path to which we should emit a module source information file.
+  /// It is valid whenever there are any inputs.
+  ///
+  /// This binary format stores source locations and other information about the
+  /// declarations in a module.
+  ///
+  /// \sa swift::serialize
+  std::string ModuleSourceInfoOutputPath;
 
   /// The path to which we should emit a module documentation file.
   /// It is valid whenever there are any inputs.
@@ -68,7 +77,7 @@ struct SupplementaryOutputPaths {
   /// visibility" within a module, that becomes very important for any sort of
   /// incremental build. These files are consumed by the Swift driver to decide
   /// whether a source file needs to be recompiled during a build. See
-  /// docs/DependencyAnalysis.rst for more information.
+  /// docs/DependencyAnalysis.md for more information.
   ///
   /// \sa swift::emitReferenceDependencies
   /// \sa DependencyGraph
@@ -113,7 +122,7 @@ struct SupplementaryOutputPaths {
   /// \sa swift::writeTBDFile
   std::string TBDPath;
 
-  /// The path to which we should emit a parseable module interface, which can
+  /// The path to which we should emit a module interface, which can
   /// be used by a client source file to import this module.
   ///
   /// This format is similar to the binary format used for #ModuleOutputPath,
@@ -121,20 +130,73 @@ struct SupplementaryOutputPaths {
   ///
   /// Currently only makes sense when the compiler has whole-module knowledge.
   ///
-  /// \sa swift::emitParseableInterface
-  std::string ParseableInterfaceOutputPath;
+  /// \sa swift::emitSwiftInterface
+  std::string ModuleInterfaceOutputPath;
+
+  /// The path to which we should emit a private module interface.
+  ///
+  /// The private module interface contains all SPI decls and attributes.
+  ///
+  /// \sa ModuleInterfaceOutputPath
+  std::string PrivateModuleInterfaceOutputPath;
+
+  /// The path to a .c file where we should declare $ld$add symbols for those
+  /// symbols moved to the current module.
+  /// When symbols are moved to this module, this module declares them as HIDE
+  /// for the OS versions prior to when the move happened. On the other hand, the
+  /// original module should ADD them for these OS versions. An executable
+  /// can choose the right library to link against depending on the deployment target.
+  /// This is a walk-around that linker directives cannot specify other install
+  /// name per symbol, we should eventually remove this.
+  std::string LdAddCFilePath;
+
+  /// The path to which we should emit module summary file.
+  std::string ModuleSummaryOutputPath;
 
   SupplementaryOutputPaths() = default;
   SupplementaryOutputPaths(const SupplementaryOutputPaths &) = default;
+
+  /// Apply a given function for each existing (non-empty string) supplementary output
+  void forEachSetOutput(llvm::function_ref<void(const std::string&)> fn) const {
+    if (!ObjCHeaderOutputPath.empty())
+      fn(ObjCHeaderOutputPath); 
+    if (!ModuleOutputPath.empty())
+      fn(ModuleOutputPath); 
+    if (!ModuleSourceInfoOutputPath.empty())
+      fn(ModuleSourceInfoOutputPath); 
+    if (!ModuleDocOutputPath.empty())
+      fn(ModuleDocOutputPath); 
+    if (!DependenciesFilePath.empty())
+      fn(DependenciesFilePath); 
+    if (!ReferenceDependenciesFilePath.empty())
+      fn(ReferenceDependenciesFilePath); 
+    if (!SerializedDiagnosticsPath.empty())
+      fn(SerializedDiagnosticsPath); 
+    if (!FixItsOutputPath.empty())
+      fn(FixItsOutputPath); 
+    if (!LoadedModuleTracePath.empty())
+      fn(LoadedModuleTracePath); 
+    if (!TBDPath.empty())
+      fn(TBDPath); 
+    if (!ModuleInterfaceOutputPath.empty())
+      fn(ModuleInterfaceOutputPath); 
+    if (!PrivateModuleInterfaceOutputPath.empty())
+      fn(PrivateModuleInterfaceOutputPath); 
+    if (!LdAddCFilePath.empty())
+      fn(LdAddCFilePath); 
+    if (!ModuleSummaryOutputPath.empty())
+      fn(ModuleSummaryOutputPath);
+  }
 
   bool empty() const {
     return ObjCHeaderOutputPath.empty() && ModuleOutputPath.empty() &&
            ModuleDocOutputPath.empty() && DependenciesFilePath.empty() &&
            ReferenceDependenciesFilePath.empty() &&
            SerializedDiagnosticsPath.empty() && LoadedModuleTracePath.empty() &&
-           TBDPath.empty() && ParseableInterfaceOutputPath.empty();
+           TBDPath.empty() && ModuleInterfaceOutputPath.empty() &&
+           ModuleSourceInfoOutputPath.empty() && LdAddCFilePath.empty();
   }
 };
 } // namespace swift
 
-#endif /* SWIFT_FRONTEND_SUPPLEMENTARYOUTPUTPATHS_H */
+#endif // SWIFT_FRONTEND_SUPPLEMENTARYOUTPUTPATHS_H

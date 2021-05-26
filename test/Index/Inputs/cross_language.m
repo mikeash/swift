@@ -6,7 +6,7 @@
 // CHECK: [[@LINE-1]]:12 | class/Swift | MyCls1 | [[MyCls1_USR]] |
 // CHECK: [[@LINE-2]]:19 | extension/ObjC | ext_in_objc | c:@M@cross_language@objc(cy)MyCls1@ext_in_objc |
 -(void)someMethFromObjC;
-// CHECK: [[@LINE-1]]:8 | instance-method/ObjC | someMethFromObjC | [[someMethFromObjC_USR:.*]] | -[ext_in_objc someMethFromObjC]
+// CHECK: [[@LINE-1]]:8 | instance-method/ObjC | someMethFromObjC | [[someMethFromObjC_USR:.*]] | -[MyCls1(ext_in_objc) someMethFromObjC]
 @end
 
 void test1() {
@@ -20,6 +20,13 @@ void test1() {
   // CHECK: [[@LINE-1]]:6 | instance-method/Swift | someExtMeth | [[MyCls1_someExtMeth_USR]] |
   [o someMethFromObjC];
   // CHECK: [[@LINE-1]]:6 | instance-method/ObjC | someMethFromObjC | [[someMethFromObjC_USR]] |
+
+  o.prop = 1;
+  // CHECK: [[@LINE-1]]:5 | instance-property/Swift | prop | [[MyCls1_prop_USR]] |
+  // CHECK: [[@LINE-2]]:5 | instance-method/acc-set/Swift | setProp: | [[MyCls1_prop_set_USR]] |
+  int v = o.ext_prop;
+  // CHECK: [[@LINE-1]]:13 | instance-property/Swift | ext_prop | [[MyCls1_ext_prop_USR]] |
+  // CHECK: [[@LINE-2]]:13 | instance-method/acc-get/Swift | ext_prop | [[MyCls1_ext_prop_get_USR]] |
 
   MyCls2 *o2 = [[MyCls2 alloc] initWithInt:0];
   // CHECK: [[@LINE-1]]:32 | instance-method/Swift | initWithInt: | [[MyCls2_initwithInt_USR]] |

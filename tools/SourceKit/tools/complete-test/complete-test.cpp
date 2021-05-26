@@ -65,8 +65,10 @@ struct TestOptions {
   Optional<unsigned> fuzzyWeight;
   Optional<unsigned> popularityBonus;
   StringRef filterRulesJSON;
+  std::string moduleCachePath;
   bool rawOutput = false;
   bool structureOutput = false;
+  bool disableImplicitConcurrencyModuleImport = false;
   ArrayRef<const char *> compilerArgs;
 };
 } // end anonymous namespace
@@ -251,6 +253,10 @@ static bool parseOptions(ArrayRef<const char *> args, TestOptions &options,
         return false;
       }
       options.showTopNonLiteral = uval;
+    } else if (opt == "module-cache-path") {
+      options.moduleCachePath = value.str();
+    } else if (opt == "disable-implicit-concurrency-module-import") {
+      options.disableImplicitConcurrencyModuleImport = true;
     }
   }
 
@@ -392,7 +398,6 @@ removeCodeCompletionTokens(StringRef Input, StringRef TokenName,
     if (match[1].str() != TokenName)
       continue;
     *CompletionOffset = CleanFile.size();
-    CleanFile.push_back('\0');
     if (match.size() == 2 || !match[2].matched)
       continue;
 
@@ -401,7 +406,7 @@ removeCodeCompletionTokens(StringRef Input, StringRef TokenName,
     StringRef next = StringRef(fullMatch).split(',').second;
     while (next != "") {
       auto split = next.split(',');
-      prefixes.push_back(split.first);
+      prefixes.push_back(split.first.str());
       next = split.second;
     }
   }
@@ -674,9 +679,19 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,"-sdk");
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, sdk);
     }
+    if (!options.moduleCachePath.empty()) {
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, "-module-cache-path");
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, options.moduleCachePath.c_str());
+    }
     // Add -- options.
     for (const char *arg : options.compilerArgs)
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, arg);
+    if (options.disableImplicitConcurrencyModuleImport) {
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-Xfrontend");
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-disable-implicit-concurrency-module-import");
+    }
   }
   sourcekitd_request_dictionary_set_value(request, KeyCompilerArgs, args);
   sourcekitd_request_release(args);
@@ -689,7 +704,7 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
 
 static bool readPopularAPIList(StringRef filename,
                                std::vector<std::string> &result) {
-  std::ifstream in(filename);
+  std::ifstream in(filename.str());
   if (!in.is_open()) {
     llvm::errs() << "error opening '" << filename << "'\n";
     return true;

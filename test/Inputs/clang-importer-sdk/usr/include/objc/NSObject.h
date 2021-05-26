@@ -27,6 +27,10 @@
 @property (readonly) NSInteger hash;
 @end
 
+@interface NSObject (Coding)
+- (Class)classForCoder;
+@end
+
 @interface A : NSObject
 - (int)method:(int)arg withDouble:(double)d;
 + (int)classMethod;
@@ -132,6 +136,7 @@
 
 @interface A(BoolStuff)
 - setEnabled:(BOOL)enabled;
++ (void)setGlobal:(BOOL)global;
 @end
 
 @interface AlmostSubscriptable

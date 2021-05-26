@@ -20,16 +20,17 @@
 
 #include "Visibility.h"
 
+#if defined(__OpenBSD__)
+#include <stdio.h>
+#endif
 #if defined(_WIN32) && !defined(__CYGWIN__)
+#include <errno.h>
 #include <io.h>
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
 typedef int mode_t;
 #else
 #include <semaphore.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
-#include <unistd.h>
 #endif
 
 #include <errno.h>
@@ -51,7 +52,7 @@ static inline int _swift_stdlib_fcntlPtr(int fd, int cmd, void* ptr) {
 #endif
 
 // Environment
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
 static inline char * _Nullable * _Null_unspecified _swift_stdlib_getEnviron() {
   extern char **environ;
   return environ;
@@ -114,31 +115,19 @@ int static inline _swift_stdlib_openat(int fd, const char *path, int oflag,
 }
 #endif
 
-static inline __swift_ssize_t
-_swift_stdlib_read(int fd, void *buf, size_t nbyte) {
-#if defined(_WIN32)
-  return _read(fd, buf, nbyte);
-#else
-  return read(fd, buf, nbyte);
-#endif
+#if defined(__OpenBSD__)
+static inline FILE *_swift_stdlib_stdin(void) {
+  return stdin;
 }
 
-static inline __swift_ssize_t
-_swift_stdlib_write(int fd, const void *buf, size_t nbyte) {
-#if defined(_WIN32)
-  return _write(fd, buf, nbyte);
-#else
-  return write(fd, buf, nbyte);
-#endif
+static inline FILE *_swift_stdlib_stdout(void) {
+  return stdout;
 }
 
-static inline int _swift_stdlib_close(int fd) {
-#if defined(_WIN32)
-  return _close(fd);
-#else
-  return close(fd);
-#endif
+static inline FILE *_swift_stdlib_stderr(void) {
+  return stderr;
 }
+#endif
 
 #if __has_feature(nullability)
 #pragma clang assume_nonnull end

@@ -18,16 +18,21 @@
 #include "swift/AST/CanTypeVisitor.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/LazyResolver.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Platform.h"
+#include "swift/Basic/SourceManager.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILModule.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Path.h"
 #include "clang/CodeGen/SwiftCallingConv.h"
 
+#include "BitPatternBuilder.h"
 #include "EnumPayload.h"
 #include "LegacyLayoutFormat.h"
 #include "LoadableTypeInfo.h"
@@ -44,7 +49,7 @@
 #include "Outlining.h"
 #include "ProtocolInfo.h"
 #include "ReferenceTypeInfo.h"
-#include "ScalarTypeInfo.h"
+#include "ScalarPairTypeInfo.h"
 #include "NativeConventionSchema.h"
 #include "IRGenMangler.h"
 #include "NonFixedTypeInfo.h"
@@ -61,6 +66,13 @@ TypeConverter::Types_t::getCacheFor(bool isDependent, TypeConverter::Mode mode) 
   return (isDependent
           ? DependentCache[unsigned(mode)]
           : IndependentCache[unsigned(mode)]);
+}
+
+llvm::DenseMap<TypeBase *, const TypeLayoutEntry *> &
+TypeConverter::Types_t::getTypeLayoutCacheFor(bool isDependent,
+                                              TypeConverter::Mode mode) {
+  return (isDependent ? DependentTypeLayoutCache[unsigned(mode)]
+                      : IndependentTypeLayoutCache[unsigned(mode)]);
 }
 
 void TypeInfo::assign(IRGenFunction &IGF, Address dest, Address src,
@@ -194,15 +206,11 @@ void LoadableTypeInfo::addScalarToAggLowering(IRGenModule &IGM,
                         offset.asCharUnits() + storageSize.asCharUnits());
 }
 
-static llvm::Constant *asSizeConstant(IRGenModule &IGM, Size size) {
-  return llvm::ConstantInt::get(IGM.SizeTy, size.getValue());
-}
-
 llvm::Value *FixedTypeInfo::getSize(IRGenFunction &IGF, SILType T) const {
   return FixedTypeInfo::getStaticSize(IGF.IGM);
 }
 llvm::Constant *FixedTypeInfo::getStaticSize(IRGenModule &IGM) const {
-  return asSizeConstant(IGM, getFixedSize());
+  return IGM.getSize(getFixedSize());
 }
 
 llvm::Value *FixedTypeInfo::getAlignmentMask(IRGenFunction &IGF,
@@ -210,7 +218,7 @@ llvm::Value *FixedTypeInfo::getAlignmentMask(IRGenFunction &IGF,
   return FixedTypeInfo::getStaticAlignmentMask(IGF.IGM);
 }
 llvm::Constant *FixedTypeInfo::getStaticAlignmentMask(IRGenModule &IGM) const {
-  return asSizeConstant(IGM, Size(getFixedAlignment().getValue() - 1));
+  return IGM.getSize(Size(getFixedAlignment().getValue() - 1));
 }
 
 llvm::Value *FixedTypeInfo::getStride(IRGenFunction &IGF, SILType T) const {
@@ -225,7 +233,7 @@ llvm::Value *FixedTypeInfo::getIsBitwiseTakable(IRGenFunction &IGF, SILType T) c
                                 isBitwiseTakable(ResilienceExpansion::Maximal) == IsBitwiseTakable);
 }
 llvm::Constant *FixedTypeInfo::getStaticStride(IRGenModule &IGM) const {
-  return asSizeConstant(IGM, getFixedStride());
+  return IGM.getSize(getFixedStride());
 }
 
 llvm::Value *FixedTypeInfo::isDynamicallyPackedInline(IRGenFunction &IGF,
@@ -240,37 +248,39 @@ llvm::Value *FixedTypeInfo::isDynamicallyPackedInline(IRGenFunction &IGF,
 unsigned FixedTypeInfo::getSpareBitExtraInhabitantCount() const {
   if (SpareBits.none())
     return 0;
-  // The runtime supports a max of 0x7FFFFFFF extra inhabitants, which ought
-  // to be enough for anybody.
+  // Make sure the arithmetic below doesn't overflow.
   if (getFixedSize().getValue() >= 4)
-    return 0x7FFFFFFF;
+    return ValueWitnessFlags::MaxNumExtraInhabitants;
   unsigned spareBitCount = SpareBits.count();
   assert(spareBitCount <= getFixedSize().getValueInBits()
          && "more spare bits than storage bits?!");
   unsigned inhabitedBitCount = getFixedSize().getValueInBits() - spareBitCount;
-  return ((1U << spareBitCount) - 1U) << inhabitedBitCount;
+  unsigned rawCount = ((1U << spareBitCount) - 1U) << inhabitedBitCount;
+  return std::min(rawCount,
+                  unsigned(ValueWitnessFlags::MaxNumExtraInhabitants));
 }
 
-void FixedTypeInfo::applyFixedSpareBitsMask(SpareBitVector &mask,
-                                            const SpareBitVector &spareBits) {
+void FixedTypeInfo::applyFixedSpareBitsMask(const IRGenModule &IGM,
+                                            SpareBitVector &mask) const {
+  auto builder = BitPatternBuilder(IGM.Triple.isLittleEndian());
+
   // If the mask is no longer than the stored spare bits, we can just
   // apply the stored spare bits.
-  if (mask.size() <= spareBits.size()) {
+  if (mask.size() <= SpareBits.size()) {
     // Grow the mask out if necessary; the tail padding is all spare bits.
-    mask.extendWithSetBits(spareBits.size());
-    mask &= spareBits;
+    builder.append(mask);
+    builder.padWithSetBitsTo(SpareBits.size());
+    mask = SpareBitVector(builder.build());
+    mask &= SpareBits;
+    return;
+  }
 
   // Otherwise, we have to grow out the stored spare bits before we
   // can intersect.
-  } else {
-    auto paddedSpareBits = spareBits;
-    paddedSpareBits.extendWithSetBits(mask.size());
-    mask &= paddedSpareBits;
-  }
-}
-
-void FixedTypeInfo::applyFixedSpareBitsMask(SpareBitVector &mask) const {
-  return applyFixedSpareBitsMask(mask, SpareBits);
+  builder.append(SpareBits);
+  builder.padWithSetBitsTo(mask.size());
+  mask &= builder.build();
+  return;
 }
 
 APInt
@@ -296,7 +306,10 @@ FixedTypeInfo::getSpareBitFixedExtraInhabitantValue(IRGenModule &IGM,
     spareIndex = (index >> occupiedBitCount) + 1;
   }
 
-  return interleaveSpareBits(IGM, SpareBits, bits, spareIndex, occupiedIndex);
+  APInt mask = SpareBits.asAPInt().zextOrTrunc(bits);
+  APInt v = scatterBits(mask, spareIndex);
+  v |= scatterBits(~mask, occupiedIndex);
+  return v;
 }
 
 llvm::Value *
@@ -330,7 +343,7 @@ FixedTypeInfo::getSpareBitExtraInhabitantIndex(IRGenFunction &IGF,
   // Gather the occupied bits.
   auto OccupiedBits = SpareBits;
   OccupiedBits.flipAll();
-  llvm::Value *idx = emitGatherSpareBits(IGF, OccupiedBits, val, 0, 31);
+  llvm::Value *idx = emitGatherBits(IGF, OccupiedBits.asAPInt(), val, 0, 31);
   
   // See if spare bits fit into the 31 bits of the index.
   unsigned numSpareBits = SpareBits.count();
@@ -338,7 +351,7 @@ FixedTypeInfo::getSpareBitExtraInhabitantIndex(IRGenFunction &IGF,
   if (numOccupiedBits < 31) {
     // Gather the spare bits.
     llvm::Value *spareIdx
-      = emitGatherSpareBits(IGF, SpareBits, val, numOccupiedBits, 31);
+      = emitGatherBits(IGF, SpareBits.asAPInt(), val, numOccupiedBits, 31);
     // Unbias by subtracting one.
 
     uint64_t shifted = static_cast<uint64_t>(1) << numOccupiedBits;
@@ -390,9 +403,9 @@ static llvm::Value *computeExtraTagBytes(IRGenFunction &IGF, IRBuilder &Builder,
   }
 
   auto *entryBB = Builder.GetInsertBlock();
-  llvm::Value *size = asSizeConstant(IGM, fixedSize);
+  llvm::Value *size = IGM.getSize(fixedSize);
   auto *returnBB = llvm::BasicBlock::Create(Ctx);
-  size = Builder.CreateTrunc(size, int32Ty); // We know size < 4.
+  size = Builder.CreateZExtOrTrunc(size, int32Ty); // We know size < 4.
 
   auto *two = llvm::ConstantInt::get(int32Ty, 2U);
   auto *four = llvm::ConstantInt::get(int32Ty, 4U);
@@ -423,18 +436,202 @@ static llvm::Value *computeExtraTagBytes(IRGenFunction &IGF, IRBuilder &Builder,
   return phi;
 }
 
+/// Emit a specialized memory operation for a \p size of 0, 1, 2 or
+/// 4 bytes.
+/// \p emitMemOpFn will be called in a basic block where \p size is
+/// a known constant value passed as a parameter to the function.
+static void emitSpecializedMemOperation(
+    IRGenFunction &IGF,
+    llvm::function_ref<void(IRBuilder &, Size)> emitMemOpFn,
+    llvm::Value *size,
+    const std::array<Size, 4> &sizes) {
+  auto &Ctx = IGF.IGM.getLLVMContext();
+  auto &Builder = IGF.Builder;
+
+  // Block to jump to after successful match.
+  auto *returnBB = llvm::BasicBlock::Create(Ctx);
+
+  // Test all the sizes in turn, generating code similar to:
+  //
+  //   if (size == 0) {
+  //     <op>
+  //   } else if (size == 1) {
+  //     <op>
+  //   } else if (size == 2) {
+  //     <op>
+  //   } else if (size == 4) {
+  //     <op>
+  //   } else {
+  //     <unreachable>
+  //   }
+  //
+  for (const Size &s : sizes) {
+    auto *matchBB = llvm::BasicBlock::Create(Ctx);
+    auto *nextBB = llvm::BasicBlock::Create(Ctx);
+
+    // Check if size matches.
+    auto *imm = Builder.getInt32(s.getValue());
+    auto *cmp = Builder.CreateICmpEQ(size, imm);
+    Builder.CreateCondBr(cmp, matchBB, nextBB);
+
+    // Size matches: execute sized operation.
+    Builder.emitBlock(matchBB);
+    emitMemOpFn(Builder, s);
+    Builder.CreateBr(returnBB);
+
+    // Size does not match: try next size.
+    Builder.emitBlock(nextBB);
+  }
+  // No size matched. Should never happen.
+  Builder.CreateUnreachable();
+
+  // Continue.
+  Builder.emitBlock(returnBB);
+}
+
+/// Emit a load of the \p size byte integer values zero extended to 4 bytes. \p
+/// size maybe any of the four values specified in the \p sizes array.
+static llvm::Value *emitLoadBytes(IRGenFunction &IGF, Address from,
+                                  llvm::Value *size,
+                                  const std::array<Size, 4> &sizes) {
+  auto *phi = llvm::PHINode::Create(IGF.IGM.Int32Ty, 4);
+
+  emitSpecializedMemOperation(IGF,
+      [=](IRBuilder &B, Size s) {
+        if (s == Size(0)) {
+          // If the size is 0 bytes return 0.
+          phi->addIncoming(B.getInt32(0), B.GetInsertBlock());
+          return;
+        }
+        // Generate a load of size bytes and zero-extend it to 32-bits.
+        auto *type = B.getIntNTy(s.getValueInBits());
+        Address addr = B.CreateBitCast(from, type->getPointerTo());
+        auto *val = B.CreateZExtOrTrunc(B.CreateLoad(addr), B.getInt32Ty());
+        phi->addIncoming(val, B.GetInsertBlock());
+      },
+      size,
+      sizes);
+  IGF.Builder.Insert(phi);
+  return phi;
+}
+
+/// Emit a load of a \p size byte integer value zero extended to 4 bytes \p size
+/// may be 1, 2, 3, or 4.
+llvm::Value *irgen::emitLoad1to4Bytes(IRGenFunction &IGF, Address from,
+                                      llvm::Value *size) {
+  // Sizes to try. Tested in order.
+  const std::array<Size, 4> sizes = {
+    Size(1),
+    Size(2),
+    Size(3),
+    Size(4),
+  };
+  return emitLoadBytes(IGF, from, size, sizes);
+}
+
+/// Emit a load of a \p size byte integer value zero extended to 4 bytes.
+/// \p size may be 0, 1, 2 or 4.
+llvm::Value *irgen::emitGetTag(IRGenFunction &IGF, Address from,
+                               llvm::Value *size) {
+  // Sizes to try. Tested in order.
+  const std::array<Size, 4> sizes = {
+    Size(0),
+    Size(1),
+    Size(2),
+    Size(4),
+  };
+  return emitLoadBytes(IGF, from, size, sizes);
+}
+
+/// Emit a store of \p val truncated to \p size bytes.
+/// \p size may be one of the entries in the \p sizes array.
+static void emitStoreBytes(IRGenFunction &IGF, Address to, llvm::Value *val,
+                           llvm::Value *size,
+                           const std::array<Size, 4> &sizes) {
+  emitSpecializedMemOperation(IGF,
+      [=](IRBuilder &B, Size s) {
+        if (s == Size(0)) {
+          // Nothing to store.
+          return;
+        }
+        // Store value truncated to size bytes.
+        auto *type = B.getIntNTy(s.getValueInBits());
+        auto *trunc = B.CreateZExtOrTrunc(val, type);
+        Address addr = B.CreateBitCast(to, type->getPointerTo());
+        B.CreateStore(trunc, addr);
+      },
+      size,
+      sizes);
+}
+
+/// Emit a store of \p val truncated to \p size bytes.
+/// \p size may be  1, 2, 3, or 4.
+void irgen::emitStore1to4Bytes(IRGenFunction &IGF, Address to, llvm::Value *val,
+                              llvm::Value *size) {
+  // Sizes to try. Tested in order.
+  const std::array<Size, 4> sizes = {
+    Size(1),
+    Size(2),
+    Size(3),
+    Size(4),
+  };
+  emitStoreBytes(IGF, to, val, size, sizes);
+}
+
+/// Emit a store of \p val truncated to \p size bytes.
+/// \p size may be 0, 1, 2 or 4.
+void irgen::emitSetTag(IRGenFunction &IGF,
+                       Address to, llvm::Value *val,
+                       llvm::Value *size) {
+  // Sizes to try. Tested in order.
+  const std::array<Size, 4> sizes = {
+    Size(0),
+    Size(1),
+    Size(2),
+    Size(4),
+  };
+  emitStoreBytes(IGF, to, val, size, sizes);
+}
+
 llvm::Value *FixedTypeInfo::getEnumTagSinglePayload(IRGenFunction &IGF,
                                                     llvm::Value *numEmptyCases,
                                                     Address enumAddr,
-                                                    SILType T) const {
+                                                    SILType T,
+                                                    bool isOutlined) const {
+  return getFixedTypeEnumTagSinglePayload(IGF, *this, numEmptyCases, enumAddr,
+                                          T, isOutlined);
+}
+
+llvm::Value *irgen::getFixedTypeEnumTagSinglePayload(IRGenFunction &IGF,
+                                                     const FixedTypeInfo &ti,
+                                                     llvm::Value *numEmptyCases,
+                                                     Address enumAddr,
+                                                     SILType T,
+                                                     bool isOutlined) {
+  auto *size = ti.getSize(IGF, T);
+  Size fixedSize = ti.getFixedSize();
+  auto fixedExtraInhabitantCount = ti.getFixedExtraInhabitantCount(IGF.IGM);
+
+  return getFixedTypeEnumTagSinglePayload(
+      IGF, numEmptyCases, enumAddr, size, fixedSize, fixedExtraInhabitantCount,
+      [&](Address addr) -> llvm::Value * {
+        return ti.getExtraInhabitantIndex(IGF, addr, T, false);
+      },
+      isOutlined);
+}
+
+llvm::Value *irgen::getFixedTypeEnumTagSinglePayload(
+    IRGenFunction &IGF, llvm::Value *numEmptyCases, Address enumAddr,
+    llvm::Value *size, Size fixedSize, unsigned fixedExtraInhabitantCount,
+    llvm::function_ref<llvm::Value *(Address)> getExtraInhabitantIndex,
+    bool isOutlined) {
+
   auto &IGM = IGF.IGM;
   auto &Ctx = IGF.IGM.getLLVMContext();
   auto &Builder = IGF.Builder;
 
-  auto *size = getSize(IGF, T);
-  Size fixedSize = getFixedSize();
   auto *numExtraInhabitants =
-      llvm::ConstantInt::get(IGM.Int32Ty, getFixedExtraInhabitantCount(IGM));
+      llvm::ConstantInt::get(IGM.Int32Ty, fixedExtraInhabitantCount);
 
   auto *zero = llvm::ConstantInt::get(IGM.Int32Ty, 0U);
   auto *one = llvm::ConstantInt::get(IGM.Int32Ty, 1U);
@@ -458,26 +655,21 @@ llvm::Value *FixedTypeInfo::getEnumTagSinglePayload(IRGenFunction &IGF,
 
   // There are extra tag bits to check.
   Builder.emitBlock(extraTagBitsBB);
-  Address extraTagBitsSlot = IGF.createAlloca(IGM.Int32Ty, Alignment(4));
-  Builder.CreateStore(zero, extraTagBitsSlot);
 
   // Compute the number of extra tag bytes.
   auto *emptyCases = Builder.CreateSub(numEmptyCases, numExtraInhabitants);
   auto *numExtraTagBytes =
       computeExtraTagBytes(IGF, Builder, fixedSize, emptyCases);
 
-  // Read the extra tag bytes.
+  // Read the value stored in the extra tag bytes.
   auto *valueAddr =
       Builder.CreateBitOrPointerCast(enumAddr.getAddress(), IGM.Int8PtrTy);
   auto *extraTagBitsAddr =
       Builder.CreateConstInBoundsGEP1_32(IGM.Int8Ty, valueAddr,
-                                         fixedSize.getValue());
-
-  // TODO: big endian.
-  Builder.CreateMemCpy(
-      Builder.CreateBitCast(extraTagBitsSlot, IGM.Int8PtrTy).getAddress(), 1,
-      extraTagBitsAddr, 1, numExtraTagBytes);
-  auto extraTagBits = Builder.CreateLoad(extraTagBitsSlot);
+          fixedSize.getValue());
+  auto *extraTagBits = emitGetTag(IGF,
+      Address(extraTagBitsAddr, Alignment(1)),
+      numExtraTagBytes);
 
   extraTagBitsBB = llvm::BasicBlock::Create(Ctx);
   Builder.CreateCondBr(Builder.CreateICmpEQ(extraTagBits, zero),
@@ -487,21 +679,36 @@ llvm::Value *FixedTypeInfo::getEnumTagSinglePayload(IRGenFunction &IGF,
 
   Builder.emitBlock(extraTagBitsBB);
 
-  auto *truncSize = Builder.CreateTrunc(size, IGM.Int32Ty);
-  Address caseIndexFromValueSlot = IGF.createAlloca(IGM.Int32Ty, Alignment(4));
-  Builder.CreateStore(zero, caseIndexFromValueSlot);
+  auto *truncSize = Builder.CreateZExtOrTrunc(size, IGM.Int32Ty);
 
   auto *caseIndexFromExtraTagBits = Builder.CreateSelect(
       Builder.CreateICmpUGE(truncSize, four), zero,
       Builder.CreateShl(Builder.CreateSub(extraTagBits, one),
                         Builder.CreateMul(eight, truncSize)));
 
-  // TODO: big endian.
-  Builder.CreateMemCpy(
-      Builder.CreateBitCast(caseIndexFromValueSlot, IGM.Int8PtrTy),
-      Address(valueAddr, Alignment(1)),
-      std::min(Size(4U), fixedSize));
-  auto caseIndexFromValue = Builder.CreateLoad(caseIndexFromValueSlot);
+  llvm::Value *caseIndexFromValue = zero;
+  if (fixedSize > Size(0)) {
+    // llvm only supports integer types upto a certain size (i.e selection dag
+    // will crash).
+    if (fixedSize.getValueInBits() <= llvm::IntegerType::MAX_INT_BITS / 4) {
+      // Read up to one pointer-sized 'chunk' of the payload.
+      // The size of the chunk does not have to be a power of 2.
+      auto *caseIndexType =
+          llvm::IntegerType::get(Ctx, fixedSize.getValueInBits());
+      auto *caseIndexAddr =
+          Builder.CreateBitCast(valueAddr, caseIndexType->getPointerTo());
+      caseIndexFromValue = Builder.CreateZExtOrTrunc(
+          Builder.CreateLoad(Address(caseIndexAddr, Alignment(1))),
+          IGM.Int32Ty);
+    } else {
+      auto *caseIndexType = llvm::IntegerType::get(Ctx, 32);
+      auto *caseIndexAddr =
+          Builder.CreateBitCast(valueAddr, caseIndexType->getPointerTo());
+      caseIndexFromValue = Builder.CreateZExtOrTrunc(
+          Builder.CreateLoad(Address(caseIndexAddr, Alignment(1))),
+          IGM.Int32Ty);
+    }
+  }
 
   auto *result1 = Builder.CreateAdd(
       numExtraInhabitants,
@@ -513,8 +720,8 @@ llvm::Value *FixedTypeInfo::getEnumTagSinglePayload(IRGenFunction &IGF,
   Builder.emitBlock(noExtraTagBitsBB);
   // If there are extra inhabitants, see whether the payload is valid.
   llvm::Value *result0;
-  if (mayHaveExtraInhabitants(IGM)) {
-    result0 = getExtraInhabitantIndex(IGF, enumAddr, T, false);
+  if (fixedExtraInhabitantCount > 0) {
+    result0 = getExtraInhabitantIndex(enumAddr);
     noExtraTagBitsBB = Builder.GetInsertBlock();
   } else {
     result0 = llvm::ConstantInt::getSigned(IGM.Int32Ty, -1);
@@ -535,77 +742,43 @@ llvm::Value *FixedTypeInfo::getEnumTagSinglePayload(IRGenFunction &IGF,
   return Builder.CreateAdd(result, llvm::ConstantInt::get(IGM.Int32Ty, 1));
 }
 
-/// Emit a speciaize memory operation for a \p size of 0 to 4 bytes.
-static void emitSpecializedMemOperation(
-    IRGenFunction &IGF,
-    llvm::function_ref<void(IRBuilder &, Size)> emitMemOpFn,
-    llvm::Value *size) {
-  auto &IGM = IGF.IGM;
-  auto &Ctx = IGF.IGM.getLLVMContext();
-  auto &Builder = IGF.Builder;
-  auto *returnBB = llvm::BasicBlock::Create(Ctx);
-  auto *oneBB = llvm::BasicBlock::Create(Ctx);
-  auto *twoBB = llvm::BasicBlock::Create(Ctx);
-  auto *fourBB = llvm::BasicBlock::Create(Ctx);
-  auto *int32Ty = IGM.Int32Ty;
-  auto *zero = llvm::ConstantInt::get(int32Ty, 0U);
-  auto *one = llvm::ConstantInt::get(int32Ty, 1U);
-  auto *two = llvm::ConstantInt::get(int32Ty, 2U);
-
-  auto *continueBB = llvm::BasicBlock::Create(Ctx);
-  auto *isZero = Builder.CreateICmpEQ(size, zero);
-  Builder.CreateCondBr(isZero, returnBB, continueBB);
-
-  Builder.emitBlock(continueBB);
-  continueBB = llvm::BasicBlock::Create(Ctx);
-  auto *isOne = Builder.CreateICmpEQ(size, one);
-  Builder.CreateCondBr(isOne, oneBB, continueBB);
-
-  Builder.emitBlock(continueBB);
-  auto *isTwo = Builder.CreateICmpEQ(size, two);
-  Builder.CreateCondBr(isTwo, twoBB, fourBB);
-
-  Builder.emitBlock(oneBB);
-  emitMemOpFn(Builder, Size(1));
-  Builder.CreateBr(returnBB);
-
-  Builder.emitBlock(twoBB);
-  emitMemOpFn(Builder, Size(2));
-  Builder.CreateBr(returnBB);
-
-  Builder.emitBlock(fourBB);
-  emitMemOpFn(Builder, Size(4));
-  Builder.CreateBr(returnBB);
-
-  Builder.emitBlock(returnBB);
-}
-
-/// Emit a memset of zero operation for a \p size of 0 to 4 bytes.
-static void emitMemZero(IRGenFunction &IGF, Address addr,
-                        llvm::Value *size) {
-  auto *zeroByte = llvm::ConstantInt::get(IGF.IGM.Int8Ty, 0U);
-  emitSpecializedMemOperation(IGF,
-                              [=](IRBuilder &B, Size numBytes) {
-                                B.CreateMemSet(addr, zeroByte, numBytes);
-                              },
-                              size);
-}
-
-/// Emit a memcpy operation for a \p size of 0 to 4 bytes.
-static void emitMemCpy(IRGenFunction &IGF, Address to, Address from,
-                       llvm::Value *size) {
-  emitSpecializedMemOperation(IGF,
-                              [=](IRBuilder &B, Size numBytes) {
-                                B.CreateMemCpy(to, from, numBytes);
-                              },
-                              size);
-}
-
 void FixedTypeInfo::storeEnumTagSinglePayload(IRGenFunction &IGF,
                                               llvm::Value *whichCase,
                                               llvm::Value *numEmptyCases,
                                               Address enumAddr,
-                                              SILType T) const {
+                                              SILType T,
+                                              bool isOutlined) const {
+  storeFixedTypeEnumTagSinglePayload(IGF, *this, whichCase, numEmptyCases,
+                                     enumAddr, T, isOutlined);
+}
+
+void irgen::storeFixedTypeEnumTagSinglePayload(IRGenFunction &IGF,
+                                               const FixedTypeInfo &ti,
+                                               llvm::Value *whichCase,
+                                               llvm::Value *numEmptyCases,
+                                               Address enumAddr,
+                                               SILType T,
+                                               bool isOutlined) {
+  auto fixedSize = ti.getFixedSize();
+  auto *size = ti.getSize(IGF, T);
+  auto fixedExtraInhabitantCount = ti.getFixedExtraInhabitantCount(IGF.IGM);
+  storeFixedTypeEnumTagSinglePayload(
+      IGF, whichCase, numEmptyCases, enumAddr, size, fixedSize,
+      fixedExtraInhabitantCount,
+      [&](llvm::Value *nonPayloadElementIndex, Address enumAddr) {
+        ti.storeExtraInhabitant(IGF, nonPayloadElementIndex, enumAddr, T,
+                                /*outlined*/ false);
+      },
+      isOutlined);
+}
+
+void irgen::storeFixedTypeEnumTagSinglePayload(
+    IRGenFunction &IGF, llvm::Value *whichCase, llvm::Value *numEmptyCases,
+    Address enumAddr, llvm::Value *size, Size fixedSize,
+    unsigned fixedExtraInhabitantCount,
+    llvm::function_ref<void(llvm::Value *, Address)> storeExtraInhabitant,
+    bool isOutlined) {
+
   auto &IGM = IGF.IGM;
   auto &Ctx = IGF.IGM.getLLVMContext();
   auto &Builder = IGF.Builder;
@@ -616,15 +789,13 @@ void FixedTypeInfo::storeEnumTagSinglePayload(IRGenFunction &IGF,
   auto *four = llvm::ConstantInt::get(int32Ty, 4U);
   auto *eight = llvm::ConstantInt::get(int32Ty, 8U);
 
-  auto fixedSize = getFixedSize();
 
   Address valueAddr = Builder.CreateElementBitCast(enumAddr, IGM.Int8Ty);
   Address extraTagBitsAddr =
     Builder.CreateConstByteArrayGEP(valueAddr, fixedSize);
 
   auto *numExtraInhabitants =
-      llvm::ConstantInt::get(IGM.Int32Ty, getFixedExtraInhabitantCount(IGM));
-  auto *size = getSize(IGF, T);
+      llvm::ConstantInt::get(IGM.Int32Ty, fixedExtraInhabitantCount);
 
   // Do we need extra tag bytes.
   auto *entryBB = Builder.GetInsertBlock();
@@ -658,7 +829,7 @@ void FixedTypeInfo::storeEnumTagSinglePayload(IRGenFunction &IGF,
   // We are the payload or fit within the extra inhabitants.
   Builder.emitBlock(isPayloadOrInhabitantCaseBB);
   // Zero the tag bits.
-  emitMemZero(IGF, extraTagBitsAddr, numExtraTagBytes);
+  emitSetTag(IGF, extraTagBitsAddr, zero, numExtraTagBytes);
   isPayloadOrInhabitantCaseBB = Builder.GetInsertBlock();
   auto *storeInhabitantBB = llvm::BasicBlock::Create(Ctx);
   auto *returnBB = llvm::BasicBlock::Create(Ctx);
@@ -666,11 +837,10 @@ void FixedTypeInfo::storeEnumTagSinglePayload(IRGenFunction &IGF,
   Builder.CreateCondBr(isPayload, returnBB, storeInhabitantBB);
 
   Builder.emitBlock(storeInhabitantBB);
-  if (mayHaveExtraInhabitants(IGM)) {
+  if (fixedExtraInhabitantCount > 0) {
     // Store an index in the range [0..ElementsWithNoPayload-1].
     auto *nonPayloadElementIndex = Builder.CreateSub(whichCase, one);
-    storeExtraInhabitant(IGF, nonPayloadElementIndex, enumAddr, T,
-                         /*outlined*/ false);
+    storeExtraInhabitant(nonPayloadElementIndex, enumAddr);
   }
   Builder.CreateBr(returnBB);
 
@@ -683,7 +853,7 @@ void FixedTypeInfo::storeEnumTagSinglePayload(IRGenFunction &IGF,
   auto *nonPayloadElementIndex = Builder.CreateSub(whichCase, one);
   auto *caseIndex =
       Builder.CreateSub(nonPayloadElementIndex, numExtraInhabitants);
-  auto *truncSize = Builder.CreateTrunc(size, IGM.Int32Ty);
+  auto *truncSize = Builder.CreateZExtOrTrunc(size, IGM.Int32Ty);
   auto *isFourBytesPayload = Builder.CreateICmpUGE(truncSize, four);
   auto *payloadGE4BB = Builder.GetInsertBlock();
   auto *payloadLT4BB = llvm::BasicBlock::Create(Ctx);
@@ -708,48 +878,32 @@ void FixedTypeInfo::storeEnumTagSinglePayload(IRGenFunction &IGF,
   payloadIndex->addIncoming(caseIndex, payloadGE4BB);
   payloadIndex->addIncoming(payloadIndex0, payloadLT4BB);
 
-  Address payloadIndexAddr = IGF.createAlloca(int32Ty, Alignment(4));
-  Builder.CreateStore(payloadIndex, payloadIndexAddr);
-  Address extraTagIndexAddr = IGF.createAlloca(int32Ty, Alignment(4));
-  Builder.CreateStore(extraTagIndex, extraTagIndexAddr);
-  // TODO: big endian
-  Builder.CreateMemCpy(
-      valueAddr,
-      Builder.CreateBitCast(payloadIndexAddr, IGM.Int8PtrTy),
-      std::min(Size(4U), fixedSize));
-  Address extraZeroAddr = Builder.CreateConstByteArrayGEP(valueAddr, Size(4));
-  if (fixedSize > Size(4))
-    Builder.CreateMemSet(
-        extraZeroAddr, llvm::ConstantInt::get(IGM.Int8Ty, 0),
-        Builder.CreateSub(size, llvm::ConstantInt::get(size->getType(), 4)));
-  emitMemCpy(IGF, extraTagBitsAddr, extraTagIndexAddr, numExtraTagBytes);
+  if (fixedSize > Size(0)) {
+    if (fixedSize.getValueInBits() <= llvm::IntegerType::MAX_INT_BITS / 4) {
+      // Write the value to the payload as a zero extended integer.
+      auto *intType = Builder.getIntNTy(fixedSize.getValueInBits());
+      Builder.CreateStore(
+          Builder.CreateZExtOrTrunc(payloadIndex, intType),
+          Builder.CreateBitCast(valueAddr, intType->getPointerTo()));
+    } else {
+      // Write the value to the payload as a zero extended integer.
+      Size limit = IGM.getPointerSize();
+      auto *intType = Builder.getIntNTy(limit.getValueInBits());
+      Builder.CreateStore(
+          Builder.CreateZExtOrTrunc(payloadIndex, intType),
+          Builder.CreateBitCast(valueAddr, intType->getPointerTo()));
+      // Zero the remainder of the payload.
+      auto zeroAddr = Builder.CreateConstByteArrayGEP(valueAddr, limit);
+      auto zeroSize = Builder.CreateSub(
+          size, llvm::ConstantInt::get(size->getType(), limit.getValue()));
+      Builder.CreateMemSet(zeroAddr, Builder.getInt8(0), zeroSize);
+    }
+  }
+  // Write to the extra tag bytes, if any.
+  emitSetTag(IGF, extraTagBitsAddr, extraTagIndex, numExtraTagBytes);
   Builder.CreateBr(returnBB);
 
   Builder.emitBlock(returnBB);
-}
-
-llvm::Value *irgen::emitGetEnumTagSinglePayload(IRGenFunction &IGF,
-                                                llvm::Value *numEmptyCases,
-                                                Address enumAddr, SILType T) {
-  auto metadata = IGF.emitTypeMetadataRefForLayout(T);
-  auto opaqueAddr =
-      IGF.Builder.CreateBitCast(enumAddr.getAddress(), IGF.IGM.OpaquePtrTy);
-
-  return IGF.Builder.CreateCall(IGF.IGM.getGetEnumCaseSinglePayloadFn(),
-                                {opaqueAddr, metadata, numEmptyCases});
-}
-
-void irgen::emitStoreEnumTagSinglePayload(IRGenFunction &IGF,
-                                          llvm::Value *whichCase,
-                                          llvm::Value *numEmptyCases,
-                                          Address enumAddr,
-                                          SILType T) {
-  auto metadata = IGF.emitTypeMetadataRefForLayout(T);
-  auto opaqueAddr =
-      IGF.Builder.CreateBitCast(enumAddr.getAddress(), IGF.IGM.OpaquePtrTy);
-
-  IGF.Builder.CreateCall(IGF.IGM.getStoreEnumTagSinglePayloadFn(),
-                         {opaqueAddr, metadata, whichCase, numEmptyCases});
 }
 
 void
@@ -788,13 +942,13 @@ FixedTypeInfo::storeSpareBitExtraInhabitant(IRGenFunction &IGF,
   }
   
   // Scatter the occupied bits.
-  auto OccupiedBits = SpareBits;
-  OccupiedBits.flipAll();
-  llvm::Value *occupied = emitScatterSpareBits(IGF, OccupiedBits,
-                                               occupiedIndex, 0);
+  auto OccupiedBits = ~SpareBits.asAPInt();
+  llvm::Value *occupied = emitScatterBits(IGF, OccupiedBits,
+                                          occupiedIndex, 0);
   
   // Scatter the spare bits.
-  llvm::Value *spare = emitScatterSpareBits(IGF, SpareBits, spareIndex, 0);
+  llvm::Value *spare = emitScatterBits(IGF, SpareBits.asAPInt(),
+                                       spareIndex, 0);
   
   // Combine the values and store to the destination.
   llvm::Value *inhabitant = IGF.Builder.CreateOr(occupied, spare);
@@ -834,6 +988,11 @@ namespace {
                                const EnumPayload &payload,
                                Explosion &dest,
                                unsigned offset) const override {}
+
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                          SILType) const override {
+      return IGM.typeLayoutCache.getEmptyEntry();
+    }
   };
 
   /// A TypeInfo implementation for types represented as a single
@@ -847,7 +1006,64 @@ namespace {
       : PODSingleScalarTypeInfo(storage, size, std::move(spareBits), align) {}
   };
 
-  /// A TypeInfo implementation for bare non-null pointers (like `void *`).
+  /// A TypeInfo implementation for pointers that are:
+  /// - valid (i.e. non-null, and generally >= LeastValidPointerValue),
+  /// - aligned (i.e. have zero low bits up to some bit), and
+  /// - trivial (i.e. not reference-counted or otherwise managed).
+  ///
+  /// These properties make it suitable for unmanaged pointers with special
+  /// uses in the ABI.
+  class AlignedRawPointerTypeInfo final :
+    public PODSingleScalarTypeInfo<AlignedRawPointerTypeInfo,
+                                   LoadableTypeInfo> {
+    Alignment PointeeAlign;
+  public:
+    AlignedRawPointerTypeInfo(llvm::Type *storage,
+                              Size size, SpareBitVector &&spareBits,
+                              Alignment align, Alignment pointeeAlign)
+      : PODSingleScalarTypeInfo(storage, size, std::move(spareBits), align),
+        PointeeAlign(pointeeAlign) {}
+
+    bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
+      return true;
+    }
+
+    PointerInfo getPointerInfo() const {
+      return PointerInfo::forAligned(PointeeAlign);
+    }
+
+    unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {
+      return getPointerInfo().getExtraInhabitantCount(IGM);
+    }
+
+    APInt getFixedExtraInhabitantValue(IRGenModule &IGM, unsigned bits,
+                                       unsigned index) const override {
+      return getPointerInfo()
+               .getFixedExtraInhabitantValue(IGM, bits, index, 0);
+    }
+
+    llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
+                                         Address src,
+                                         SILType T,
+                                         bool isOutlined) const override {
+      return getPointerInfo().getExtraInhabitantIndex(IGF, src);
+    }
+
+    void storeExtraInhabitant(IRGenFunction &IGF, llvm::Value *index,
+                              Address dest, SILType T,
+                              bool isOutlined) const override {
+      getPointerInfo().storeExtraInhabitant(IGF, index, dest);
+    }
+  };
+
+  /// A TypeInfo implementation for Builtin.RawPointer.  We intentionally
+  /// do not make any assumptions about values of this type except that
+  /// they are not the special "null" extra inhabitant; as a result, an
+  /// Optional<Builtin.RawPointer> can reliably carry an arbitrary
+  /// bit-pattern of its size without fear of corruption.  Since the
+  /// primary uses of Builtin.RawPointer are the unsafe pointer APIs,
+  /// that is exactly what we want.  It does mean that Builtin.RawPointer
+  /// is usually a suboptimal type for representing known-valid pointers.
   class RawPointerTypeInfo final :
     public PODSingleScalarTypeInfo<RawPointerTypeInfo, LoadableTypeInfo> {
   public:
@@ -916,7 +1132,12 @@ namespace {
     llvm::ArrayType *getStorageType() const {
       return cast<llvm::ArrayType>(ScalarTypeInfo::getStorageType());
     }
-    
+
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                          SILType T) const override {
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    }
+
     unsigned getExplosionSize() const override {
       return 1;
     }
@@ -1002,6 +1223,10 @@ namespace {
                       Alignment align)
       : IndirectTypeInfo(storage, size, std::move(spareBits), align,
                          IsNotPOD, IsNotBitwiseTakable, IsFixedSize) {}
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                          SILType T) const override {
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    }
 
     void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
                         SILType T, bool isOutlined) const override {
@@ -1040,20 +1265,23 @@ TypeConverter::createPrimitive(llvm::Type *type, Size size, Alignment align) {
                                align);
 }
 
-/// Constructs a type info which performs simple loads and stores of
-/// the given IR type, given that it's a pointer to an aligned pointer
-/// type.
-const LoadableTypeInfo *
-TypeConverter::createPrimitiveForAlignedPointer(llvm::PointerType *type,
-                                                Size size,
-                                                Alignment align,
-                                                Alignment pointerAlignment) {
+static SpareBitVector getSpareBitsForAlignedPointer(IRGenModule &IGM,
+                                                    Alignment pointeeAlign) {
+  // FIXME: this is little-endian
   SpareBitVector spareBits = IGM.TargetInfo.PointerSpareBits;
-  for (unsigned bit = 0; Alignment(1 << bit) != pointerAlignment; ++bit) {
+  for (unsigned bit = 0; Alignment(1ull << bit) != pointeeAlign; ++bit) {
     spareBits.setBit(bit);
   }
+  return spareBits;
+}
 
-  return new PrimitiveTypeInfo(type, size, std::move(spareBits), align);
+static LoadableTypeInfo *createAlignedPointerTypeInfo(IRGenModule &IGM,
+                                                      llvm::Type *ty,
+                                                      Alignment pointeeAlign) {
+  return new AlignedRawPointerTypeInfo(ty, IGM.getPointerSize(),
+                              getSpareBitsForAlignedPointer(IGM, pointeeAlign),
+                                       IGM.getPointerAlignment(),
+                                       pointeeAlign);
 }
 
 /// Constructs a fixed-size type info which asserts if you try to copy
@@ -1066,8 +1294,9 @@ TypeConverter::createImmovable(llvm::Type *type, Size size, Alignment align) {
 
 static TypeInfo *invalidTypeInfo() { return (TypeInfo*) 1; }
 
-bool TypeConverter::readLegacyTypeInfo(StringRef path) {
-  auto fileOrErr = llvm::MemoryBuffer::getFile(path);
+bool TypeConverter::readLegacyTypeInfo(llvm::vfs::FileSystem &fs,
+                                       StringRef path) {
+  auto fileOrErr = fs.getBufferForFile(path);
   if (!fileOrErr)
     return true;
 
@@ -1114,23 +1343,91 @@ TypeConverter::getLegacyTypeInfo(NominalTypeDecl *decl) const {
   return found->second;
 }
 
+// The following Apple platforms support backward deployment of Swift
+// code built with Swift 5.0 running on an old Objective-C runtime
+// that does not support the class metadata update hook.
+//
+// We ship a YAML legacy type info file for these platforms as part
+// of the toolchain.
+static llvm::StringLiteral platformsWithLegacyLayouts[][2] = {
+  {"appletvos", "arm64"},
+  {"appletvsimulator", "x86_64"},
+  {"iphoneos", "armv7"},
+  {"iphoneos", "armv7s"},
+  {"iphoneos", "arm64"},
+  {"iphonesimulator", "i386"},
+  {"iphonesimulator", "x86_64"},
+  {"macosx", "x86_64"},
+  {"watchos", "armv7k"},
+  {"watchos", "arm64_32"},
+  {"watchsimulator", "i386"}
+};
+
+static bool doesPlatformUseLegacyLayouts(StringRef platformName,
+                                         StringRef archName) {
+  for (auto platformArchPair : platformsWithLegacyLayouts) {
+    if (platformName == platformArchPair[0] &&
+        archName == platformArchPair[1]) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 TypeConverter::TypeConverter(IRGenModule &IGM)
   : IGM(IGM),
     FirstType(invalidTypeInfo()) {
-  // FIXME: In LLDB, everything is completely fragile, so that IRGen can query
-  // the size of resilient types. Of course this is not the right long term
-  // solution, because it won't work once the swiftmodule file is not in
-  // sync with the binary module. Once LLDB can calculate type layouts at
-  // runtime (using remote mirrors or some other mechanism), we can remove this.
-  if (IGM.IRGen.Opts.EnableResilienceBypass)
-    LoweringMode = Mode::CompletelyFragile;
+  // Whether the Objective-C runtime is guaranteed to invoke the class
+  // metadata update callback when realizing a Swift class referenced from
+  // Objective-C.
+  auto deploymentAvailability =
+    AvailabilityContext::forDeploymentTarget(IGM.Context);
+  bool supportsObjCMetadataUpdateCallback =
+    deploymentAvailability.isContainedIn(
+        IGM.Context.getObjCMetadataUpdateCallbackAvailability());
 
-  StringRef path = IGM.IRGen.Opts.ReadTypeInfoPath;
-  if (!path.empty()) {
-    bool error = readLegacyTypeInfo(path);
-    if (error) {
-      llvm::report_fatal_error("Cannot read '" + path + "'");
-    }
+  // If our deployment target allows us to rely on the metadata update
+  // callback being called, we don't have to emit a legacy layout for a
+  // class with resiliently-sized fields.
+  if (supportsObjCMetadataUpdateCallback)
+    return;
+
+  // We have a bunch of -parse-stdlib tests that pass a -target in the test
+  // suite. To prevent these from failing when the user hasn't build the
+  // standard library for that target, we pass -disable-legacy-type-info to
+  // disable trying to load the legacy type info.
+  if (IGM.IRGen.Opts.DisableLegacyTypeInfo)
+    return;
+
+  llvm::SmallString<128> defaultPath;
+
+  StringRef path = IGM.IRGen.Opts.ReadLegacyTypeInfoPath;
+  auto fs =
+      IGM.getSwiftModule()->getASTContext().SourceMgr.getFileSystem();
+  if (path.empty()) {
+    const auto &Triple = IGM.Context.LangOpts.Target;
+
+    // If the flag was not explicitly specified, look for a file in a
+    // platform-specific location, if this platform is known to require
+    // one.
+    auto platformName = getPlatformNameForTriple(Triple);
+    auto archName = swift::getMajorArchitectureName(Triple);
+
+    if (!doesPlatformUseLegacyLayouts(platformName, archName))
+      return;
+
+    defaultPath = IGM.Context.SearchPathOpts.RuntimeLibraryPaths[0];
+    llvm::sys::path::append(defaultPath, "layouts-");
+    defaultPath.append(archName);
+    defaultPath.append(".yaml");
+
+    path = defaultPath;
+  }
+
+  bool error = readLegacyTypeInfo(*fs, path);
+  if (error) {
+    IGM.error(SourceLoc(), "Cannot read legacy layout file at '" + path + "'");
   }
 }
 
@@ -1143,36 +1440,30 @@ TypeConverter::~TypeConverter() {
   }
 }
 
-void TypeConverter::pushGenericContext(CanGenericSignature signature) {
+void TypeConverter::setGenericContext(CanGenericSignature signature) {
   if (!signature)
     return;
   
-  // Push the generic context down to the SIL TypeConverter, so we can share
-  // archetypes with SIL.
-  IGM.getSILTypes().pushGenericContext(signature);
+  CurGenericSignature = signature;
 
   // Clear the dependent type info cache since we have a new active signature
   // now.
   Types.getCacheFor(/*isDependent*/ true, Mode::Normal).clear();
   Types.getCacheFor(/*isDependent*/ true, Mode::Legacy).clear();
   Types.getCacheFor(/*isDependent*/ true, Mode::CompletelyFragile).clear();
+
+  Types.getTypeLayoutCacheFor(/*isDependent*/ true, Mode::Normal).clear();
+  Types.getTypeLayoutCacheFor(/*isDependent*/ true, Mode::Legacy).clear();
+  Types.getTypeLayoutCacheFor(/*isDependent*/ true, Mode::CompletelyFragile)
+      .clear();
 }
 
-void TypeConverter::popGenericContext(CanGenericSignature signature) {
-  if (!signature)
-    return;
-
-  // Pop the SIL TypeConverter's generic context too.
-  IGM.getSILTypes().popGenericContext(signature);
-  
-  Types.getCacheFor(/*isDependent*/ true, Mode::Normal).clear();
-  Types.getCacheFor(/*isDependent*/ true, Mode::Legacy).clear();
-  Types.getCacheFor(/*isDependent*/ true, Mode::CompletelyFragile).clear();
+CanGenericSignature IRGenModule::getCurGenericContext() {
+  return Types.getCurGenericContext();
 }
 
 GenericEnvironment *TypeConverter::getGenericEnvironment() {
-  auto genericSig = IGM.getSILTypes().getCurGenericContext();
-  return genericSig->getCanonicalSignature().getGenericEnvironment();
+  return CurGenericSignature->getGenericEnvironment();
 }
 
 GenericEnvironment *IRGenModule::getGenericEnvironment() {
@@ -1196,11 +1487,20 @@ const TypeInfo &IRGenModule::getWitnessTablePtrTypeInfo() {
 
 const LoadableTypeInfo &TypeConverter::getWitnessTablePtrTypeInfo() {
   if (WitnessTablePtrTI) return *WitnessTablePtrTI;
-  WitnessTablePtrTI =
-    createPrimitiveForAlignedPointer(IGM.WitnessTablePtrTy,
-                                     IGM.getPointerSize(),
-                                     IGM.getPointerAlignment(),
-                                     IGM.getWitnessTableAlignment());
+
+  auto spareBits =
+    getSpareBitsForAlignedPointer(IGM, IGM.getWitnessTableAlignment());
+
+  // This is sub-optimal because it doesn't consider that there are
+  // also potential extra inhabitants in witnesss table pointers, but
+  // it's what we're currently doing, so we might be stuck.
+  // TODO: it's likely that this never matters in the current ABI,
+  // so we can just switch to using AlignedRawPointerTypeInfo; but
+  // we need to check that first.
+  WitnessTablePtrTI = new PrimitiveTypeInfo(IGM.WitnessTablePtrTy,
+                                            IGM.getPointerSize(),
+                                            std::move(spareBits),
+                                            IGM.getPointerAlignment());
   WitnessTablePtrTI->NextConverted = FirstType;
   FirstType = WitnessTablePtrTI;
   return *WitnessTablePtrTI;
@@ -1208,6 +1508,7 @@ const LoadableTypeInfo &TypeConverter::getWitnessTablePtrTypeInfo() {
 
 const SpareBitVector &IRGenModule::getWitnessTablePtrSpareBits() const {
   // Witness tables are pointers and have pointer spare bits.
+  // FIXME: this is not what we use in getWitnessTablePtrTypeInfo()
   return TargetInfo.PointerSpareBits;
 }
 
@@ -1223,6 +1524,34 @@ const TypeInfo &TypeConverter::getTypeMetadataPtrTypeInfo() {
   TypeMetadataPtrTI->NextConverted = FirstType;
   FirstType = TypeMetadataPtrTI;
   return *TypeMetadataPtrTI;
+}
+
+const TypeInfo &IRGenModule::getSwiftContextPtrTypeInfo() {
+  return Types.getSwiftContextPtrTypeInfo();
+}
+
+const TypeInfo &TypeConverter::getSwiftContextPtrTypeInfo() {
+  if (SwiftContextPtrTI) return *SwiftContextPtrTI;
+  SwiftContextPtrTI = createUnmanagedStorageType(IGM.SwiftContextPtrTy,
+                                                 ReferenceCounting::Unknown,
+                                                 /*isOptional*/false);
+  SwiftContextPtrTI->NextConverted = FirstType;
+  FirstType = SwiftContextPtrTI;
+  return *SwiftContextPtrTI;
+}
+
+const TypeInfo &IRGenModule::getTaskContinuationFunctionPtrTypeInfo() {
+  return Types.getTaskContinuationFunctionPtrTypeInfo();
+}
+
+const TypeInfo &TypeConverter::getTaskContinuationFunctionPtrTypeInfo() {
+  if (TaskContinuationFunctionPtrTI) return *TaskContinuationFunctionPtrTI;
+  TaskContinuationFunctionPtrTI = createUnmanagedStorageType(
+      IGM.TaskContinuationFunctionPtrTy, ReferenceCounting::Unknown,
+      /*isOptional*/ false);
+  TaskContinuationFunctionPtrTI->NextConverted = FirstType;
+  FirstType = TaskContinuationFunctionPtrTI;
+  return *TaskContinuationFunctionPtrTI;
 }
 
 const LoadableTypeInfo &
@@ -1293,6 +1622,47 @@ const LoadableTypeInfo &TypeConverter::getRawPointerTypeInfo() {
   return *RawPointerTI;
 }
 
+const LoadableTypeInfo &IRGenModule::getRawUnsafeContinuationTypeInfo() {
+  return Types.getRawUnsafeContinuationTypeInfo();
+}
+
+const LoadableTypeInfo &TypeConverter::getRawUnsafeContinuationTypeInfo() {
+  if (RawUnsafeContinuationTI) return *RawUnsafeContinuationTI;
+
+  // A Builtin.RawUnsafeContinuation is an AsyncTask*, which is a heap
+  // object aligned to 2*alignof(void*).  Incomplete tasks are
+  // self-owning, which is to say that pointers to them can be held
+  // reliably without retaining or releasing until the task starts
+  // running again.
+  //
+  // TODO: It is possible to retain and release task pointers, which means
+  // they can be used directly as Swift function contexts.  Preserve this
+  // information to optimize closure-creation (partial apply).
+  auto ty = IGM.Int8PtrTy;
+  auto pointeeAlign = Alignment(2 * IGM.getPointerAlignment().getValue());
+  RawUnsafeContinuationTI =
+    createAlignedPointerTypeInfo(IGM, ty, pointeeAlign);
+  RawUnsafeContinuationTI->NextConverted = FirstType;
+  FirstType = RawUnsafeContinuationTI;
+  return *RawUnsafeContinuationTI;
+}
+
+const LoadableTypeInfo &TypeConverter::getJobTypeInfo() {
+  if (JobTI) return *JobTI;
+
+  // A Builtin.Job is a Job*, which is an arbitrary pointer aligned to
+  // 2*alignof(void*).  Jobs are self-owning, which is to say that
+  // they're valid until they are scheduled, and then they're responsible
+  // for destroying themselves.  (Jobs are often interior pointers into
+  // an AsyncTask*, but that's not guaranteed.)
+  auto ty = IGM.SwiftJobPtrTy;
+  auto pointeeAlign = Alignment(2 * IGM.getPointerAlignment().getValue());
+  JobTI = createAlignedPointerTypeInfo(IGM, ty, pointeeAlign);
+  JobTI->NextConverted = FirstType;
+  FirstType = JobTI;
+  return *JobTI;
+}
+
 const LoadableTypeInfo &TypeConverter::getEmptyTypeInfo() {
   if (EmptyTI) return *EmptyTI;
   EmptyTI = new EmptyTypeInfo(IGM.Int8Ty);
@@ -1346,13 +1716,26 @@ const TypeInfo &IRGenFunction::getTypeInfo(SILType T) {
 }
 
 /// Return the SIL-lowering of the given type.
-SILType IRGenModule::getLoweredType(AbstractionPattern orig, Type subst) {
-  return getSILTypes().getLoweredType(orig, subst);
+SILType IRGenModule::getLoweredType(AbstractionPattern orig, Type subst) const {
+  return getSILTypes().getLoweredType(
+      orig, subst, TypeExpansionContext::maximalResilienceExpansionOnly());
 }
 
 /// Return the SIL-lowering of the given type.
-SILType IRGenModule::getLoweredType(Type subst) {
-  return getSILTypes().getLoweredType(subst);
+SILType IRGenModule::getLoweredType(Type subst) const {
+  return getSILTypes().getLoweredType(
+      subst, TypeExpansionContext::maximalResilienceExpansionOnly());
+}
+
+/// Return the SIL-lowering of the given type.
+const Lowering::TypeLowering &IRGenModule::getTypeLowering(SILType type) const {
+  return getSILTypes().getTypeLowering(
+      type, TypeExpansionContext::maximalResilienceExpansionOnly());
+}
+
+bool IRGenModule::isTypeABIAccessible(SILType type) const {
+  return getSILModule().isTypeABIAccessible(
+      type, TypeExpansionContext::maximalResilienceExpansionOnly());
 }
 
 /// Get a pointer to the storage type for the given type.  Note that,
@@ -1369,7 +1752,7 @@ llvm::PointerType *IRGenModule::getStoragePointerTypeForLowered(CanType T) {
 }
 
 llvm::Type *IRGenModule::getStorageTypeForUnlowered(Type subst) {
-  return getStorageType(getSILTypes().getLoweredType(subst));
+  return getStorageType(getLoweredType(subst));
 }
 
 llvm::Type *IRGenModule::getStorageType(SILType T) {
@@ -1399,7 +1782,7 @@ IRGenModule::getTypeInfoForUnlowered(AbstractionPattern orig, Type subst) {
 /// have yet undergone SIL type lowering.
 const TypeInfo &
 IRGenModule::getTypeInfoForUnlowered(AbstractionPattern orig, CanType subst) {
-  return getTypeInfo(getSILTypes().getLoweredType(orig, subst));
+  return getTypeInfo(getLoweredType(orig, subst));
 }
 
 /// Get the fragile type information for the given type, which is known
@@ -1420,16 +1803,20 @@ const TypeInfo &TypeConverter::getCompleteTypeInfo(CanType T) {
 }
 
 ArchetypeType *TypeConverter::getExemplarArchetype(ArchetypeType *t) {
+  // Get the primary archetype.
+  auto primary = dyn_cast<PrimaryArchetypeType>(t->getRoot());
+  
+  // If there is no primary (IOW, it's an opened archetype), the archetype is
+  // an exemplar.
+  if (!primary) return t;
+  
   // Retrieve the generic environment of the archetype.
-  auto genericEnv = t->getGenericEnvironment();
-
-  // If there is no generic environment, the archetype is an exemplar.
-  if (!genericEnv) return t;
+  auto genericEnv = primary->getGenericEnvironment();
 
   // Dig out the canonical generic environment.
   auto genericSig = genericEnv->getGenericSignature();
-  auto canGenericSig = genericSig->getCanonicalSignature();
-  auto canGenericEnv = canGenericSig.getGenericEnvironment();
+  auto canGenericSig = genericSig.getCanonicalSignature();
+  auto canGenericEnv = canGenericSig->getGenericEnvironment();
   if (canGenericEnv == genericEnv) return t;
 
   // Map the archetype out of its own generic environment and into the
@@ -1461,6 +1848,19 @@ CanType TypeConverter::getExemplarType(CanType contextTy) {
     return CanType(exemplified);
   }
 }
+const TypeLayoutEntry &TypeConverter::getTypeLayoutEntry(SILType T) {
+  auto astTy = T.getASTType();
+  auto cache =
+      Types.getTypeLayoutCacheFor(astTy->hasTypeParameter(), LoweringMode);
+  auto it = cache.find(astTy.getPointer());
+  if (it != cache.end()) {
+    return *it->second;
+  }
+  auto *ti = getTypeEntry(T.getASTType());
+  auto *entry = ti->buildTypeLayoutEntry(IGM, T);
+  cache[astTy.getPointer()] = entry;
+  return *entry;
+}
 
 const TypeInfo *TypeConverter::getTypeEntry(CanType canonicalTy) {
   // Cache this entry in the dependent or independent cache appropriate to it.
@@ -1473,7 +1873,7 @@ const TypeInfo *TypeConverter::getTypeEntry(CanType canonicalTy) {
       return it->second;
     }
   }
-  
+
   // If the type is dependent, substitute it into our current context.
   auto contextTy = canonicalTy;
   if (contextTy->hasTypeParameter()) {
@@ -1548,7 +1948,8 @@ TypeConverter::getOpaqueStorageTypeInfo(Size size, Alignment align) {
   // Use an [N x i8] array for storage, but load and store as a single iNNN
   // scalar.
   auto storageType = llvm::ArrayType::get(IGM.Int8Ty, size.getValue());
-  auto intType = llvm::IntegerType::get(IGM.LLVMContext, size.getValueInBits());
+  auto intType = llvm::IntegerType::get(IGM.getLLVMContext(),
+                                        size.getValueInBits());
   // There are no spare bits in an opaque storage type.
   auto type = new OpaqueStorageTypeInfo(storageType, intType, size,
                     SpareBitVector::getConstant(size.getValueInBits(), false),
@@ -1562,7 +1963,7 @@ TypeConverter::getOpaqueStorageTypeInfo(Size size, Alignment align) {
   return *type;
 }
 
-/// \brief Convert a primitive builtin type to its LLVM type, size, and
+/// Convert a primitive builtin type to its LLVM type, size, and
 /// alignment.
 static std::tuple<llvm::Type *, Size, Alignment>
 convertPrimitiveBuiltin(IRGenModule &IGM, CanType canTy) {
@@ -1594,7 +1995,8 @@ convertPrimitiveBuiltin(IRGenModule &IGM, CanType canTy) {
     }
     llvm_unreachable("bad builtin floating-point type kind");
   case TypeKind::BuiltinInteger: {
-    unsigned BitWidth = IGM.getBuiltinIntegerWidth(cast<BuiltinIntegerType>(ty));
+    auto intTy = cast<BuiltinIntegerType>(ty);
+    unsigned BitWidth = IGM.getBuiltinIntegerWidth(intTy);
     unsigned ByteSize = (BitWidth+7U)/8U;
     // Round up the memory size and alignment to a power of 2.
     if (!llvm::isPowerOf2_32(ByteSize))
@@ -1612,7 +2014,9 @@ convertPrimitiveBuiltin(IRGenModule &IGM, CanType canTy) {
       = convertPrimitiveBuiltin(IGM,
                                 vecTy->getElementType()->getCanonicalType());
 
-    auto llvmVecTy = llvm::VectorType::get(elementTy, vecTy->getNumElements());
+    auto llvmVecTy =
+        llvm::FixedVectorType::get(elementTy, vecTy->getNumElements());
+
     unsigned bitSize = size.getValue() * vecTy->getNumElements() * 8;
     if (!llvm::isPowerOf2_32(bitSize))
       bitSize = llvm::NextPowerOf2(bitSize);
@@ -1628,9 +2032,12 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   PrettyStackTraceType stackTrace(IGM.Context, "converting", ty);
 
   switch (ty->getKind()) {
-  case TypeKind::Error:
-    llvm_unreachable("found an ErrorType in IR-gen");
-
+  case TypeKind::Error: {
+    // We might see error types if type checking has failed.
+    // Try to do something graceful and return an zero sized type.
+    auto &ctx = ty->getASTContext();
+    return convertTupleType(cast<TupleType>(ctx.TheEmptyTupleType));
+  }
 #define UNCHECKED_TYPE(id, parent) \
   case TypeKind::id: \
     llvm_unreachable("found a " #id "Type in IR-gen");
@@ -1654,8 +2061,6 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
   }
   case TypeKind::BuiltinNativeObject:
     return &getNativeObjectTypeInfo();
-  case TypeKind::BuiltinUnknownObject:
-    return &getUnknownObjectTypeInfo();
   case TypeKind::BuiltinBridgeObject:
     return &getBridgeObjectTypeInfo();
   case TypeKind::BuiltinUnsafeValueBuffer:
@@ -1664,6 +2069,14 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
                            getFixedBufferAlignment(IGM));
   case TypeKind::BuiltinRawPointer:
     return &getRawPointerTypeInfo();
+  case TypeKind::BuiltinRawUnsafeContinuation:
+    return &getRawUnsafeContinuationTypeInfo();
+  case TypeKind::BuiltinJob:
+    return &getJobTypeInfo();
+  case TypeKind::BuiltinExecutor:
+    return &getExecutorTypeInfo();
+  case TypeKind::BuiltinIntegerLiteral:
+    return &getIntegerLiteralTypeInfo();
   case TypeKind::BuiltinFloat:
   case TypeKind::BuiltinInteger:
   case TypeKind::BuiltinVector: {
@@ -1674,8 +2087,25 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
     align = IGM.getCappedAlignment(align);
     return createPrimitive(llvmTy, size, align);
   }
+  case TypeKind::BuiltinDefaultActorStorage: {
+    // Builtin.DefaultActorStorage represents the extra storage
+    // (beyond the heap header) of a default actor.  It is
+    // fixed-size and totally opaque.
+    auto numWords = NumWords_DefaultActor;
 
-  case TypeKind::Archetype:
+    auto ty = llvm::StructType::create(IGM.getLLVMContext(),
+                                 llvm::ArrayType::get(IGM.Int8PtrTy, numWords),
+                                       "swift.defaultactor");
+    auto size = IGM.getPointerSize() * numWords;
+    auto align = Alignment(2 * IGM.getPointerAlignment().getValue());
+    auto spareBits = SpareBitVector::getConstant(size.getValueInBits(), false);
+    return new PrimitiveTypeInfo(ty, size, std::move(spareBits), align);
+  }
+
+  case TypeKind::PrimaryArchetype:
+  case TypeKind::OpenedArchetype:
+  case TypeKind::NestedArchetype:
+  case TypeKind::OpaqueTypeArchetype:
     return convertArchetypeType(cast<ArchetypeType>(ty));
   case TypeKind::Class:
   case TypeKind::Enum:
@@ -1802,9 +2232,10 @@ namespace {
         return false;
 
       for (auto elt : decl->getAllElements()) {
-        if (elt->hasAssociatedValues() &&
-            !elt->isIndirect() &&
-            visit(elt->getArgumentInterfaceType()->getCanonicalType()))
+        if (!elt->hasAssociatedValues() || elt->isIndirect())
+          continue;
+
+        if (visit(elt->getArgumentInterfaceType()->getCanonicalType()))
           return true;
       }
       return false;
@@ -1868,6 +2299,11 @@ public:
                     IsNotBitwiseTakable, /* irrelevant */
                     IsFixedSize /* irrelevant */),
       NumExtraInhabitants(node.NumExtraInhabitants) {}
+
+  TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                        SILType T) const override {
+    return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+  }
 
   virtual unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {
     return NumExtraInhabitants;
@@ -2073,32 +2509,27 @@ SpareBitVector IRGenModule::getSpareBitsForType(llvm::Type *scalarTy, Size size)
   if (it != SpareBitsForTypes.end())
     return it->second;
 
-  assert(DataLayout.getTypeAllocSizeInBits(scalarTy) <= size.getValueInBits() &&
+  assert(!isa<llvm::StructType>(scalarTy));
+
+  unsigned allocBits = size.getValueInBits();
+  assert(allocBits >= DataLayout.getTypeAllocSizeInBits(scalarTy) &&
          "using a size that's smaller than LLVM's alloc size?");
-  
-  {
-    // FIXME: Currently we only implement spare bits for primitive integer
-    // types.
-    assert(!isa<llvm::StructType>(scalarTy));
 
-    auto *intTy = dyn_cast<llvm::IntegerType>(scalarTy);
-    if (!intTy)
-      goto no_spare_bits;
+  // Allocate a new cache entry.
+  SpareBitVector &result = SpareBitsForTypes[scalarTy];
 
-    // Round Integer-Of-Unusual-Size types up to their allocation size.
-    unsigned allocBits = size.getValueInBits();
-    assert(allocBits >= intTy->getBitWidth());
-        
-    // FIXME: Endianness.
-    SpareBitVector &result = SpareBitsForTypes[scalarTy];
-    result.appendClearBits(intTy->getBitWidth());
-    result.extendWithSetBits(allocBits);
+  // FIXME: Currently we only implement spare bits for primitive integer
+  // types.
+  if (auto *intTy = dyn_cast<llvm::IntegerType>(scalarTy)) {
+    // Pad integers with spare bits up to their allocation size.
+    auto v = llvm::APInt::getBitsSetFrom(allocBits, intTy->getBitWidth());
+    // FIXME: byte swap v on big-endian platforms.
+    result = SpareBitVector::fromAPInt(v);
     return result;
   }
-  
-no_spare_bits:
-  SpareBitVector &result = SpareBitsForTypes[scalarTy];
-  result.appendClearBits(size.getValueInBits());
+
+  // No spare bits.
+  result = SpareBitVector::getConstant(allocBits, false);
   return result;
 }
 
@@ -2114,22 +2545,29 @@ unsigned IRGenModule::getBuiltinIntegerWidth(BuiltinIntegerWidth w) {
   llvm_unreachable("impossible width value");
 }
 
-void IRGenFunction::setLocalSelfMetadata(llvm::Value *value,
-                                         IRGenFunction::LocalSelfKind kind) {
-  assert(!LocalSelf && "already have local self metadata");
-  LocalSelf = value;
+void IRGenFunction::setDynamicSelfMetadata(CanType selfClass,
+                                           bool isExactSelfClass,
+                                           llvm::Value *value,
+                                           IRGenFunction::DynamicSelfKind kind) {
+  assert(!SelfValue && "already have local self metadata");
+  SelfValue = value;
+  assert(selfClass->getClassOrBoundGenericClass()
+         && "self type not a class?");
+  SelfTypeIsExact = isExactSelfClass;
+  SelfType = selfClass;
   SelfKind = kind;
 }
 
 #ifndef NDEBUG
 bool TypeConverter::isExemplarArchetype(ArchetypeType *arch) const {
-  auto genericEnv = arch->getGenericEnvironment();
-  if (!genericEnv) return true;
+  auto primary = dyn_cast<PrimaryArchetypeType>(arch->getRoot());
+  if (!primary) return true;
+  auto genericEnv = primary->getGenericEnvironment();
 
   // Dig out the canonical generic environment.
   auto genericSig = genericEnv->getGenericSignature();
-  auto canGenericSig = genericSig->getCanonicalSignature();
-  auto canGenericEnv = canGenericSig.getGenericEnvironment();
+  auto canGenericSig = genericSig.getCanonicalSignature();
+  auto canGenericEnv = canGenericSig->getGenericEnvironment();
 
   // If this archetype is in the canonical generic environment, it's an
   // exemplar archetype.
@@ -2163,9 +2601,15 @@ SILType irgen::getSingletonAggregateFieldType(IRGenModule &IGM, SILType t,
     // If there's only one stored property, we have the layout of its field.
     auto allFields = structDecl->getStoredProperties();
     
-    auto field = allFields.begin();
-    if (!allFields.empty() && std::next(field) == allFields.end())
-      return t.getFieldType(*field, IGM.getSILModule());
+    if (allFields.size() == 1) {
+      auto fieldTy = t.getFieldType(
+          allFields[0], IGM.getSILModule(),
+          TypeExpansionContext(expansion, IGM.getSwiftModule(),
+                               IGM.getSILModule().isWholeModule()));
+      if (!IGM.isTypeABIAccessible(fieldTy))
+        return SILType();
+      return fieldTy;
+    }
 
     return SILType();
   }
@@ -2180,8 +2624,15 @@ SILType irgen::getSingletonAggregateFieldType(IRGenModule &IGM, SILType t,
     
     auto theCase = allCases.begin();
     if (!allCases.empty() && std::next(theCase) == allCases.end()
-        && (*theCase)->hasAssociatedValues())
-      return t.getEnumElementType(*theCase, IGM.getSILModule());
+        && (*theCase)->hasAssociatedValues()) {
+      auto enumEltTy = t.getEnumElementType(
+          *theCase, IGM.getSILModule(),
+          TypeExpansionContext(expansion, IGM.getSwiftModule(),
+                               IGM.getSILModule().isWholeModule()));
+      if (!IGM.isTypeABIAccessible(enumEltTy))
+        return SILType();
+      return enumEltTy;
+    }
 
     return SILType();
   }

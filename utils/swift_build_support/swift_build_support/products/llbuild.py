@@ -10,8 +10,41 @@
 #
 # ----------------------------------------------------------------------------
 
+from . import cmark
+from . import foundation
+from . import libcxx
+from . import libdispatch
+from . import libicu
+from . import llvm
 from . import product
+from . import swift
+from . import xctest
 
 
 class LLBuild(product.Product):
-    pass
+    @classmethod
+    def is_build_script_impl_product(cls):
+        """is_build_script_impl_product -> bool
+
+        Whether this product is produced by build-script-impl.
+        """
+        return True
+
+    @classmethod
+    def is_before_build_script_impl_product(cls):
+        """is_before_build_script_impl_product -> bool
+
+        Whether this product is build before any build-script-impl products.
+        """
+        return False
+
+    @classmethod
+    def get_dependencies(cls):
+        return [cmark.CMark,
+                llvm.LLVM,
+                libcxx.LibCXX,
+                libicu.LibICU,
+                swift.Swift,
+                libdispatch.LibDispatch,
+                foundation.Foundation,
+                xctest.XCTest]

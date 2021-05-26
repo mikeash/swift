@@ -4,6 +4,7 @@
 // RUN: %target-swift-frontend %s -g -S -o - | %FileCheck %s --check-prefix ASM-%target-object-format
 // ASM-macho: .section __DWARF,__debug_info
 // ASM-elf: .section .debug_info,"",{{[@%]}}progbits
+// ASM-coff: .section .debug_info,"dr"
 
 // Test variables-interpreter.swift runs this code with `swift -g -i`.
 // Test variables-repl.swift runs this code with `swift -g < variables.swift`.
@@ -40,7 +41,7 @@ print(", \(glob_b)", terminator: "")
 print(", \(glob_s)", terminator: "")
 var unused: Int32 = -1
 
-// CHECK-DAG: ![[RT:[0-9]+]] ={{.*}}"Swift.swiftmodule"
+// CHECK-DAG: ![[RT:[0-9]+]] ={{.*}}"{{.*}}Swift.swiftmodule{{([/\\].+[.]swiftmodule)?}}"
 
 
 // Stack variables.
@@ -71,7 +72,10 @@ myprint(tuple)
 
 // Arrays are represented as an instantiation of Array.
 // CHECK-DAG: ![[ARRAYTY:.*]] = !DICompositeType(tag: DW_TAG_structure_type, name: "Array",
-// CHECK-DAG: !DIGlobalVariable(name: "array_of_tuples",{{.*}} type: ![[ARRAYTY]]
+// CHECK-DAG: ![[ARRAY_MEMBER:.*]] = !DIDerivedType(tag: DW_TAG_member, {{.*}}baseType: ![[ARRAYTY]]
+// CHECK-DAG: ![[ARRAY_ELTS:.*]] = !{![[ARRAY_MEMBER]]}
+// CHECK-DAG: ![[ARRAY_CONTAINER:.*]] = !DICompositeType({{.*}}elements: ![[ARRAY_ELTS]]
+// CHECK-DAG: !DIGlobalVariable(name: "array_of_tuples",{{.*}} type: ![[ARRAY_CONTAINER]]
 var array_of_tuples : [(a : Int, b : Int)] = [(1,2)]
 var twod : [[Int]] = [[1]]
 
@@ -113,4 +117,4 @@ func myprint(_ value: TriValue) {
 }
 myprint(unknown)
 
-// CHECK-DAG: !DIFile(filename: "variables.swift"
+// CHECK-DAG: !DIFile(filename: "{{.*}}variables.swift"

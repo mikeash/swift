@@ -5,6 +5,7 @@
     key.column: 10,
     key.filepath: parse_error.swift,
     key.severity: source.diagnostic.severity.error,
+    key.id: "func_decl_without_paren",
     key.description: "expected '(' in argument list of function declaration",
     key.diagnostic_stage: source.diagnostic.stage.swift.sema,
     key.fixits: [
@@ -20,7 +21,8 @@
     key.column: 8,
     key.filepath: parse_error.swift,
     key.severity: source.diagnostic.severity.error,
-    key.description: "use of undeclared type 'Undeclared'",
+    key.id: "cannot_find_type_in_scope",
+    key.description: "cannot find type 'Undeclared' in scope",
     key.diagnostic_stage: source.diagnostic.stage.swift.sema,
     key.ranges: [
       {
@@ -36,6 +38,7 @@
     key.column: 13,
     key.filepath: parse_error.swift,
     key.severity: source.diagnostic.severity.error,
+    key.id: "func_decl_without_paren",
     key.description: "expected '(' in argument list of function declaration",
     key.diagnostic_stage: source.diagnostic.stage.swift.sema,
     key.fixits: [
@@ -51,7 +54,8 @@
     key.column: 8,
     key.filepath: parse_error.swift,
     key.severity: source.diagnostic.severity.error,
-    key.description: "use of undeclared type 'Undeclared'",
+    key.id: "cannot_find_type_in_scope",
+    key.description: "cannot find type 'Undeclared' in scope",
     key.diagnostic_stage: source.diagnostic.stage.swift.sema,
     key.ranges: [
       {

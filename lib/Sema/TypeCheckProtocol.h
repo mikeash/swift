@@ -1,4 +1,4 @@
-//===--- ConstraintSystem.h - Constraint-based Type Checking ----*- C++ -*-===//
+//===--- TypeCheckProtocol.h - Constraint-based Type Checking ----*- C++ -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -18,10 +18,14 @@
 #ifndef SWIFT_SEMA_PROTOCOL_H
 #define SWIFT_SEMA_PROTOCOL_H
 
+#include "TypeChecker.h"
+#include "swift/AST/AccessScope.h"
 #include "swift/AST/RequirementEnvironment.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/Witness.h"
+#include "swift/Basic/Debug.h"
+#include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/ScopedHashTable.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -36,7 +40,6 @@ class DeclContext;
 class FuncDecl;
 class NormalProtocolConformance;
 class ProtocolDecl;
-class TypeChecker;
 class TypeRepr;
 class ValueDecl;
 
@@ -89,13 +92,68 @@ public:
 };
 
 /// Check whether the given type witness can be used for the given
-/// associated type.
+/// associated type in the given conformance.
 ///
 /// \returns an empty result on success, or a description of the error.
-CheckTypeWitnessResult checkTypeWitness(TypeChecker &tc, DeclContext *dc,
-                                        ProtocolDecl *proto,
+CheckTypeWitnessResult checkTypeWitness(Type type,
                                         AssociatedTypeDecl *assocType,
-                                        Type type);
+                                        const NormalProtocolConformance *Conf,
+                                        SubstOptions options = None);
+
+/// Describes the means of inferring an abstract type witness.
+enum class AbstractTypeWitnessKind : uint8_t {
+  /// The type witness was inferred via a same-type-to-concrete constraint
+  /// in a protocol requirement signature.
+  Fixed,
+
+  /// The type witness was inferred via a defaulted associated type.
+  Default,
+
+  /// The type witness was inferred to a generic parameter of the
+  /// conforming type.
+  GenericParam,
+};
+
+/// A type witness inferred without the aid of a specific potential
+/// value witness.
+class AbstractTypeWitness {
+  AbstractTypeWitnessKind Kind;
+  AssociatedTypeDecl *AssocType;
+  Type TheType;
+
+  /// When this is a default type witness, the declaration responsible for it.
+  /// May not necessarilly match \c AssocType.
+  AssociatedTypeDecl *DefaultedAssocType;
+
+  AbstractTypeWitness(AbstractTypeWitnessKind Kind,
+                      AssociatedTypeDecl *AssocType, Type TheType,
+                      AssociatedTypeDecl *DefaultedAssocType)
+      : Kind(Kind), AssocType(AssocType), TheType(TheType),
+        DefaultedAssocType(DefaultedAssocType) {
+    assert(AssocType && TheType);
+  }
+
+public:
+  static AbstractTypeWitness forFixed(AssociatedTypeDecl *assocType, Type type);
+
+  static AbstractTypeWitness forDefault(AssociatedTypeDecl *assocType,
+                                        Type type,
+                                        AssociatedTypeDecl *defaultedAssocType);
+
+  static AbstractTypeWitness forGenericParam(AssociatedTypeDecl *assocType,
+                                             Type type);
+
+public:
+  AbstractTypeWitnessKind getKind() const { return Kind; }
+
+  AssociatedTypeDecl *getAssocType() const { return AssocType; }
+
+  Type getType() const { return TheType; }
+
+  AssociatedTypeDecl *getDefaultedAssocType() const {
+    return DefaultedAssocType;
+  }
+};
 
 /// The set of associated types that have been inferred by matching
 /// the given value witness to its corresponding requirement.
@@ -113,8 +171,7 @@ struct InferredAssociatedTypesByWitness {
 
   void dump(llvm::raw_ostream &out, unsigned indent) const;
 
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const,
-                            "only for use in the debugger");
+  SWIFT_DEBUG_DUMP;
 };
 
 /// The set of witnesses that were considered when attempting to
@@ -149,60 +206,79 @@ struct InferredTypeWitnessesSolution {
 
 class RequirementEnvironment;
 
-/// \brief The result of matching a particular declaration to a given
+/// The result of matching a particular declaration to a given
 /// requirement.
 enum class MatchKind : uint8_t {
-  /// \brief The witness matched the requirement exactly.
+  /// The witness matched the requirement exactly.
   ExactMatch,
 
-  /// \brief There is a difference in optionality.
+  /// There is a difference in optionality.
   OptionalityConflict,
 
-  /// \brief The witness matched the requirement with some renaming.
+  /// The witness matched the requirement with some renaming.
   RenamedMatch,
 
-  /// \brief The witness is invalid or has an invalid type.
+  /// The witness is invalid or has an invalid type.
   WitnessInvalid,
 
-  /// \brief The kind of the witness and requirement differ, e.g., one
+  /// The witness is currently being type checked and this type checking in turn
+  /// triggered conformance checking, so the witness cannot be considered as a
+  /// candidate.
+  Circularity,
+
+  /// The kind of the witness and requirement differ, e.g., one
   /// is a function and the other is a variable.
   KindConflict,
 
-  /// \brief The types conflict.
+  /// The types conflict.
   TypeConflict,
 
-  /// \brief The witness would match if an additional requirement were met.
+  /// The witness would match if an additional requirement were met.
   MissingRequirement,
+
+  /// The witness and requirement disagree on 'async'.
+  AsyncConflict,
 
   /// The witness throws, but the requirement does not.
   ThrowsConflict,
 
-  /// \brief The witness did not match due to static/non-static differences.
+  /// The witness did not match due to static/non-static differences.
   StaticNonStaticConflict,
 
-  /// \brief The witness is not settable, but the requirement is.
+  /// The witness is not settable, but the requirement is.
   SettableConflict,
 
-  /// \brief The witness did not match due to prefix/non-prefix differences.
+  /// The witness did not match due to prefix/non-prefix differences.
   PrefixNonPrefixConflict,
 
-  /// \brief The witness did not match due to postfix/non-postfix differences.
+  /// The witness did not match due to postfix/non-postfix differences.
   PostfixNonPostfixConflict,
 
-  /// \brief The witness did not match because of mutating conflicts.
+  /// The witness did not match because of mutating conflicts.
   MutatingConflict,
 
-  /// \brief The witness did not match because of nonmutating conflicts.
+  /// The witness did not match because of nonmutating conflicts.
   NonMutatingConflict,
 
-  /// \brief The witness did not match because of __consuming conflicts.
+  /// The witness did not match because of __consuming conflicts.
   ConsumingConflict,
 
-  /// The witness is not rethrows, but the requirement is.
+  /// The witness throws unconditionally, but the requirement rethrows.
   RethrowsConflict,
+
+  /// The witness rethrows via conformance, but the requirement rethrows
+  /// via closure and is not in a '@rethrows' protocol.
+  RethrowsByConformanceConflict,
 
   /// The witness is explicitly @nonobjc but the requirement is @objc.
   NonObjC,
+
+  /// The witness is missing a `@differentiable` attribute from the requirement.
+  MissingDifferentiableAttr,
+  
+  /// The witness did not match because it is an enum case with
+  /// associated values.
+  EnumCaseWithAssociatedValues,
 };
 
 /// Describes the kind of optional adjustment performed when
@@ -249,6 +325,9 @@ enum class CheckKind : unsigned {
   /// The witness is storage whose setter is less accessible than the
   /// requirement.
   AccessOfSetter,
+
+  /// The witness needs to be @usableFromInline.
+  UsableFromInline,
 
   /// The witness is less available than the requirement.
   Availability,
@@ -337,12 +416,20 @@ public:
   SourceLoc getOptionalityLoc(TypeRepr *tyR) const;
 };
 
-/// \brief Describes a match between a requirement and a witness.
+/// Describes a match between a requirement and a witness.
 struct RequirementMatch {
   RequirementMatch(ValueDecl *witness, MatchKind kind,
                    Optional<RequirementEnvironment> env = None)
     : Witness(witness), Kind(kind), WitnessType(), ReqEnv(std::move(env)) {
     assert(!hasWitnessType() && "Should have witness type");
+  }
+
+  RequirementMatch(ValueDecl *witness, MatchKind kind,
+                   const DeclAttribute *attr)
+      : Witness(witness), Kind(kind), WitnessType(), UnmetAttribute(attr),
+        ReqEnv(None) {
+    assert(!hasWitnessType() && "Should have witness type");
+    assert(hasUnmetAttribute() && "Should have unmet attribute");
   }
 
   RequirementMatch(ValueDecl *witness, MatchKind kind,
@@ -369,19 +456,22 @@ struct RequirementMatch {
            "Should have witness type and requirement");
   }
 
-  /// \brief The witness that matches the (implied) requirement.
+  /// The witness that matches the (implied) requirement.
   ValueDecl *Witness;
 
-  /// \brief The kind of match.
+  /// The kind of match.
   MatchKind Kind;
 
-  /// \brief The type of the witness when it is referenced.
+  /// The type of the witness when it is referenced.
   Type WitnessType;
 
-  /// \brief Requirement not met.
+  /// Requirement not met.
   Optional<Requirement> MissingRequirement;
 
-  /// \brief The requirement environment to use for the witness thunk.
+  /// Unmet attribute from the requirement.
+  const DeclAttribute *UnmetAttribute = nullptr;
+
+  /// The requirement environment to use for the witness thunk.
   Optional<RequirementEnvironment> ReqEnv;
 
   /// The set of optional adjustments performed on the witness.
@@ -391,7 +481,7 @@ struct RequirementMatch {
   /// environment.
   SubstitutionMap WitnessSubstitutions;
 
-  /// \brief Determine whether this match is viable.
+  /// Determine whether this match is viable.
   bool isViable() const {
     switch(Kind) {
     case MatchKind::ExactMatch:
@@ -400,6 +490,7 @@ struct RequirementMatch {
       return true;
 
     case MatchKind::WitnessInvalid:
+    case MatchKind::Circularity:
     case MatchKind::KindConflict:
     case MatchKind::TypeConflict:
     case MatchKind::MissingRequirement:
@@ -411,15 +502,19 @@ struct RequirementMatch {
     case MatchKind::NonMutatingConflict:
     case MatchKind::ConsumingConflict:
     case MatchKind::RethrowsConflict:
+    case MatchKind::RethrowsByConformanceConflict:
+    case MatchKind::AsyncConflict:
     case MatchKind::ThrowsConflict:
     case MatchKind::NonObjC:
+    case MatchKind::MissingDifferentiableAttr:
+    case MatchKind::EnumCaseWithAssociatedValues:
       return false;
     }
 
     llvm_unreachable("Unhandled MatchKind in switch.");
   }
 
-  /// \brief Determine whether this requirement match has a witness type.
+  /// Determine whether this requirement match has a witness type.
   bool hasWitnessType() const {
     switch(Kind) {
     case MatchKind::ExactMatch:
@@ -430,6 +525,7 @@ struct RequirementMatch {
       return true;
 
     case MatchKind::WitnessInvalid:
+    case MatchKind::Circularity:
     case MatchKind::KindConflict:
     case MatchKind::StaticNonStaticConflict:
     case MatchKind::SettableConflict:
@@ -439,16 +535,25 @@ struct RequirementMatch {
     case MatchKind::NonMutatingConflict:
     case MatchKind::ConsumingConflict:
     case MatchKind::RethrowsConflict:
+    case MatchKind::RethrowsByConformanceConflict:
+    case MatchKind::AsyncConflict:
     case MatchKind::ThrowsConflict:
     case MatchKind::NonObjC:
+    case MatchKind::MissingDifferentiableAttr:
+    case MatchKind::EnumCaseWithAssociatedValues:
       return false;
     }
 
     llvm_unreachable("Unhandled MatchKind in switch.");
   }
 
-  /// \brief Determine whether this requirement match has a requirement.
+  /// Determine whether this requirement match has a requirement.
   bool hasRequirement() { return Kind == MatchKind::MissingRequirement; }
+
+  /// Determine whether this requirement match has an unmet attribute.
+  bool hasUnmetAttribute() {
+    return Kind == MatchKind::MissingDifferentiableAttr;
+  }
 
   swift::Witness getWitness(ASTContext &ctx) const;
 };
@@ -458,16 +563,18 @@ struct RequirementCheck;
 class WitnessChecker {
 public:
   using RequirementEnvironmentCacheKey =
-      std::pair<const GenericSignature *, const ClassDecl *>;
+      std::pair<const GenericSignatureImpl *, const ClassDecl *>;
   using RequirementEnvironmentCache =
       llvm::DenseMap<RequirementEnvironmentCacheKey, RequirementEnvironment>;
 
 protected:
-  TypeChecker &TC;
+  ASTContext &Context;
   ProtocolDecl *Proto;
   Type Adoptee;
   // The conforming context, either a nominal type or extension.
   DeclContext *DC;
+
+  ASTContext &getASTContext() const { return Context; }
 
   // An auxiliary lookup table to be used for witnesses remapped via
   // @_implements(Protocol, DeclName)
@@ -475,10 +582,20 @@ protected:
 
   RequirementEnvironmentCache ReqEnvironmentCache;
 
-  WitnessChecker(TypeChecker &tc, ProtocolDecl *proto,
-                 Type adoptee, DeclContext *dc);
+  Optional<std::pair<AccessScope, bool>> RequiredAccessScopeAndUsableFromInline;
+
+  WitnessChecker(ASTContext &ctx, ProtocolDecl *proto, Type adoptee,
+                 DeclContext *dc);
 
   bool isMemberOperator(FuncDecl *decl, Type type);
+
+  AccessScope getRequiredAccessScope();
+
+  bool isUsableFromInlineRequired() {
+    assert(RequiredAccessScopeAndUsableFromInline.hasValue() &&
+           "must check access first using getRequiredAccessScope");
+    return RequiredAccessScopeAndUsableFromInline.getValue().second;
+  }
 
   /// Gather the value witnesses for the given requirement.
   ///
@@ -501,8 +618,7 @@ protected:
                        unsigned &bestIdx,
                        bool &doNotDiagnoseMatches);
 
-  bool checkWitnessAccess(AccessScope &requiredAccessScope,
-                          ValueDecl *requirement,
+  bool checkWitnessAccess(ValueDecl *requirement,
                           ValueDecl *witness,
                           bool *isSetter);
 
@@ -510,8 +626,7 @@ protected:
                                 ValueDecl *witness,
                                 AvailabilityContext *requirementInfo);
 
-  RequirementCheck checkWitness(AccessScope requiredAccessScope,
-                                ValueDecl *requirement,
+  RequirementCheck checkWitness(ValueDecl *requirement,
                                 const RequirementMatch &match);
 };
 
@@ -535,11 +650,42 @@ enum class MissingWitnessDiagnosisKind {
 class AssociatedTypeInference;
 class MultiConformanceChecker;
 
+/// Describes a missing witness during conformance checking.
+class MissingWitness {
+public:
+  /// The requirement that is missing a witness.
+  ValueDecl *requirement;
+
+  /// The set of potential matching witnesses.
+  std::vector<RequirementMatch> matches;
+
+  MissingWitness(ValueDecl *requirement,
+                 ArrayRef<RequirementMatch> matches)
+    : requirement(requirement),
+      matches(matches.begin(), matches.end()) { }
+};
+
+/// Capture missing witnesses that have been delayed and will be stored
+/// in the ASTContext for later.
+class DelayedMissingWitnesses : public MissingWitnessesBase {
+public:
+  std::vector<MissingWitness> missingWitnesses;
+
+  DelayedMissingWitnesses(ArrayRef<MissingWitness> missingWitnesses)
+      : missingWitnesses(missingWitnesses.begin(), missingWitnesses.end()) { }
+};
+
 /// The protocol conformance checker.
 ///
 /// This helper class handles most of the details of checking whether a
 /// given type (\c Adoptee) conforms to a protocol (\c Proto).
 class ConformanceChecker : public WitnessChecker {
+public:
+  /// Key that can be used to uniquely identify a particular Objective-C
+  /// method.
+  using ObjCMethodKey = std::pair<ObjCSelector, char>;
+
+private:
   friend class MultiConformanceChecker;
   friend class AssociatedTypeInference;
 
@@ -557,7 +703,7 @@ class ConformanceChecker : public WitnessChecker {
   /// Keep track of missing witnesses, either type or value, for later
   /// diagnosis emits. This may contain witnesses that are external to the
   /// protocol under checking.
-  llvm::SetVector<ValueDecl*> &GlobalMissingWitnesses;
+  llvm::SetVector<MissingWitness> &GlobalMissingWitnesses;
 
   /// Keep track of the slice in GlobalMissingWitnesses that is local to
   /// this protocol under checking.
@@ -573,6 +719,14 @@ class ConformanceChecker : public WitnessChecker {
 
   /// Whether we checked the requirement signature already.
   bool CheckedRequirementSignature = false;
+
+  /// Mapping from Objective-C methods to the set of requirements within this
+  /// protocol that have the same selector and instance/class designation.
+  llvm::SmallDenseMap<ObjCMethodKey, TinyPtrVector<AbstractFunctionDecl *>, 4>
+    objcMethodRequirements;
+
+  /// Whether objcMethodRequirements has been computed.
+  bool computedObjCMethodRequirements = false;
 
   /// Retrieve the associated types that are referenced by the given
   /// requirement with a base of 'Self'.
@@ -591,6 +745,11 @@ class ConformanceChecker : public WitnessChecker {
   bool checkObjCTypeErasedGenerics(AssociatedTypeDecl *assocType,
                                    Type type,
                                    TypeDecl *typeDecl);
+
+  /// Check that the witness and requirement have compatible actor contexts.
+  ///
+  /// \returns true if an error occurred, false otherwise.
+  bool checkActorIsolation(ValueDecl *requirement, ValueDecl *witness);
 
   /// Record a type witness.
   ///
@@ -616,6 +775,11 @@ class ConformanceChecker : public WitnessChecker {
   /// Resolve a (non-type) witness via default definition or optional.
   ResolveWitnessResult resolveWitnessViaDefault(ValueDecl *requirement);
 
+  /// Resolve a (non-type) witness by trying each standard strategy until one
+  /// of them produces a result.
+  ResolveWitnessResult
+  resolveWitnessTryingAllStrategies(ValueDecl *requirement);
+
   /// Attempt to resolve a type witness via member name lookup.
   ResolveWitnessResult resolveTypeWitnessViaLookup(
                          AssociatedTypeDecl *assocType);
@@ -633,12 +797,7 @@ class ConformanceChecker : public WitnessChecker {
          ValueDecl *requirement, bool isError,
          std::function<void(NormalProtocolConformance *)> fn);
 
-  void
-  addUsedConformances(ProtocolConformance *conformance,
-                      llvm::SmallPtrSetImpl<ProtocolConformance *> &visited);
-  void addUsedConformances(ProtocolConformance *conformance);
-
-  ArrayRef<ValueDecl*> getLocalMissingWitness() {
+  ArrayRef<MissingWitness> getLocalMissingWitness() {
     return GlobalMissingWitnesses.getArrayRef().
       slice(LocalMissingWitnessesStartIndex,
             GlobalMissingWitnesses.size() - LocalMissingWitnessesStartIndex);
@@ -651,16 +810,24 @@ class ConformanceChecker : public WitnessChecker {
 
 public:
   /// Call this to diagnose currently known missing witnesses.
-  void diagnoseMissingWitnesses(MissingWitnessDiagnosisKind Kind);
+  ///
+  /// \returns true if any witnesses were diagnosed.
+  bool diagnoseMissingWitnesses(MissingWitnessDiagnosisKind Kind);
+
   /// Emit any diagnostics that have been delayed.
   void emitDelayedDiags();
 
-  ConformanceChecker(TypeChecker &tc, NormalProtocolConformance *conformance,
-                     llvm::SetVector<ValueDecl*> &GlobalMissingWitnesses,
+  ConformanceChecker(ASTContext &ctx, NormalProtocolConformance *conformance,
+                     llvm::SetVector<MissingWitness> &GlobalMissingWitnesses,
                      bool suppressDiagnostics = true);
+
+  ~ConformanceChecker();
 
   /// Resolve all of the type witnesses.
   void resolveTypeWitnesses();
+
+  /// Resolve all of the non-type witnesses.
+  void resolveValueWitnesses();
 
   /// Resolve the witness for the given non-type requirement as
   /// directly as possible, only resolving other witnesses if
@@ -678,22 +845,32 @@ public:
 
   /// Check all of the protocols requirements are actually satisfied by a
   /// the chosen type witnesses.
-  ///
-  /// \param failUnsubstituted Whether to fail when the requirements of the
-  /// protocol could not be substituted (e.g., due to missing information).
-  /// When true, emits a diagnostic in such cases; when false, enqueues the
-  /// conformance for later checking.
-  void ensureRequirementsAreSatisfied(bool failUnsubstituted);
+  void ensureRequirementsAreSatisfied();
 
   /// Check the entire protocol conformance, ensuring that all
   /// witnesses are resolved and emitting any diagnostics.
   void checkConformance(MissingWitnessDiagnosisKind Kind);
+
+  /// Retrieve the Objective-C method key from the given function.
+  ObjCMethodKey getObjCMethodKey(AbstractFunctionDecl *func);
+
+  /// Retrieve the Objective-C requirements in this protocol that have the
+  /// given Objective-C method key.
+  ArrayRef<AbstractFunctionDecl *> getObjCRequirements(ObjCMethodKey key);
+
+  /// @returns a non-null requirement if the given requirement is part of a
+  /// group of ObjC requirements that share the same ObjC method key.
+  /// The first such requirement that the predicate function returns true for
+  /// is the requirement required by this function. Otherwise, nullptr is
+  /// returned.
+  ValueDecl *getObjCRequirementSibling(ValueDecl *requirement,
+                    llvm::function_ref<bool(AbstractFunctionDecl *)>predicate);
 };
 
 /// Captures the state needed to infer associated types.
 class AssociatedTypeInference {
   /// The type checker we'll need to validate declarations etc.
-  TypeChecker &tc;
+  ASTContext &ctx;
 
   /// The conformance for which we are inferring associated types.
   NormalProtocolConformance *conformance;
@@ -733,10 +910,13 @@ class AssociatedTypeInference {
   unsigned numTypeWitnessesBeforeConflict = 0;
 
 public:
-  AssociatedTypeInference(TypeChecker &tc,
+  AssociatedTypeInference(ASTContext &ctx,
                           NormalProtocolConformance *conformance);
 
 private:
+  /// Retrieve the AST context.
+  ASTContext &getASTContext() const { return ctx; }
+
   /// Infer associated type witnesses for the given tentative
   /// requirement/witness match.
   InferredAssociatedTypesByWitness inferTypeWitnessesViaValueWitness(
@@ -764,25 +944,22 @@ private:
     const llvm::SetVector<AssociatedTypeDecl *> &assocTypes);
 
   /// Compute a "fixed" type witness for an associated type, e.g.,
-  /// if the refined protocol requires it to be equivalent to some other
-  /// concrete type.
+  /// if the refined protocol requires it to be equivalent to some other type.
   Type computeFixedTypeWitness(AssociatedTypeDecl *assocType);
 
   /// Compute the default type witness from an associated type default,
   /// if there is one.
-  Type computeDefaultTypeWitness(AssociatedTypeDecl *assocType);
+  Optional<AbstractTypeWitness>
+  computeDefaultTypeWitness(AssociatedTypeDecl *assocType);
 
   /// Compute the "derived" type witness for an associated type that is
   /// known to the compiler.
-  Type computeDerivedTypeWitness(AssociatedTypeDecl *assocType);
+  std::pair<Type, TypeDecl *>
+  computeDerivedTypeWitness(AssociatedTypeDecl *assocType);
 
-  /// Compute a type witness without using a specific potential witness,
-  /// e.g., using a fixed type (from a refined protocol), default type
-  /// on an associated type, or deriving the type.
-  ///
-  /// \param allowDerived Whether to allow "derived" type witnesses.
-  Type computeAbstractTypeWitness(AssociatedTypeDecl *assocType,
-                                  bool allowDerived);
+  /// Compute a type witness without using a specific potential witness.
+  Optional<AbstractTypeWitness>
+  computeAbstractTypeWitness(AssociatedTypeDecl *assocType);
 
   /// Substitute the current type witnesses into the given interface type.
   Type substCurrentTypeWitnesses(Type type);
@@ -800,6 +977,15 @@ private:
   /// Check the current type witnesses against the
   /// requirements of the given constrained extension.
   bool checkConstrainedExtension(ExtensionDecl *ext);
+
+  /// Validate the current tentative solution represented by \p typeWitnesses
+  /// and attempt to resolve abstract type witnesses for associated types that
+  /// could not be inferred otherwise.
+  ///
+  /// \returns \c nullptr, or the associated type that failed.
+  AssociatedTypeDecl *
+  completeSolution(ArrayRef<AssociatedTypeDecl *> unresolvedAssocTypes,
+                   unsigned reqDepth);
 
   /// Top-level operation to find solutions for the given unresolved
   /// associated types.
@@ -861,15 +1047,13 @@ public:
 
   /// Find an associated type declaration that provides a default definition.
   static AssociatedTypeDecl *findDefaultedAssociatedType(
-                                                 TypeChecker &tc,
                                                  AssociatedTypeDecl *assocType);
 };
 
-/// \brief Match the given witness to the given requirement.
+/// Match the given witness to the given requirement.
 ///
 /// \returns the result of performing the match.
 RequirementMatch matchWitness(
-             TypeChecker &tc,
              DeclContext *dc, ValueDecl *req, ValueDecl *witness,
              llvm::function_ref<
                      std::tuple<Optional<RequirementMatch>, Type, Type>(void)>
@@ -881,10 +1065,9 @@ RequirementMatch matchWitness(
                    > finalize);
 
 RequirementMatch
-  matchWitness(TypeChecker &tc,
-               WitnessChecker::RequirementEnvironmentCache &reqEnvCache,
-               ProtocolDecl *proto, ProtocolConformance *conformance,
-               DeclContext *dc, ValueDecl *req, ValueDecl *witness);
+matchWitness(WitnessChecker::RequirementEnvironmentCache &reqEnvCache,
+             ProtocolDecl *proto, ProtocolConformance *conformance,
+             DeclContext *dc, ValueDecl *req, ValueDecl *witness);
 
 /// If the given type is a direct reference to an associated type of
 /// the given protocol, return the referenced associated type.
@@ -910,16 +1093,33 @@ llvm::TinyPtrVector<ValueDecl *> findWitnessedObjCRequirements(
                                      const ValueDecl *witness,
                                      bool anySingleRequirement = false);
 
-/// Mark any _ObjectiveCBridgeable conformances in the given type as "used".
-void useObjectiveCBridgeableConformances(
-                      DeclContext *dc, Type type);
-
-/// If this bound-generic type is bridged, mark any
-/// _ObjectiveCBridgeable conformances in the generic arguments of
-/// the given type as "used".
-void useObjectiveCBridgeableConformancesOfArgs(
-                      DeclContext *dc, BoundGenericType *bound);
+void diagnoseConformanceFailure(Type T,
+                                ProtocolDecl *Proto,
+                                DeclContext *DC,
+                                SourceLoc ComplainLoc);
 
 }
 
+namespace llvm {
+
+template<>
+struct DenseMapInfo<swift::MissingWitness> {
+  using MissingWitness = swift::MissingWitness;
+  using RequirementPointerTraits = DenseMapInfo<swift::ValueDecl *>;
+
+  static inline MissingWitness getEmptyKey() {
+    return MissingWitness(RequirementPointerTraits::getEmptyKey(), {});
+  }
+  static inline MissingWitness getTombstoneKey() {
+    return MissingWitness(RequirementPointerTraits::getTombstoneKey(), {});
+  }
+  static inline unsigned getHashValue(MissingWitness missing) {
+    return RequirementPointerTraits::getHashValue(missing.requirement);
+  }
+  static bool isEqual(MissingWitness a, MissingWitness b) {
+    return a.requirement == b.requirement;
+  }
+};
+
+}
 #endif // SWIFT_SEMA_PROTOCOL_H

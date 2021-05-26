@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -167,7 +167,7 @@ if resiliencyChecks.subscriptOnOutOfBoundsIndicesBehavior != .none {
     var c = makeWrappedCollection([ 1010, 2020, 3030 ].map(OpaqueValue.init))
     var index = c.endIndex
     expectCrashLater()
-    index = c.index(index, offsetBy: numericCast(outOfBoundsSubscriptOffset))
+    index = c.index(index, offsetBy: outOfBoundsSubscriptOffset)
     c[index] = wrapValue(OpaqueValue(9999))
   }
 
@@ -175,7 +175,7 @@ if resiliencyChecks.subscriptOnOutOfBoundsIndicesBehavior != .none {
     var c = makeWrappedCollection([])
     var index = c.endIndex
     expectCrashLater()
-    index = c.index(index, offsetBy: numericCast(outOfBoundsSubscriptOffset))
+    index = c.index(index, offsetBy: outOfBoundsSubscriptOffset)
     c[index] = wrapValue(OpaqueValue(9999))
   }
 
@@ -192,10 +192,10 @@ if resiliencyChecks.subscriptOnOutOfBoundsIndicesBehavior != .none {
     print("\(elements)/sliceFromLeft=\(sliceFromLeft)/sliceFromRight=\(sliceFromRight)")
     let base = makeWrappedCollection(elements)
     let sliceStartIndex =
-      base.index(base.startIndex, offsetBy: numericCast(sliceFromLeft))
+      base.index(base.startIndex, offsetBy: sliceFromLeft)
     let sliceEndIndex = base.index(
       base.startIndex,
-      offsetBy: numericCast(elements.count - sliceFromRight))
+      offsetBy: elements.count - sliceFromRight)
     var slice = base[sliceStartIndex..<sliceEndIndex]
     expectType(C.SubSequence.self, &slice)
 
@@ -224,12 +224,12 @@ if resiliencyChecks.subscriptOnOutOfBoundsIndicesBehavior != .none {
       if sliceFromLeft == 0 { return }
       index = base.index(
         base.startIndex,
-        offsetBy: numericCast(sliceFromLeft - 1))
+        offsetBy: sliceFromLeft - 1)
     case .outOfRangeToTheRight:
       if sliceFromRight == 0 { return }
       index = base.index(
         base.startIndex,
-        offsetBy: numericCast(elements.count - sliceFromRight))
+        offsetBy: elements.count - sliceFromRight)
     case .baseEndIndex:
       index = base.endIndex
     case .sliceEndIndex:
@@ -274,7 +274,7 @@ self.test("\(testNamePrefix).subscript(_: Range)/Set/semantics") {
 
     do {
       // Call setter implicitly through an inout mutation.
-      var c = makeWrappedCollection(test.collection)
+      let c = makeWrappedCollection(test.collection)
 
       var s = c[test.bounds(in: c)]
       _mapInPlace(&s) {
@@ -342,10 +342,10 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
     print("\(elements)/sliceFromLeft=\(sliceFromLeft)/sliceFromRight=\(sliceFromRight)")
     let base = makeWrappedCollection(elements)
     let sliceStartIndex =
-      base.index(base.startIndex, offsetBy: numericCast(sliceFromLeft))
+      base.index(base.startIndex, offsetBy: sliceFromLeft)
     let sliceEndIndex = base.index(
       base.startIndex,
-      offsetBy: numericCast(elements.count - sliceFromRight))
+      offsetBy: elements.count - sliceFromRight)
     var slice = base[sliceStartIndex..<sliceEndIndex]
     expectType(C.SubSequence.self, &slice)
 
@@ -385,28 +385,28 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
       if sliceFromLeft == 0 { return }
       let index = base.index(
         base.startIndex,
-        offsetBy: numericCast(sliceFromLeft - 1))
+        offsetBy: sliceFromLeft - 1)
       bounds = index..<index
       break
     case .outOfRangeToTheLeftNonEmpty:
       if sliceFromLeft == 0 { return }
       let index = base.index(
         base.startIndex,
-        offsetBy: numericCast(sliceFromLeft - 1))
+        offsetBy: sliceFromLeft - 1)
       bounds = index..<sliceStartIndex
       break
     case .outOfRangeToTheRightEmpty:
       if sliceFromRight == 0 { return }
       let index = base.index(
         base.startIndex,
-        offsetBy: numericCast(elements.count - sliceFromRight + 1))
+        offsetBy: elements.count - sliceFromRight + 1)
       bounds = index..<index
       break
     case .outOfRangeToTheRightNonEmpty:
       if sliceFromRight == 0 { return }
       let index = base.index(
         base.startIndex,
-        offsetBy: numericCast(elements.count - sliceFromRight + 1))
+        offsetBy: elements.count - sliceFromRight + 1)
       bounds = sliceEndIndex..<index
       break
     case .outOfRangeBothSides:
@@ -415,11 +415,11 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
       bounds =
         base.index(
           base.startIndex,
-          offsetBy: numericCast(sliceFromLeft - 1))
+          offsetBy: sliceFromLeft - 1)
         ..<
         base.index(
           base.startIndex,
-          offsetBy: numericCast(elements.count - sliceFromRight + 1))
+          offsetBy: elements.count - sliceFromRight + 1)
       break
     case .baseEndIndex:
       if sliceFromRight == 0 { return }
@@ -427,8 +427,8 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
       break
     }
 
-    let count: Int = numericCast(
-      base.distance(from: bounds.lowerBound, to: bounds.upperBound))
+    let count: Int =
+      base.distance(from: bounds.lowerBound, to: bounds.upperBound)
     let newValues = makeWrappedCollection(Array(elements[0..<count]))
     let newSlice = newValues[...]
 
@@ -438,13 +438,13 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
 }
 
 //===----------------------------------------------------------------------===//
-// _withUnsafeMutableBufferPointerIfSupported()
+// withContiguousMutableStorageIfAvailable()
 //===----------------------------------------------------------------------===//
 
-self.test("\(testNamePrefix)._withUnsafeMutableBufferPointerIfSupported()/semantics") {
+self.test("\(testNamePrefix).withContiguousMutableStorageIfAvailable()/semantics") {
   for test in subscriptRangeTests {
     var c = makeWrappedCollection(test.collection)
-    var result = c._withUnsafeMutableBufferPointerIfSupported {
+    var result = c.withContiguousMutableStorageIfAvailable {
       (bufferPointer) -> OpaqueValue<Array<OpaqueValue<Int>>> in
       let value = OpaqueValue(bufferPointer.map(extractValue))
       return value
@@ -512,7 +512,7 @@ func checkSortedPredicateThrow(
   }
 }
 
-self.test("\(testNamePrefix).sorted/DispatchesThrough_withUnsafeMutableBufferPointerIfSupported/WhereElementIsComparable") {
+self.test("\(testNamePrefix).sorted/DispatchesThroughDirectStorageAccessors/WhereElementIsComparable") {
   let sequence = [ 5, 4, 3, 2, 1 ]
   let elements: [MinimalComparableValue] =
     zip(sequence, 0..<sequence.count).map {
@@ -520,18 +520,21 @@ self.test("\(testNamePrefix).sorted/DispatchesThrough_withUnsafeMutableBufferPoi
     }
   let c = makeWrappedCollectionWithComparableElement(elements)
 
-  var lc = LoggingMutableCollection(wrapping: c)
+  let lc = LoggingMutableCollection(wrapping: c)
 
   let result = lc.sorted()
   let extractedResult = result.map(extractValueFromComparable)
 
+  let actualWUMBPIF = lc.log._withUnsafeMutableBufferPointerIfSupported[type(of: lc)]
+  let actualWCMSIA =  lc.log.withContiguousMutableStorageIfAvailable[type(of: lc)]
+
+  let actualWUMBPIFNonNil = lc.log._withUnsafeMutableBufferPointerIfSupportedNonNilReturns[type(of: lc)]
+  let actualWCMSIANonNil =  lc.log.withContiguousMutableStorageIfAvailableNonNilReturns[type(of: lc)]
+
   // This sort operation is not in-place.
   // The collection is copied into an array before sorting.
-  expectEqual(
-    0, lc.log._withUnsafeMutableBufferPointerIfSupported[type(of: lc)])
-  expectEqual(
-    0,
-    lc.log._withUnsafeMutableBufferPointerIfSupportedNonNilReturns[type(of: lc)])
+  expectEqual(0, actualWUMBPIF + actualWCMSIA)
+  expectEqual(0, actualWUMBPIFNonNil + actualWCMSIANonNil)
 
   expectEqualSequence([ 1, 2, 3, 4, 5 ], extractedResult.map { $0.value })
 }
@@ -631,7 +634,7 @@ self.test("\(testNamePrefix).sorted/ThrowingPredicateWithLargeNumberElements") {
 }
 
 
-self.test("\(testNamePrefix).sorted/DispatchesThrough_withUnsafeMutableBufferPointerIfSupported/Predicate") {
+self.test("\(testNamePrefix).sorted/DispatchesThroughDirectStorageAccessors/Predicate") {
   let sequence = [ 5, 4, 3, 2, 1 ]
   let elements: [OpaqueValue<Int>] =
     zip(sequence, 0..<sequence.count).map {
@@ -639,18 +642,21 @@ self.test("\(testNamePrefix).sorted/DispatchesThrough_withUnsafeMutableBufferPoi
     }
   let c = makeWrappedCollection(elements)
 
-  var lc = LoggingMutableCollection(wrapping: c)
+  let lc = LoggingMutableCollection(wrapping: c)
 
   let result = lc.sorted { extractValue($0).value < extractValue($1).value }
   let extractedResult = result.map(extractValue)
 
+  let actualWUMBPIF = lc.log._withUnsafeMutableBufferPointerIfSupported[type(of: lc)]
+  let actualWCMSIA =  lc.log.withContiguousMutableStorageIfAvailable[type(of: lc)]
+
+  let actualWUMBPIFNonNil = lc.log._withUnsafeMutableBufferPointerIfSupportedNonNilReturns[type(of: lc)]
+  let actualWCMSIAIFNonNil =  lc.log.withContiguousMutableStorageIfAvailableNonNilReturns[type(of: lc)]
+
   // This sort operation is not in-place.
   // The collection is copied into an array before sorting.
-  expectEqual(
-    0, lc.log._withUnsafeMutableBufferPointerIfSupported[type(of: lc)])
-  expectEqual(
-    0,
-    lc.log._withUnsafeMutableBufferPointerIfSupportedNonNilReturns[type(of: lc)])
+  expectEqual(0, actualWUMBPIF + actualWCMSIA)
+  expectEqual(0, actualWUMBPIFNonNil + actualWCMSIAIFNonNil)
 
   expectEqualSequence([ 1, 2, 3, 4, 5 ], extractedResult.map { $0.value })
 }
@@ -918,7 +924,7 @@ if resiliencyChecks.subscriptOnOutOfBoundsIndicesBehavior != .none {
     var c = makeWrappedCollection([ 1010, 2020, 3030 ].map(OpaqueValue.init))
     var index = c.startIndex
     expectCrashLater()
-    index = c.index(index, offsetBy: numericCast(-outOfBoundsSubscriptOffset))
+    index = c.index(index, offsetBy: -outOfBoundsSubscriptOffset)
     c[index] = wrapValue(OpaqueValue(9999))
   }
 
@@ -926,7 +932,7 @@ if resiliencyChecks.subscriptOnOutOfBoundsIndicesBehavior != .none {
     var c = makeWrappedCollection([])
     var index = c.startIndex
     expectCrashLater()
-    index = c.index(index, offsetBy: numericCast(-outOfBoundsSubscriptOffset))
+    index = c.index(index, offsetBy: -outOfBoundsSubscriptOffset)
     c[index] = wrapValue(OpaqueValue(9999))
   }
 }
@@ -949,7 +955,7 @@ self.test("\(testNamePrefix).reverse()") {
 // partition(by:)
 //===----------------------------------------------------------------------===//
 
-self.test("\(testNamePrefix).partition/DispatchesThrough_withUnsafeMutableBufferPointerIfSupported") {
+self.test("\(testNamePrefix).partition/DispatchesThroughDirectStorageAccessors") {
   let sequence = [ 5, 4, 3, 2, 1 ]
   let elements: [OpaqueValue<Int>] =
     zip(sequence, 0..<sequence.count).map {
@@ -965,11 +971,23 @@ self.test("\(testNamePrefix).partition/DispatchesThrough_withUnsafeMutableBuffer
     return !(extractValue(val).value < extractValue(first!).value)
   })
 
-  expectEqual(
-    1, lc.log._withUnsafeMutableBufferPointerIfSupported[type(of: lc)])
+  let actualWUMBPIF = lc.log._withUnsafeMutableBufferPointerIfSupported[type(of: lc)]
+  let actualWCMSIA =  lc.log.withContiguousMutableStorageIfAvailable[type(of: lc)]
+
+  let actualWUMBPIFNonNil = lc.log._withUnsafeMutableBufferPointerIfSupportedNonNilReturns[type(of: lc)]
+  let actualWCMSIAIFNonNil =  lc.log.withContiguousMutableStorageIfAvailableNonNilReturns[type(of: lc)]
+
+  expectEqual(1, actualWUMBPIF + actualWCMSIA)
   expectEqual(
     withUnsafeMutableBufferPointerIsSupported ? 1 : 0,
-    lc.log._withUnsafeMutableBufferPointerIfSupportedNonNilReturns[type(of: lc)])
+    actualWUMBPIFNonNil + actualWCMSIAIFNonNil)
+
+  if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
+    // `partition(by:)` is expected to dispatch to the public API in releases
+    // that contain https://github.com/apple/swift/pull/36003.
+    expectEqual(0, actualWUMBPIF)
+    expectEqual(0, actualWUMBPIFNonNil)
+  }
 
   expectEqual(4, lc.distance(from: lc.startIndex, to: pivot))
   expectEqualsUnordered([1, 2, 3, 4], lc.prefix(upTo: pivot).map { extractValue($0).value })
@@ -1279,4 +1297,3 @@ self.test("\(testNamePrefix).sort/ThrowingPredicateWithLargeNumberElements") {
 
   } // addMutableRandomAccessCollectionTests
 }
-

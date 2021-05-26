@@ -1,4 +1,4 @@
-silopt_register_sources(
+target_sources(swiftSILOptimizer PRIVATE
   ARCAnalysis.cpp
   AccessSummaryAnalysis.cpp
   AccessedStorageAnalysis.cpp
@@ -7,11 +7,12 @@ silopt_register_sources(
   ArraySemantic.cpp
   BasicCalleeAnalysis.cpp
   CallerAnalysis.cpp
-  CFG.cpp
   ClassHierarchyAnalysis.cpp
   ClosureScope.cpp
   ColdBlockInfo.cpp
+  DeadEndBlocksAnalysis.cpp
   DestructorAnalysis.cpp
+  DifferentiableActivityAnalysis.cpp
   EscapeAnalysis.cpp
   EpilogueARCAnalysis.cpp
   FunctionOrder.cpp
@@ -19,11 +20,11 @@ silopt_register_sources(
   LoopAnalysis.cpp
   LoopRegionAnalysis.cpp
   MemoryBehavior.cpp
+  NonLocalAccessBlockAnalysis.cpp
   PassManagerVerifierAnalysis.cpp
   ProtocolConformanceAnalysis.cpp
   RCIdentityAnalysis.cpp
   SideEffectAnalysis.cpp
   SimplifyInstruction.cpp
   TypeExpansionAnalysis.cpp
-  ValueTracking.cpp
-)
+  ValueTracking.cpp)

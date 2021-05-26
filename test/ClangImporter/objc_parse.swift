@@ -6,6 +6,7 @@ import AppKit
 import AVFoundation
 
 import Newtype
+import NewtypeSystem
 import objc_ext
 import TestProtocols
 import TypeAndValue
@@ -73,7 +74,12 @@ func classMethods(_ b: B, other: NSObject) {
   // Both class and instance methods exist.
   B.description()
   B.instanceTakesObjectClassTakesFloat(2.0)
-  B.instanceTakesObjectClassTakesFloat(other) // expected-error{{cannot convert value of type 'NSObject' to expected argument type 'Float'}}
+  // TODO(diagnostics): Once argument/parameter conversion diagnostics are implemented we should be able to
+  // diagnose this as failed conversion from NSObject to Float, but right now the problem is that there
+  // exists another overload `instanceTakesObjectClassTakesFloat: (Any?) -> Void` which makes this invocation
+  // type-check iff base is an instance of `B`.
+  B.instanceTakesObjectClassTakesFloat(other)
+  // expected-error@-1 {{instance member 'instanceTakesObjectClassTakesFloat' cannot be used on type 'B'; did you mean to use a value of this type instead?}}
 
   // Call an instance method of NSObject.
   var c: AnyClass = B.myClass() // no-warning
@@ -178,8 +184,12 @@ func keyedSubscripting(_ b: B, idx: A, a: A) {
   dict[NSString()] = a
   let value = dict[NSString()]
 
-  dict[nil] = a // expected-error {{cannot assign value of type 'A' to type 'Any?'}}
-  let q = dict[nil]  // expected-error {{ambiguous subscript}}
+  // notes attached to the partially matching declarations for both following subscripts:
+  // - override subscript(_: Any) -> Any? -> 'nil' is not compatible with expected argument type 'Any' at position #1
+  // - open subscript(key: NSCopying) -> Any? { get set } -> 'nil' is not compatible with expected argument type 'NSCopying' at position #1
+
+  dict[nil] = a // expected-error {{no exact matches in call to subscript}}
+  let q = dict[nil]  // expected-error {{no exact matches in call to subscript}}
   _ = q
 }
 
@@ -200,7 +210,7 @@ func testProtocols(_ b: B, bp: BProto) {
   var c1 : Cat1Proto = b
   var bcat1 = b.getAsProtoWithCat()!
   c1 = bcat1
-  bcat1 = c1 // expected-error{{value of type 'Cat1Proto' does not conform to 'BProto & Cat1Proto' in assignment}}
+  bcat1 = c1 // expected-error{{value of type 'Cat1Proto' does not conform to 'BProto' in assignment}}
 }
 
 // Methods only defined in a protocol
@@ -273,8 +283,7 @@ func classAnyObject(_ obj: NSObject) {
 class Wobbler : NSWobbling {
   @objc func wobble() { }
 
-  func returnMyself() -> Self { return self } // expected-error{{non-'@objc' method 'returnMyself()' does not satisfy requirement of '@objc' protocol 'NSWobbling'}}{{none}}
-  // expected-error@-1{{method cannot be an implementation of an @objc requirement because its result type cannot be represented in Objective-C}}
+  func returnMyself() -> Self { return self }
 }
 
 extension Wobbler : NSMaybeInitWobble { // expected-error{{type 'Wobbler' does not conform to protocol 'NSMaybeInitWobble'}}
@@ -290,7 +299,7 @@ extension Wobbler2 : NSMaybeInitWobble { // expected-error{{type 'Wobbler2' does
 
 func optionalMemberAccess(_ w: NSWobbling) {
   w.wobble()
-  w.wibble() // expected-error{{value of optional type '(() -> Void)?' must be unwrapped}}
+  w.wibble() // expected-error{{value of optional type '(() -> Void)?' must be unwrapped to a value of type '() -> Void'}}
   // expected-note@-1{{coalesce}}
   // expected-note@-2{{force-unwrap}}
   let x = w[5]!!
@@ -347,7 +356,8 @@ func testDynamicSelf(_ queen: Bee, wobbler: NSWobbling) {
   // class itself.
   // FIXME: This should be accepted.
   let baseClass: ObjCParseExtras.Base.Type = ObjCParseExtras.Base.returnMyself()
-  // expected-error@-1 {{instance member 'returnMyself' cannot be used on type 'Base'}}
+  // expected-error@-1 {{instance member 'returnMyself' cannot be used on type 'Base'; did you mean to use a value of this type instead?}}
+  // expected-error@-2 {{cannot convert value of type 'Base?' to specified type 'Base.Type'}}
 }
 
 func testRepeatedProtocolAdoption(_ w: NSWindow) {
@@ -473,8 +483,7 @@ func testProtocolClassShadowing(_ obj: ClassInHelper, p: ProtoInHelper) {
 
 func testDealloc(_ obj: NSObject) {
   // dealloc is subsumed by deinit.
-  // FIXME: Special-case diagnostic in the type checker?
-  obj.dealloc() // expected-error{{value of type 'NSObject' has no member 'dealloc'}}
+  obj.dealloc() // expected-error{{'dealloc()' is unavailable in Swift: use 'deinit' to define a de-initializer}}
 }
 
 func testConstantGlobals() {
@@ -535,18 +544,20 @@ func testStrangeSelectors(obj: StrangeSelectors) {
 
 func testProtocolQualified(_ obj: CopyableNSObject, cell: CopyableSomeCell,
                            plainObj: NSObject, plainCell: SomeCell) {
-  _ = obj as NSObject // expected-error {{'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') is not convertible to 'NSObject'; did you mean to use 'as!' to force downcast?}} {{11-13=as!}}
+  _ = obj as NSObject // expected-error {{'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') is not convertible to 'NSObject'}} 
+  // expected-note@-1 {{did you mean to use 'as!' to force downcast?}} {{11-13=as!}}
   _ = obj as NSObjectProtocol
   _ = obj as NSCopying
-  _ = obj as SomeCell // expected-error {{'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') is not convertible to 'SomeCell'; did you mean to use 'as!' to force downcast?}} {{11-13=as!}}
+  _ = obj as SomeCell // expected-error {{'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') is not convertible to 'SomeCell'}}
+  // expected-note@-1 {{did you mean to use 'as!' to force downcast?}} {{11-13=as!}}
 
   _ = cell as NSObject
   _ = cell as NSObjectProtocol
   _ = cell as NSCopying
   _ = cell as SomeCell
   
-  _ = plainObj as CopyableNSObject // expected-error {{'NSObject' is not convertible to 'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol'); did you mean to use 'as!' to force downcast?}} {{16-18=as!}}
-  _ = plainCell as CopyableSomeCell // expected-error {{'SomeCell' is not convertible to 'CopyableSomeCell' (aka 'SomeCell & NSCopying'); did you mean to use 'as!' to force downcast?}}
+  _ = plainObj as CopyableNSObject // expected-error {{value of type 'NSObject' does not conform to 'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') in coercion}} 
+  _ = plainCell as CopyableSomeCell // expected-error {{value of type 'SomeCell' does not conform to 'CopyableSomeCell' (aka 'SomeCell & NSCopying') in coercion}}
 }
 
 extension Printing {
@@ -670,8 +681,8 @@ func testBridgeFunctionPointerTypedefs(fptrTypedef: FPTypedef) {
 }
 
 func testNonTrivialStructs() {
-  _ = NonTrivialToCopy() // expected-error {{use of unresolved identifier 'NonTrivialToCopy'}}
-  _ = NonTrivialToCopyWrapper() // expected-error {{use of unresolved identifier 'NonTrivialToCopyWrapper'}}
+  _ = NonTrivialToCopy() // expected-error {{cannot find 'NonTrivialToCopy' in scope}}
+  _ = NonTrivialToCopyWrapper() // expected-error {{cannot find 'NonTrivialToCopyWrapper' in scope}}
   _ = TrivialToCopy() // okay
 }
 
@@ -683,4 +694,14 @@ func testErrorNewtype() {
   // works.
   testErrorDictionary(3) // expected-error {{cannot convert value of type 'Int' to expected argument type '[AnyHashable : String]'}}
   testErrorDictionaryNewtype(3) // expected-error {{cannot convert value of type 'Int' to expected argument type '[AnyHashable : String]'}}
+}
+
+func testNSUIntegerNewtype() {
+  let _: NSUIntegerNewType = NSUIntegerNewType(4)
+  let _: UInt = NSUIntegerNewType(4).rawValue
+  let _: NSUIntegerNewType = NSUIntegerNewType.constant
+
+  let _: NSUIntegerSystemNewType = NSUIntegerSystemNewType(4)
+  let _: Int = NSUIntegerSystemNewType(4).rawValue
+  let _: NSUIntegerSystemNewType = NSUIntegerSystemNewType.constant
 }

@@ -14,6 +14,7 @@
 #define SWIFT_SERIALIZATION_VALIDATION_H
 
 #include "swift/Basic/LLVM.h"
+#include "swift/Serialization/SerializationOptions.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -42,7 +43,7 @@ enum class Status {
   MissingDependency,
 
   /// The module file is an overlay for a Clang module, which can't be found.
-  MissingShadowedModule,
+  MissingUnderlyingModule,
 
   /// The module file depends on a module that is still being loaded, i.e.
   /// there is a circular dependency.
@@ -76,7 +77,9 @@ struct ValidationInfo {
   StringRef name = {};
   StringRef targetTriple = {};
   StringRef shortVersion = {};
+  StringRef miscVersion = {};
   version::Version compatibilityVersion = {};
+  llvm::VersionTuple userModuleVersion;
   size_t bytes = 0;
   Status status = Status::Malformed;
 };
@@ -91,10 +94,15 @@ struct ValidationInfo {
 class ExtendedValidationInfo {
   SmallVector<StringRef, 4> ExtraClangImporterOpts;
   StringRef SDKPath;
+  StringRef ModuleABIName;
   struct {
+    unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
+    unsigned IsStaticLibrary: 1;
     unsigned IsTestable : 1;
     unsigned ResilienceStrategy : 2;
+    unsigned IsImplicitDynamicEnabled : 1;
+    unsigned IsAllowModuleWithCompilerErrorsEnabled : 1;
   } Bits;
 public:
   ExtendedValidationInfo() : Bits() {}
@@ -116,6 +124,18 @@ public:
   void setIsSIB(bool val) {
       Bits.IsSIB = val;
   }
+  bool arePrivateImportsEnabled() { return Bits.ArePrivateImportsEnabled; }
+  void setPrivateImportsEnabled(bool enabled) {
+    Bits.ArePrivateImportsEnabled = enabled;
+  }
+  bool isImplicitDynamicEnabled() { return Bits.IsImplicitDynamicEnabled; }
+  void setImplicitDynamicEnabled(bool val) {
+    Bits.IsImplicitDynamicEnabled = val;
+  }
+  bool isStaticLibrary() const { return Bits.IsStaticLibrary; }
+  void setIsStaticLibrary(bool val) {
+    Bits.IsStaticLibrary = val;
+  }
   bool isTestable() const { return Bits.IsTestable; }
   void setIsTestable(bool val) {
     Bits.IsTestable = val;
@@ -126,6 +146,15 @@ public:
   void setResilienceStrategy(ResilienceStrategy resilience) {
     Bits.ResilienceStrategy = unsigned(resilience);
   }
+  bool isAllowModuleWithCompilerErrorsEnabled() {
+    return Bits.IsAllowModuleWithCompilerErrorsEnabled;
+  }
+  void setAllowModuleWithCompilerErrorsEnabled(bool val) {
+    Bits.IsAllowModuleWithCompilerErrorsEnabled = val;
+  }
+
+  StringRef getModuleABIName() const { return ModuleABIName; }
+  void setModuleABIName(StringRef name) { ModuleABIName = name; }
 };
 
 /// Returns info about the serialized AST in the given data.
@@ -144,9 +173,12 @@ public:
 /// \param[out] extendedInfo If present, will be populated with additional
 /// compilation options serialized into the AST at build time that may be
 /// necessary to load it properly.
-ValidationInfo
-validateSerializedAST(StringRef data,
-                      ExtendedValidationInfo *extendedInfo = nullptr);
+/// \param[out] dependencies If present, will be populated with list of
+/// input files the module depends on, if present in INPUT_BLOCK.
+ValidationInfo validateSerializedAST(
+    StringRef data, ExtendedValidationInfo *extendedInfo = nullptr,
+    SmallVectorImpl<SerializationOptions::FileDependency> *dependencies =
+        nullptr);
 
 /// Emit diagnostics explaining a failure to load a serialized AST.
 ///
@@ -157,14 +189,13 @@ validateSerializedAST(StringRef data,
 ///   Status::Valid.
 /// - \p moduleBufferID and \p moduleDocBufferID are the buffer identifiers
 ///   of the module input and doc input buffers respectively (\ref 
-///   SerializedModuleLoader::loadAST, \ref ModuleFile::load).
+///   SerializedModuleLoaderBase::loadAST, \ref ModuleFile::load).
 /// - \p loadedModuleFile is an invalid loaded module.
 /// - \p ModuleName is the name used to refer to the module in diagnostics.
 void diagnoseSerializedASTLoadFailure(
     ASTContext &Ctx, SourceLoc diagLoc, const ValidationInfo &loadInfo,
-    const ExtendedValidationInfo &extendedInfo, StringRef moduleBufferID,
-    StringRef moduleDocBufferID, ModuleFile *loadedModuleFile,
-    Identifier ModuleName);
+    StringRef moduleBufferID, StringRef moduleDocBufferID,
+    ModuleFile *loadedModuleFile, Identifier ModuleName);
 
 } // end namespace serialization
 } // end namespace swift

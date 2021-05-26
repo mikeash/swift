@@ -19,23 +19,41 @@
 #include "swift/Driver/Job.h"
 #include "swift/Driver/ToolChain.h"
 #include "llvm/Option/ArgList.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/StringSaver.h"
 
 using namespace swift;
 using namespace swift::driver;
 
+void swift::driver::ExpandResponseFilesWithRetry(llvm::StringSaver &Saver,
+                                llvm::SmallVectorImpl<const char *> &Args) {
+  const unsigned MAX_COUNT = 30;
+  for (unsigned I = 0; I != MAX_COUNT; ++I) {
+    if (llvm::cl::ExpandResponseFiles(Saver,
+        llvm::Triple(llvm::sys::getProcessTriple()).isOSWindows()
+          ? llvm::cl::TokenizeWindowsCommandLine
+          : llvm::cl::TokenizeGNUCommandLine,
+        Args)) {
+      return;
+    }
+  }
+}
+
 bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
     ArrayRef<const char *> Argv, DiagnosticEngine &Diags,
-    llvm::function_ref<bool(ArrayRef<const char *> FrontendArgs)> Action) {
+    llvm::function_ref<bool(ArrayRef<const char *> FrontendArgs)> Action,
+    bool ForceNoOutputs) {
   SmallVector<const char *, 16> Args;
   Args.push_back("<swiftc>"); // FIXME: Remove dummy argument.
   Args.insert(Args.end(), Argv.begin(), Argv.end());
 
   // When creating a CompilerInvocation, ensure that the driver creates a single
   // frontend command.
-  Args.push_back("-force-single-frontend-invocation");
+  Args.push_back("-whole-module-optimization");
 
   // Explictly disable batch mode to avoid a spurious warning when combining
-  // -enable-batch-mode with -force-single-frontend-invocation.  This is an
+  // -enable-batch-mode with -whole-module-optimization.  This is an
   // implementation detail.
   Args.push_back("-disable-batch-mode");
 
@@ -45,6 +63,11 @@ bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
   Args.push_back("-driver-filelist-threshold");
   Args.push_back(neverThreshold.c_str());
 
+  // Expand any file list args.
+  llvm::BumpPtrAllocator Allocator;
+  llvm::StringSaver Saver(Allocator);
+  ExpandResponseFilesWithRetry(Saver, Args);
+
   // Force the driver into batch mode by specifying "swiftc" as the name.
   Driver TheDriver("swiftc", "swiftc", Args, Diags);
 
@@ -52,17 +75,33 @@ bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
   // CompilerInvocation may wish to remap inputs to source buffers.
   TheDriver.setCheckInputFilesExist(false);
 
+  TheDriver.setIsDummyDriverForFrontendInvocation(true);
+
   std::unique_ptr<llvm::opt::InputArgList> ArgList =
     TheDriver.parseArgStrings(ArrayRef<const char *>(Args).slice(1));
   if (Diags.hadAnyError())
     return true;
+
+  if (ForceNoOutputs) {
+    // Clear existing output modes and supplementary outputs.
+    ArgList->eraseArg(options::OPT_modes_Group);
+    ArgList->eraseArgIf([](const llvm::opt::Arg *A) {
+      return A && A->getOption().hasFlag(options::SupplementaryOutput);
+    });
+
+    unsigned index = ArgList->MakeIndex("-typecheck");
+    // Takes ownership of the Arg.
+    ArgList->append(new llvm::opt::Arg(
+        TheDriver.getOpts().getOption(options::OPT_typecheck),
+        ArgList->getArgString(index), index));
+  }
 
   std::unique_ptr<ToolChain> TC = TheDriver.buildToolChain(*ArgList);
   if (Diags.hadAnyError())
     return true;
 
   std::unique_ptr<Compilation> C =
-      TheDriver.buildCompilation(*TC, std::move(ArgList));
+      TheDriver.buildCompilation(*TC, std::move(ArgList), /*AllowErrors=*/true);
   if (!C || C->getJobs().empty())
     return true; // Don't emit an error; one should already have been emitted
 
@@ -74,7 +113,6 @@ bool swift::driver::getSingleFrontendInvocationFromDriverArguments(
   if (CompileCommands.size() != 1) {
     // TODO: include Jobs in the diagnostic.
     Diags.diagnose(SourceLoc(), diag::error_expected_one_frontend_job);
-    return true;
   }
 
   const Job *Cmd = *CompileCommands.begin();

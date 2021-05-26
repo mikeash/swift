@@ -10,8 +10,8 @@ class A {
   @objc(do_b_2:) func do_b(_ x: Int) {}
   @objc func do_b(_ x: Float) {}
 
-  @objc func do_c(x: Int) {}
-  @objc func do_c(y: Int) {}
+  @objc func do_c(x: Int) {} // expected-note {{incorrect labels for candidate (have: '(_:)', expected: '(x:)')}}
+  @objc func do_c(y: Int) {} // expected-note {{incorrect labels for candidate (have: '(_:)', expected: '(y:)')}}
 }
 
 func test0(_ a: AnyObject) {
@@ -20,7 +20,7 @@ func test0(_ a: AnyObject) {
   a.do_b?(1)
   a.do_b?(5.0)
 
-  a.do_c?(1) // expected-error {{cannot invoke value of function type with argument list '(Int)'}}
+  a.do_c?(1) // expected-error {{no exact matches in call to instance method 'do_c'}}
   a.do_c?(x: 1)
 }
 
@@ -64,15 +64,17 @@ func test5() -> Int? {
 }
 
 func test6<T>(_ x : T) {
-  // FIXME: this code should work; T could be Int? or Int??
-  // or something like that at runtime.  rdar://16374053
-  _ = x as? Int? // expected-error {{cannot downcast from 'T' to a more optional type 'Int?'}}
+  _ = x as? Int? // Okay.  We know nothing about T, so cannot judge.
 }
 
 class B : A { }
 
 func test7(_ x : A) {
-  _ = x as? B? // expected-error{{cannot downcast from 'A' to a more optional type 'B?'}}
+  _ = x as? B? // Okay: Injecting into an Optional
+}
+
+func test7a(_ x : B) {
+  _ = x as? A // expected-warning{{conditional cast from 'B' to 'A' always succeeds}}
 }
 
 func test8(_ x : AnyObject?) {
@@ -217,7 +219,7 @@ struct SR_3248 {
 
 SR_3248().callback?("test") // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
 SR_3248().callback!("test") // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
-SR_3248().callback("test")  // expected-error {{cannot invoke 'callback' with an argument list of type '(String)'}}
+SR_3248().callback("test")  // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
 
 _? = nil  // expected-error {{'nil' requires a contextual type}}
 _?? = nil // expected-error {{'nil' requires a contextual type}}
@@ -291,4 +293,209 @@ func se0213() {
   _ = Q("why")?.foo // Ok
   _ = Q("who")!.foo // Ok
   _ = Q?("how") // Ok
+}
+
+func rdar45218255(_ i: Int) {
+  struct S<T> {
+    init(_:[T]) {}
+  }
+
+  _ = i!           // expected-error {{cannot force unwrap value of non-optional type 'Int'}} {{8-9=}}
+  _ = [i!]         // expected-error {{cannot force unwrap value of non-optional type 'Int'}} {{9-10=}}
+  _ = S<Int>([i!]) // expected-error {{cannot force unwrap value of non-optional type 'Int'}} {{16-17=}}
+}
+
+// rdar://problem/47967277 - cannot assign through '!': '$0' is immutable
+func sr_9893_1() {
+  func foo<T : Equatable>(_: @autoclosure () throws -> T,
+                          _: @autoclosure () throws -> T) {}
+
+  class A {
+    var bar: String?
+  }
+
+  let r1 = A()
+  let r2 = A()
+
+  let arr1: [A] = []
+  foo(Set(arr1.map { $0.bar! }), Set([r1, r2].map { $0.bar! })) // Ok
+}
+
+func sr_9893_2(cString: UnsafePointer<CChar>) {
+  struct S {
+    var a: Int32 = 0
+    var b = ContiguousArray<CChar>(repeating: 0, count: 10)
+  }
+
+  var s = S()
+
+  withUnsafeMutablePointer(to: &s.a) { ptrA in
+    s.b.withUnsafeMutableBufferPointer { bufferB in
+      withVaList([ptrA, bufferB.baseAddress!]) { ptr in } // Ok
+    }
+  }
+}
+
+// rdar://problem/47776586 - Diagnostic refers to '&' which is not present in the source code
+func rdar47776586() {
+  func foo(_: inout Int) {}
+  var x: Int? = 0
+  foo(&x) // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{7-7=(}} {{9-9=)!}}
+
+  var dict = [1: 2]
+  dict[1] += 1 // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{10-10=!}}
+}
+
+struct S {
+  var foo: Optional<() -> Int?> = nil
+  var bar: Optional<() -> Int?> = nil
+
+  mutating func test(_ clj: @escaping () -> Int) {
+    if let fn = foo {
+      bar = fn  // Ok
+      bar = clj // Ok
+    }
+  }
+}
+
+// rdar://problem/53238058 - Crash in getCalleeLocator while trying to produce a diagnostic about missing optional unwrap
+//                           associated with an argument to a call
+
+func rdar_53238058() {
+  struct S {
+    init(_: Double) {}
+    init<T>(_ value: T) where T : BinaryFloatingPoint {}
+  }
+
+  func test(_ str: String) {
+    _ = S(Double(str)) // expected-error {{value of optional type 'Double?' must be unwrapped to a value of type 'Double'}}
+    // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}}
+    // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}}
+  }
+}
+
+// SR-8411 - Inconsistent ambiguity with optional and non-optional inout-to-pointer
+func sr8411() {
+  struct S {
+    init(_ x: UnsafeMutablePointer<Int>) {}
+    init(_ x: UnsafeMutablePointer<Int>?) {}
+
+    static func foo(_ x: UnsafeMutablePointer<Int>) {}
+    static func foo(_ x: UnsafeMutablePointer<Int>?) {}
+
+    static func bar(_ x: UnsafeMutablePointer<Int>, _ y: Int) {}
+    static func bar(_ x: UnsafeMutablePointer<Int>?, _ y: Int) {}
+  }
+
+  var foo = 0
+
+  _ = S(&foo)      // Ok
+  _ = S.init(&foo) // Ok
+  S.foo(&foo)  // Ok
+  S.bar(&foo, 42) // Ok
+}
+
+// SR-11104 - Slightly misleading diagnostics for contextual failures with multiple fixes
+func sr_11104() {
+  func bar(_: Int) {}
+
+  bar(["hello"].first)
+  // expected-error@-1 {{cannot convert value of type 'String?' to expected argument type 'Int'}}
+}
+
+// rdar://problem/57668873 - Too eager force optional unwrap fix
+
+@objc class Window {}
+
+@objc protocol WindowDelegate {
+  @objc optional var window: Window? { get set }
+}
+
+func test_force_unwrap_not_being_too_eager() {
+  struct WindowContainer {
+    unowned(unsafe) var delegate: WindowDelegate? = nil
+  }
+
+  let obj: WindowContainer = WindowContainer()
+  if let _ = obj.delegate?.window { // Ok
+  }
+}
+
+// rdar://problem/57097401
+func invalidOptionalChaining(a: Any) {
+  a == "="? // expected-error {{cannot use optional chaining on non-optional value of type 'String'}}
+  // expected-error@-1 {{protocol 'Any' as a type cannot conform to 'Equatable'}}
+  // expected-note@-2 {{requirement from conditional conformance of 'Any?' to 'Equatable'}} expected-note@-2 {{only concrete types such as structs, enums and classes can conform to protocols}}
+}
+
+// SR-12309 - Force unwrapping 'nil' compiles without warning
+func sr_12309() {
+  struct S {
+    var foo: Int
+  }
+
+  _ = S(foo: nil!) // expected-error {{'nil' literal cannot be force unwrapped}}
+  _ = nil! // expected-error {{'nil' literal cannot be force unwrapped}}
+  _ = (nil!) // expected-error {{'nil' literal cannot be force unwrapped}}
+  _ = (nil)! // expected-error {{'nil' literal cannot be force unwrapped}}
+  _ = ((nil))! // expected-error {{'nil' literal cannot be force unwrapped}}
+  _ = nil? // expected-error {{'nil' requires a contextual type}}
+  _ = ((nil?)) // expected-error {{'nil' requires a contextual type}}
+  _ = ((nil))? // expected-error {{'nil' requires a contextual type}}
+  _ = ((nil)?) // expected-error {{'nil' requires a contextual type}}
+  _ = nil // expected-error {{'nil' requires a contextual type}}
+  _ = (nil) // expected-error {{'nil' requires a contextual type}}
+  _ = ((nil)) // expected-error {{'nil' requires a contextual type}}
+  _ = (((nil))) // expected-error {{'nil' requires a contextual type}}
+  _ = ((((((nil)))))) // expected-error {{'nil' requires a contextual type}}
+  _ = (((((((((nil))))))))) // expected-error {{'nil' requires a contextual type}}
+
+  func test_with_contextual_type_one() -> Int? {
+    return (nil) // Ok
+  }
+
+  func test_with_contextual_type_many() -> Int? {
+    return (((nil))) // Ok
+  }
+}
+
+// rdar://75146811 - crash due to incorrect inout type
+func rdar75146811() {
+  func test(_: UnsafeMutablePointer<Double>) {}
+  func test_tuple(_: UnsafeMutablePointer<Double>, x: Int) {}
+  func test_named(x: UnsafeMutablePointer<Double>) {}
+
+  var arr: [Double]! = []
+
+  test(&arr) // expected-error {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+  test((&arr)) // expected-error {{use of extraneous '&'}}
+  // expected-error@-1 {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+  test(&(arr)) // expected-error {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+
+  test_tuple(&arr, x: 0) // expected-error {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+  test_tuple((&arr), x: 0) // expected-error {{use of extraneous '&'}}
+  // expected-error@-1 {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+  test_tuple(&(arr), x: 0) // expected-error {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+
+  test_named(x: &arr) // expected-error {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+  test_named(x: (&arr)) // expected-error {{use of extraneous '&'}}
+  // expected-error@-1 {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+  test_named(x: &(arr)) // expected-error {{cannot convert value of type '[Double]?' to expected argument type 'Double'}}
+}
+
+// rdar://75514153 - Unable to produce a diagnostic for ambiguities related to use of `nil`
+func rdar75514153() {
+  func test_no_label(_: Int) {}    // expected-note 2 {{'nil' is not compatible with expected argument type 'Int' at position #1}}
+  func test_no_label(_: String) {} // expected-note 2 {{'nil' is not compatible with expected argument type 'String' at position #1}}
+
+  test_no_label(nil)   // expected-error {{no exact matches in call to local function 'test_no_label'}}
+  test_no_label((nil)) // expected-error {{no exact matches in call to local function 'test_no_label'}}
+
+  func test_labeled(_: Int, x: Int) {}    // expected-note 2 {{'nil' is not compatible with expected argument type 'Int' at position #2}}
+  func test_labeled(_: Int, x: String) {} // expected-note 2 {{'nil' is not compatible with expected argument type 'String' at position #2}}
+
+  test_labeled(42, x: nil)   // expected-error {{no exact matches in call to local function 'test_labeled'}}
+  test_labeled(42, x: (nil)) // expected-error {{no exact matches in call to local function 'test_labeled'}}
 }

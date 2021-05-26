@@ -74,7 +74,8 @@ void LoopCloner::cloneLoop() {
   Loop->getExitBlocks(ExitBlocks);
 
   // Clone the entire loop.
-  cloneReachableBlocks(Loop->getHeader(), ExitBlocks);
+  cloneReachableBlocks(Loop->getHeader(), ExitBlocks,
+                       /*insertAfter*/Loop->getLoopLatch());
 }
 
 /// Determine the number of iterations the loop is at most executed. The loop
@@ -93,37 +94,52 @@ static Optional<uint64_t> getMaxLoopTripCount(SILLoop *Loop,
   if (!Loop->isLoopExiting(Latch))
     return None;
 
-  // Get the loop exit condition.
+ // Get the loop exit condition.
   auto *CondBr = dyn_cast<CondBranchInst>(Latch->getTerminator());
   if (!CondBr)
     return None;
 
   // Match an add 1 recurrence.
-  SILPhiArgument *RecArg;
-  IntegerLiteralInst *End;
-  SILValue RecNext;
+
+  auto *Cmp = dyn_cast<BuiltinInst>(CondBr->getCondition());
+  if (!Cmp)
+    return None;
 
   unsigned Adjust = 0;
+  SILBasicBlock *Exit = CondBr->getTrueBB();
 
-  if (!match(CondBr->getCondition(),
-             m_BuiltinInst(BuiltinValueKind::ICMP_EQ, m_SILValue(RecNext),
-                           m_IntegerLiteralInst(End))) &&
-      !match(CondBr->getCondition(),
-             m_BuiltinInst(BuiltinValueKind::ICMP_SGE, m_SILValue(RecNext),
-                           m_IntegerLiteralInst(End)))) {
-    if (!match(CondBr->getCondition(),
-               m_BuiltinInst(BuiltinValueKind::ICMP_SGT, m_SILValue(RecNext),
-                             m_IntegerLiteralInst(End))))
-      return None;
-    // Otherwise, we have a greater than comparison.
-    else
+  switch (Cmp->getBuiltinInfo().ID) {
+    case BuiltinValueKind::ICMP_EQ:
+    case BuiltinValueKind::ICMP_SGE:
+      break;
+    case BuiltinValueKind::ICMP_SGT:
       Adjust = 1;
+      break;
+    case BuiltinValueKind::ICMP_SLE:
+      Exit = CondBr->getFalseBB();
+      Adjust = 1;
+      break;
+    case BuiltinValueKind::ICMP_NE:
+    case BuiltinValueKind::ICMP_SLT:
+      Exit = CondBr->getFalseBB();
+      break;
+    default:
+      return None;
   }
 
-  if (!match(RecNext,
-             m_TupleExtractInst(m_ApplyInst(BuiltinValueKind::SAddOver,
-                                            m_SILPhiArgument(RecArg), m_One()),
-                                0)))
+  if (Loop->contains(Exit))
+    return None;
+
+  auto *End = dyn_cast<IntegerLiteralInst>(Cmp->getArguments()[1]);
+  if (!End)
+    return None;
+
+  SILValue RecNext = Cmp->getArguments()[0];
+  SILPhiArgument *RecArg;
+  if (!match(RecNext, m_TupleExtractOperation(
+                          m_ApplyInst(BuiltinValueKind::SAddOver,
+                                      m_SILPhiArgument(RecArg), m_One()),
+                          0)))
     return None;
 
   if (RecArg->getParent() != Header)
@@ -179,7 +195,7 @@ static bool canAndShouldUnrollLoop(SILLoop *Loop, uint64_t TripCount) {
         auto Callee = AI.getCalleeFunction();
         if (Callee && getEligibleFunction(AI, InlineSelection::Everything)) {
           // If callee is rather big and potentialy inlinable, it may be better
-          // not to unroll, so that the body of the calle can be inlined later.
+          // not to unroll, so that the body of the callee can be inlined later.
           Cost += Callee->size() * InsnsPerBB;
         }
       }
@@ -194,7 +210,7 @@ static bool canAndShouldUnrollLoop(SILLoop *Loop, uint64_t TripCount) {
 /// iterations header or if this is the last iteration remove the backedge to
 /// the header.
 static void redirectTerminator(SILBasicBlock *Latch, unsigned CurLoopIter,
-                               unsigned LastLoopIter, SILBasicBlock *OrigHeader,
+                               unsigned LastLoopIter, SILBasicBlock *CurrentHeader,
                                SILBasicBlock *NextIterationsHeader) {
 
   auto *CurrentTerminator = Latch->getTerminator();
@@ -224,18 +240,18 @@ static void redirectTerminator(SILBasicBlock *Latch, unsigned CurLoopIter,
       auto *CondBr = cast<CondBranchInst>(
           Latch->getSinglePredecessorBlock()->getTerminator());
       if (CondBr->getTrueBB() != Latch)
-        SILBuilder(CondBr).createBranch(CondBr->getLoc(), CondBr->getTrueBB(),
-                                        CondBr->getTrueArgs());
+        SILBuilderWithScope(CondBr).createBranch(
+            CondBr->getLoc(), CondBr->getTrueBB(), CondBr->getTrueArgs());
       else
-        SILBuilder(CondBr).createBranch(CondBr->getLoc(), CondBr->getFalseBB(),
-                                        CondBr->getFalseArgs());
+        SILBuilderWithScope(CondBr).createBranch(
+            CondBr->getLoc(), CondBr->getFalseBB(), CondBr->getFalseArgs());
       CondBr->eraseFromParent();
       return;
     }
 
     // Otherwise, branch to the next iteration's header.
-    SILBuilder(Br).createBranch(Br->getLoc(), NextIterationsHeader,
-                                Br->getArgs());
+    SILBuilderWithScope(Br).createBranch(Br->getLoc(), NextIterationsHeader,
+                                         Br->getArgs());
     Br->eraseFromParent();
     return;
   }
@@ -245,23 +261,26 @@ static void redirectTerminator(SILBasicBlock *Latch, unsigned CurLoopIter,
   // On the last iteration change the conditional exit to an unconditional
   // one.
   if (CurLoopIter == LastLoopIter) {
-    if (CondBr->getTrueBB() != OrigHeader)
-      SILBuilder(CondBr).createBranch(CondBr->getLoc(), CondBr->getTrueBB(),
-                                      CondBr->getTrueArgs());
-    else
-      SILBuilder(CondBr).createBranch(CondBr->getLoc(), CondBr->getFalseBB(),
-                                      CondBr->getFalseArgs());
+    if (CondBr->getTrueBB() == CurrentHeader) {
+      SILBuilderWithScope(CondBr).createBranch(
+          CondBr->getLoc(), CondBr->getFalseBB(), CondBr->getFalseArgs());
+    } else {
+      assert(CondBr->getFalseBB() == CurrentHeader);
+      SILBuilderWithScope(CondBr).createBranch(
+          CondBr->getLoc(), CondBr->getTrueBB(), CondBr->getTrueArgs());
+    }
     CondBr->eraseFromParent();
     return;
   }
 
   // Otherwise, branch to the next iteration's header.
-  if (CondBr->getTrueBB() == OrigHeader) {
-    SILBuilder(CondBr).createCondBranch(
+  if (CondBr->getTrueBB() == CurrentHeader) {
+    SILBuilderWithScope(CondBr).createCondBranch(
         CondBr->getLoc(), CondBr->getCondition(), NextIterationsHeader,
         CondBr->getTrueArgs(), CondBr->getFalseBB(), CondBr->getFalseArgs());
   } else {
-    SILBuilder(CondBr).createCondBranch(
+    assert(CondBr->getFalseBB() == CurrentHeader);
+    SILBuilderWithScope(CondBr).createCondBranch(
         CondBr->getLoc(), CondBr->getCondition(), CondBr->getTrueBB(),
         CondBr->getTrueArgs(), NextIterationsHeader, CondBr->getFalseArgs());
   }
@@ -305,7 +324,7 @@ void LoopCloner::collectLoopLiveOutValues(
 }
 
 static void
-updateSSA(SILLoop *Loop,
+updateSSA(SILModule &M, SILLoop *Loop,
           DenseMap<SILValue, SmallVector<SILValue, 8>> &LoopLiveOutValues) {
   SILSSAUpdater SSAUp;
   for (auto &MapEntry : LoopLiveOutValues) {
@@ -316,25 +335,27 @@ updateSSA(SILLoop *Loop,
       if (!Loop->contains(Use->getUser()->getParent()))
         UseList.push_back(UseWrapper(Use));
     // Update SSA of use with the available values.
-    SSAUp.Initialize(OrigValue->getType());
-    SSAUp.AddAvailableValue(OrigValue->getParentBlock(), OrigValue);
+    SSAUp.initialize(OrigValue->getType(), OrigValue.getOwnershipKind());
+    SSAUp.addAvailableValue(OrigValue->getParentBlock(), OrigValue);
     for (auto NewValue : MapEntry.second)
-      SSAUp.AddAvailableValue(NewValue->getParentBlock(), NewValue);
+      SSAUp.addAvailableValue(NewValue->getParentBlock(), NewValue);
     for (auto U : UseList) {
       Operand *Use = U;
-      SSAUp.RewriteUse(*Use);
+      SSAUp.rewriteUse(*Use);
     }
   }
 }
 
 /// Try to fully unroll the loop if we can determine the trip count and the trip
-/// count lis below a threshold.
+/// count is below a threshold.
 static bool tryToUnrollLoop(SILLoop *Loop) {
   assert(Loop->getSubLoops().empty() && "Expecting innermost loops");
 
+  LLVM_DEBUG(llvm::dbgs() << "Trying to unroll loop : \n" << *Loop);
   auto *Preheader = Loop->getLoopPreheader();
   if (!Preheader)
     return false;
+  SILModule &M = Preheader->getParent()->getModule();
 
   auto *Latch = Loop->getLoopLatch();
   if (!Latch)
@@ -344,11 +365,15 @@ static bool tryToUnrollLoop(SILLoop *Loop) {
 
   Optional<uint64_t> MaxTripCount =
       getMaxLoopTripCount(Loop, Preheader, Header, Latch);
-  if (!MaxTripCount)
+  if (!MaxTripCount) {
+    LLVM_DEBUG(llvm::dbgs() << "Not unrolling, did not find trip count\n");
     return false;
+  }
 
-  if (!canAndShouldUnrollLoop(Loop, MaxTripCount.getValue()))
+  if (!canAndShouldUnrollLoop(Loop, MaxTripCount.getValue())) {
+    LLVM_DEBUG(llvm::dbgs() << "Not unrolling, exceeds cost threshold\n");
     return false;
+  }
 
   // TODO: We need to split edges from non-condbr exits for the SSA updater. For
   // now just don't handle loops containing such exits.
@@ -400,16 +425,16 @@ static bool tryToUnrollLoop(SILLoop *Loop) {
        ++Iteration) {
     auto *CurrentLatch = Latches[Iteration];
     auto LastIteration = End - 1;
-    auto *OriginalHeader = Headers[0];
+    auto *CurrentHeader = Headers[Iteration];
     auto *NextIterationsHeader =
         Iteration == LastIteration ? nullptr : Headers[Iteration + 1];
 
-    redirectTerminator(CurrentLatch, Iteration, LastIteration, OriginalHeader,
+    redirectTerminator(CurrentLatch, Iteration, LastIteration, CurrentHeader,
                        NextIterationsHeader);
   }
 
   // Fixup SSA form for loop values used outside the loop.
-  updateSSA(Loop, LoopLiveOutValues);
+  updateSSA(M, Loop, LoopLiveOutValues);
   return true;
 }
 
@@ -423,7 +448,6 @@ class LoopUnrolling : public SILFunctionTransform {
 
   void run() override {
     bool Changed = false;
-
     auto *Fun = getFunction();
     SILLoopInfo *LoopInfo = PM->getAnalysis<SILLoopAnalysis>()->get(Fun);
 
@@ -441,6 +465,12 @@ class LoopUnrolling : public SILFunctionTransform {
           InnermostLoops.push_back(L);
       }
     }
+
+    if (InnermostLoops.empty())
+      return;
+
+    LLVM_DEBUG(llvm::dbgs() << "Loop Unroll running on function : "
+                            << Fun->getName() << "\n");
 
     // Try to unroll innermost loops.
     for (auto *Loop : InnermostLoops)

@@ -84,6 +84,7 @@ where SubSequence: RandomAccessCollection, Indices: RandomAccessCollection
   override subscript(bounds: Range<Index>) -> SubSequence { get }
 
   // FIXME: Associated type inference requires these.
+  @_borrowed
   override subscript(position: Index) -> Element { get }
   override var startIndex: Index { get }
   override var endIndex: Index { get }
@@ -267,13 +268,13 @@ extension RandomAccessCollection {
 
 // Provides an alternative default associated type witness for Indices
 // for random access collections with strideable indices.
-extension RandomAccessCollection where Index : Strideable, Index.Stride == Int {
+extension RandomAccessCollection where Index: Strideable, Index.Stride == Int {
   @_implements(Collection, Indices)
   public typealias _Default_Indices = Range<Index>
 }
 
 extension RandomAccessCollection
-where Index : Strideable, 
+where Index: Strideable,
       Index.Stride == Int,
       Indices == Range<Index> {
 

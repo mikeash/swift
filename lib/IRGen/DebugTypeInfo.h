@@ -36,39 +36,39 @@ class TypeInfo;
 /// This data structure holds everything needed to emit debug info
 /// for a type.
 class DebugTypeInfo {
-public:
-  /// The DeclContext of the function. This might not be the DeclContext of
-  /// the variable if inlining took place.
-  DeclContext *DeclCtx = nullptr;
-
-  /// The generic environment of the type. Ideally we should need only this and
-  /// retire the DeclCtxt.
-  GenericEnvironment *GenericEnv = nullptr;
-
+protected:
   /// The type we need to emit may be different from the type
   /// mentioned in the Decl, for example, stripped of qualifiers.
   TypeBase *Type = nullptr;
   /// Needed to determine the size of basic types and to determine
   /// the storage type for undefined variables.
   llvm::Type *StorageType = nullptr;
-  Size size = Size(0);
-  Alignment align = Alignment(0);
+  Optional<Size> size;
+  Alignment align;
   bool DefaultAlignment = true;
+  bool IsMetadataType = false;
 
-  DebugTypeInfo() {}
-  DebugTypeInfo(DeclContext *DC, GenericEnvironment *GE, swift::Type Ty,
-                llvm::Type *StorageTy, Size SizeInBytes, Alignment AlignInBytes,
-                bool HasDefaultAlignment);
+public:
+  DebugTypeInfo() = default;
+  DebugTypeInfo(swift::Type Ty, llvm::Type *StorageTy,
+                Optional<Size> SizeInBytes, Alignment AlignInBytes,
+                bool HasDefaultAlignment, bool IsMetadataType);
+
   /// Create type for a local variable.
-  static DebugTypeInfo getLocalVariable(DeclContext *DeclCtx,
-                                        GenericEnvironment *GE, VarDecl *Decl,
+  static DebugTypeInfo getLocalVariable(VarDecl *Decl,
                                         swift::Type Ty, const TypeInfo &Info);
-  /// Create type for an artificial metadata variable.
+  /// Create type for global type metadata.
   static DebugTypeInfo getMetadata(swift::Type Ty, llvm::Type *StorageTy,
                                    Size size, Alignment align);
+  /// Create type for an artificial metadata variable.
+  static DebugTypeInfo getArchetype(swift::Type Ty, llvm::Type *StorageTy,
+                                    Size size, Alignment align);
+
+  /// Create a forward declaration for a type whose size is unknown.
+  static DebugTypeInfo getForwardDecl(swift::Type Ty);
+
   /// Create a standalone type from a TypeInfo object.
-  static DebugTypeInfo getFromTypeInfo(DeclContext *DC, GenericEnvironment *GE,
-                                       swift::Type Ty, const TypeInfo &Info);
+  static DebugTypeInfo getFromTypeInfo(swift::Type Ty, const TypeInfo &Info);
   /// Global variables.
   static DebugTypeInfo getGlobal(SILGlobalVariable *GV, llvm::Type *StorageType,
                                  Size size, Alignment align);
@@ -76,32 +76,61 @@ public:
   static DebugTypeInfo getObjCClass(ClassDecl *theClass,
                                     llvm::Type *StorageType, Size size,
                                     Alignment align);
+  /// Error type.
+  static DebugTypeInfo getErrorResult(swift::Type Ty, llvm::Type *StorageType,
+                                      Size size, Alignment align);
 
   TypeBase *getType() const { return Type; }
 
   TypeDecl *getDecl() const;
-  DeclContext *getDeclContext() const { return DeclCtx; }
-  GenericEnvironment *getGenericEnvironment() const { return GenericEnv; }
 
-  // Determine whether this type is an Archetype itself.
-  bool isArchetype() const {
-    return Type->getWithoutSpecifierType()->is<ArchetypeType>();
+  // Determine whether this type is an Archetype dependent on a generic context.
+  bool isContextArchetype() const {
+    if (auto archetype = Type->getWithoutSpecifierType()->getAs<ArchetypeType>()) {
+      return !isa<OpaqueTypeArchetypeType>(archetype->getRoot());
+    }
+    return false;
   }
 
-  /// LValues, inout args, and Archetypes are implicitly indirect by
-  /// virtue of their DWARF type.
-  //
-  // FIXME: There exists an inverse workaround in LLDB. Both should be removed.
-  bool isImplicitlyIndirect() const {
-    return isArchetype();
+  llvm::Type *getStorageType() const {
+    if (size && size->isZero())
+      assert(StorageType && "only defined types may have a size");
+    return StorageType;
   }
-
+  Optional<Size> getSize() const { return size; }
+  void setSize(Size NewSize) { size = NewSize; }
+  Alignment getAlignment() const { return align; }
   bool isNull() const { return Type == nullptr; }
+  bool isForwardDecl() const { return StorageType == nullptr; }
+  bool isMetadataType() const { return IsMetadataType; }
+  bool hasDefaultAlignment() const { return DefaultAlignment; }
+
   bool operator==(DebugTypeInfo T) const;
   bool operator!=(DebugTypeInfo T) const;
-
-  void dump() const;
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  LLVM_DUMP_METHOD void dump() const;
+#endif
 };
+
+/// A DebugTypeInfo with a defined size (that may be 0).
+class CompletedDebugTypeInfo : public DebugTypeInfo {
+  CompletedDebugTypeInfo(DebugTypeInfo DbgTy) : DebugTypeInfo(DbgTy) {}
+public:
+  static Optional<CompletedDebugTypeInfo> get(DebugTypeInfo DbgTy) {
+    if (!DbgTy.getSize())
+      return {};
+    return CompletedDebugTypeInfo(DbgTy);
+  }
+
+  static Optional<CompletedDebugTypeInfo>
+  getFromTypeInfo(swift::Type Ty, const TypeInfo &Info) {
+    return CompletedDebugTypeInfo::get(
+        DebugTypeInfo::getFromTypeInfo(Ty, Info));
+  }
+
+  Size::int_type getSizeValue() const { return size.getValue().getValue(); }
+};
+
 }
 }
 
@@ -114,9 +143,8 @@ template <> struct DenseMapInfo<swift::irgen::DebugTypeInfo> {
   }
   static swift::irgen::DebugTypeInfo getTombstoneKey() {
     return swift::irgen::DebugTypeInfo(
-        nullptr, nullptr,
         llvm::DenseMapInfo<swift::TypeBase *>::getTombstoneKey(), nullptr,
-        swift::irgen::Size(0), swift::irgen::Alignment(0), false);
+        swift::irgen::Size(0), swift::irgen::Alignment(), false, false);
   }
   static unsigned getHashValue(swift::irgen::DebugTypeInfo Val) {
     return DenseMapInfo<swift::CanType>::getHashValue(Val.getType());

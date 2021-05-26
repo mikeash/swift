@@ -4,6 +4,11 @@ set(datafiles
   tvos4.json
   watchos4.json
   overlay4.json
+  macos42.json
+  ios42.json
+  tvos42.json
+  watchos42.json
+  overlay42.json
 )
 set(SWIFTLIB_DIR
     "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/lib/swift")
@@ -38,9 +43,9 @@ add_custom_target("symlink_migrator_data"
     DEPENDS "${output_dir}" "${outputs}"
     COMMENT "Symlinking migrator data to ${output_dir}")
 
-swift_install_in_component(compiler
-  FILES ${datafiles}
-DESTINATION "lib/swift/migrator")
+swift_install_in_component(FILES ${datafiles}
+                           DESTINATION "lib/swift/migrator"
+                           COMPONENT compiler)
 
 add_swift_host_library(swiftMigrator STATIC
   APIDiffMigratorPass.cpp
@@ -48,8 +53,13 @@ add_swift_host_library(swiftMigrator STATIC
   FixitApplyDiagnosticConsumer.cpp
   Migrator.cpp
   MigrationState.cpp
-  RewriteBufferEditsReceiver.cpp
-  LINK_LIBRARIES swiftSyntax swiftIDE)
+  OptionalTryMigratorPass.cpp
+  RewriteBufferEditsReceiver.cpp)
+target_link_libraries(swiftMigrator PRIVATE
+  swiftIDE
+  swiftSyntax)
 
 add_dependencies(swiftMigrator
   "symlink_migrator_data")
+
+set_swift_llvm_is_available(swiftMigrator)

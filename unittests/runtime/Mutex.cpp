@@ -16,125 +16,10 @@
 #include <chrono>
 #include <map>
 #include <random>
-#include <thread>
+
+#include "ThreadingHelpers.h"
 
 using namespace swift;
-
-// When true many of the threaded tests log activity to help triage issues.
-static bool trace = false;
-
-template <typename ThreadBody, typename AfterSpinRelease>
-void threadedExecute(int threadCount, ThreadBody threadBody,
-                     AfterSpinRelease afterSpinRelease) {
-
-  std::vector<std::thread> threads;
-
-  // Block the threads we are about to create.
-  std::atomic<bool> spinWait(true);
-  std::atomic<int> readyCount(0);
-  std::atomic<int> activeCount(0);
-
-  for (int i = 0; i < threadCount; ++i) {
-    threads.push_back(std::thread([&, i] {
-      readyCount++;
-
-      while (spinWait) {
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-      activeCount++;
-
-      threadBody(i);
-    }));
-  }
-
-  while (readyCount < threadCount) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
-  // Allow our threads to fight for the lock.
-  spinWait = false;
-
-  while (activeCount < threadCount) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
-  afterSpinRelease();
-
-  // Wait until all of our threads have finished.
-  for (auto &thread : threads) {
-    thread.join();
-  }
-}
-
-template <typename ThreadBody>
-void threadedExecute(int threadCount, ThreadBody threadBody) {
-  threadedExecute(threadCount, threadBody, [] {});
-}
-
-template <typename M, typename C, typename ConsumerBody, typename ProducerBody>
-void threadedExecute(M &mutex, C &condition, bool &doneCondition,
-                     ConsumerBody consumerBody, ProducerBody producerBody) {
-
-  std::vector<std::thread> producers;
-  std::vector<std::thread> consumers;
-
-  // Block the threads we are about to create.
-  std::atomic<bool> spinWait(true);
-
-  for (int i = 1; i <= 8; ++i) {
-    consumers.push_back(std::thread([&, i] {
-      while (spinWait) {
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-      consumerBody(i);
-
-      if (trace)
-        printf("### Consumer[%d] thread exiting.\n", i);
-    }));
-  }
-
-  for (int i = 1; i <= 5; ++i) {
-    producers.push_back(std::thread([&, i] {
-      while (spinWait) {
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-      producerBody(i);
-
-      if (trace)
-        printf("### Producer[%d] thread exiting.\n", i);
-    }));
-  }
-
-  // Poor mans attempt to get as many threads ready as possible before
-  // dropping spinWait, it doesn't have to be perfect.
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  // Allow our threads to fight for the lock.
-  spinWait = false;
-
-  // Wait until all of our producer threads have finished.
-  for (auto &thread : producers) {
-    thread.join();
-  }
-
-  // Inform consumers that producers are done.
-  mutex.withLockThenNotifyAll(condition, [&] {
-    if (trace)
-      printf("### Informing consumers we are done.\n");
-    doneCondition = true;
-  });
-
-  // Wait for consumers to finish.
-  for (auto &thread : consumers) {
-    thread.join();
-  }
-}
 
 // -----------------------------------------------------------------------------
 
@@ -161,13 +46,28 @@ TEST(MutexTest, BasicLockableThreaded) {
   basicLockableThreaded(mutex);
 }
 
+TEST(ConditionMutexTest, BasicLockableThreaded) {
+  ConditionVariable::Mutex mutex(/* checked = */ true);
+  basicLockableThreaded(mutex);
+}
+
 TEST(StaticMutexTest, BasicLockableThreaded) {
+  static StaticMutex mutex;
+  basicLockableThreaded(mutex);
+}
+
+TEST(StaticConditionMutexTest, BasicLockableThreaded) {
   static StaticMutex mutex;
   basicLockableThreaded(mutex);
 }
 
 TEST(StaticUnsafeMutexTest, BasicLockableThreaded) {
   static StaticUnsafeMutex mutex;
+  basicLockableThreaded(mutex);
+}
+
+TEST(SmallMutex, BasicLockableThreaded) {
+  SmallMutex mutex;
   basicLockableThreaded(mutex);
 }
 
@@ -209,6 +109,11 @@ TEST(StaticMutexTest, LockableThreaded) {
   lockableThreaded(Mutex);
 }
 
+TEST(SmallMutexTest, LockableThreaded) {
+  SmallMutex Mutex;
+  lockableThreaded(Mutex);
+}
+
 template <typename SL, typename M> void scopedLockThreaded(M &mutex) {
   int count1 = 0;
   int count2 = 0;
@@ -228,12 +133,27 @@ template <typename SL, typename M> void scopedLockThreaded(M &mutex) {
 
 TEST(MutexTest, ScopedLockThreaded) {
   Mutex mutex(/* checked = */ true);
-  scopedLockThreaded<ScopedLock>(mutex);
+  scopedLockThreaded<Mutex::ScopedLock>(mutex);
+}
+
+TEST(ConditionMutexTest, ScopedLockThreaded) {
+  ConditionVariable::Mutex mutex(/* checked = */ true);
+  scopedLockThreaded<ConditionVariable::Mutex::ScopedLock>(mutex);
 }
 
 TEST(StaticMutexTest, ScopedLockThreaded) {
   static StaticMutex Mutex;
-  scopedLockThreaded<StaticScopedLock>(Mutex);
+  scopedLockThreaded<StaticMutex::ScopedLock>(Mutex);
+}
+
+TEST(StaticConditionMutexTest, ScopedLockThreaded) {
+  static StaticConditionVariable::StaticMutex Mutex;
+  scopedLockThreaded<StaticConditionVariable::StaticMutex::ScopedLock>(Mutex);
+}
+
+TEST(SmallMutexTest, ScopedLockThreaded) {
+  SmallMutex mutex(/* checked = */ true);
+  scopedLockThreaded<ScopedLockT<SmallMutex, false>>(mutex);
 }
 
 template <typename SL, typename SU, typename M>
@@ -261,13 +181,34 @@ void scopedUnlockUnderScopedLockThreaded(M &mutex) {
 
 TEST(MutexTest, ScopedUnlockUnderScopedLockThreaded) {
   Mutex mutex(/* checked = */ true);
-  scopedUnlockUnderScopedLockThreaded<ScopedLock, ScopedUnlock>(mutex);
+  scopedUnlockUnderScopedLockThreaded<Mutex::ScopedLock, Mutex::ScopedUnlock>(
+      mutex);
+}
+
+TEST(ConditionMutexTest, ScopedUnlockUnderScopedLockThreaded) {
+  ConditionVariable::Mutex mutex(/* checked = */ true);
+  scopedUnlockUnderScopedLockThreaded<ConditionVariable::Mutex::ScopedLock,
+                                      ConditionVariable::Mutex::ScopedUnlock>(
+      mutex);
 }
 
 TEST(StaticMutexTest, ScopedUnlockUnderScopedLockThreaded) {
   static StaticMutex Mutex;
-  scopedUnlockUnderScopedLockThreaded<StaticScopedLock, StaticScopedUnlock>(
-      Mutex);
+  scopedUnlockUnderScopedLockThreaded<StaticMutex::ScopedLock,
+                                      StaticMutex::ScopedUnlock>(Mutex);
+}
+
+TEST(StaticConditionMutexTest, ScopedUnlockUnderScopedLockThreaded) {
+  static StaticConditionVariable::StaticMutex Mutex;
+  scopedUnlockUnderScopedLockThreaded<
+      StaticConditionVariable::StaticMutex::ScopedLock,
+      StaticConditionVariable::StaticMutex::ScopedUnlock>(Mutex);
+}
+
+TEST(SmallMutexTest, ScopedUnlockUnderScopedLockThreaded) {
+  SmallMutex mutex(/* checked = */ true);
+  scopedUnlockUnderScopedLockThreaded<SmallMutex::ScopedLock,
+                                      SmallMutex::ScopedUnlock>(mutex);
 }
 
 template <typename M> void criticalSectionThreaded(M &mutex) {
@@ -293,8 +234,18 @@ TEST(MutexTest, CriticalSectionThreaded) {
   criticalSectionThreaded(mutex);
 }
 
+TEST(ConditionMutexTest, CriticalSectionThreaded) {
+  ConditionVariable::Mutex mutex(/* checked = */ true);
+  criticalSectionThreaded(mutex);
+}
+
 TEST(StaticMutexTest, CriticalSectionThreaded) {
   static StaticMutex Mutex;
+  criticalSectionThreaded(Mutex);
+}
+
+TEST(StaticConditionMutexTest, CriticalSectionThreaded) {
+  static StaticConditionVariable::StaticMutex Mutex;
   criticalSectionThreaded(Mutex);
 }
 
@@ -342,15 +293,18 @@ void conditionThreaded(M &mutex, C &condition) {
 }
 
 TEST(MutexTest, ConditionThreaded) {
-  Mutex mutex(/* checked = */ true);
+  ConditionVariable::Mutex mutex(/* checked = */ true);
   ConditionVariable condition;
-  conditionThreaded<ScopedLock, ScopedUnlock>(mutex, condition);
+  conditionThreaded<ConditionVariable::Mutex::ScopedLock,
+                    ConditionVariable::Mutex::ScopedUnlock>(mutex, condition);
 }
 
 TEST(StaticMutexTest, ConditionThreaded) {
-  static StaticMutex mutex;
+  static StaticConditionVariable::StaticMutex mutex;
   static StaticConditionVariable condition;
-  conditionThreaded<StaticScopedLock, StaticScopedUnlock>(mutex, condition);
+  conditionThreaded<StaticConditionVariable::StaticMutex::ScopedLock,
+                    StaticConditionVariable::StaticMutex::ScopedUnlock>(
+      mutex, condition);
 }
 
 template <typename SU, typename M, typename C>
@@ -397,16 +351,17 @@ void conditionLockOrWaitLockThenNotifyThreaded(M &mutex, C &condition) {
 }
 
 TEST(MutexTest, ConditionLockOrWaitLockThenNotifyThreaded) {
-  Mutex mutex(/* checked = */ true);
+  ConditionVariable::Mutex mutex(/* checked = */ true);
   ConditionVariable condition;
-  conditionLockOrWaitLockThenNotifyThreaded<ScopedUnlock>(mutex, condition);
+  conditionLockOrWaitLockThenNotifyThreaded<
+      ConditionVariable::Mutex::ScopedUnlock>(mutex, condition);
 }
 
 TEST(StaticMutexTest, ConditionLockOrWaitLockThenNotifyThreaded) {
-  static StaticMutex mutex;
+  static StaticConditionVariable::StaticMutex mutex;
   static StaticConditionVariable condition;
-  conditionLockOrWaitLockThenNotifyThreaded<StaticScopedUnlock>(mutex,
-                                                                condition);
+  conditionLockOrWaitLockThenNotifyThreaded<
+      StaticConditionVariable::StaticMutex::ScopedUnlock>(mutex, condition);
 }
 
 template <typename SRL, bool Locking, typename RW>
@@ -555,20 +510,23 @@ TEST(StaticReadWriteLockTest, ScopedWriteUnlockThreaded) {
 template <typename RW> void readLockWhileReadLockedThreaded(RW &lock) {
   lock.readLock();
 
-  std::vector<bool> results;
-  results.assign(10, false);
+  const int threadCount = 10;
+
+  std::atomic<bool> results[threadCount] = {};
 
   std::atomic<bool> done(false);
-  threadedExecute(10,
+  threadedExecute(threadCount,
                   [&](int index) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       lock.withReadLock([&] {
                         results[index] = true;
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(5));
                       });
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -577,7 +535,7 @@ template <typename RW> void readLockWhileReadLockedThreaded(RW &lock) {
 
   lock.readUnlock();
 
-  for (auto result : results) {
+  for (auto &result : results) {
     ASSERT_TRUE(result);
   }
 }
@@ -595,20 +553,23 @@ TEST(StaticReadWriteLockTest, ReadLockWhileReadLockedThreaded) {
 template <typename RW> void readLockWhileWriteLockedThreaded(RW &lock) {
   lock.writeLock();
 
-  std::vector<int> results;
-  results.assign(10, 0);
+  const int threadCount = 10;
+
+  std::atomic<int> results[threadCount] = {};
 
   std::atomic<bool> done(false);
-  threadedExecute(10,
+  threadedExecute(threadCount,
                   [&](int index) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       lock.withReadLock([&] {
                         results[index] += 1;
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(5));
                       });
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -616,7 +577,7 @@ template <typename RW> void readLockWhileWriteLockedThreaded(RW &lock) {
                     lock.writeUnlock();
                   });
 
-  for (auto result : results) {
+  for (auto &result : results) {
     ASSERT_EQ(result, 1);
   }
 }
@@ -636,20 +597,21 @@ template <typename RW> void writeLockWhileReadLockedThreaded(RW &lock) {
 
   const int threadCount = 10;
 
-  std::vector<int> results;
-  results.assign(threadCount, 0);
+  std::atomic<int> results[threadCount] = {};
 
   std::atomic<bool> done(false);
   threadedExecute(threadCount,
                   [&](int index) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       lock.withWriteLock([&] {
                         results[index] += 1;
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(5));
                       });
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -657,7 +619,7 @@ template <typename RW> void writeLockWhileReadLockedThreaded(RW &lock) {
                     lock.readUnlock();
                   });
 
-  for (auto result : results) {
+  for (auto &result : results) {
     ASSERT_EQ(result, 1);
   }
 }
@@ -677,20 +639,21 @@ template <typename RW> void writeLockWhileWriteLockedThreaded(RW &lock) {
 
   const int threadCount = 10;
 
-  std::vector<int> results;
-  results.assign(threadCount, 0);
+  std::atomic<int> results[threadCount] = {};
 
   std::atomic<bool> done(false);
   threadedExecute(threadCount,
                   [&](int index) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       lock.withWriteLock([&] {
                         results[index] += 1;
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(5));
                       });
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -698,7 +661,7 @@ template <typename RW> void writeLockWhileWriteLockedThreaded(RW &lock) {
                     lock.writeUnlock();
                   });
 
-  for (auto result : results) {
+  for (auto &result : results) {
     ASSERT_EQ(result, 1);
   }
 }
@@ -719,10 +682,12 @@ template <typename RW> void tryReadLockWhileWriteLockedThreaded(RW &lock) {
   std::atomic<bool> done(false);
   threadedExecute(10,
                   [&](int) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       ASSERT_FALSE(lock.try_readLock());
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -747,19 +712,20 @@ template <typename RW> void tryReadLockWhileReadLockedThreaded(RW &lock) {
 
   const int threadCount = 10;
 
-  std::vector<bool> results;
-  results.assign(threadCount, false);
+  std::atomic<bool> results[threadCount] = {};
 
   std::atomic<bool> done(false);
   threadedExecute(threadCount,
                   [&](int index) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       ASSERT_TRUE(lock.try_readLock());
                       results[index] = true;
                       std::this_thread::sleep_for(std::chrono::milliseconds(5));
                       lock.readUnlock();
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -768,7 +734,7 @@ template <typename RW> void tryReadLockWhileReadLockedThreaded(RW &lock) {
 
   lock.readUnlock();
 
-  for (auto result : results) {
+  for (auto &result : results) {
     ASSERT_TRUE(result);
   }
 }
@@ -789,10 +755,12 @@ template <typename RW> void tryWriteLockWhileWriteLockedThreaded(RW &lock) {
   std::atomic<bool> done(false);
   threadedExecute(10,
                   [&](int) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       ASSERT_FALSE(lock.try_writeLock());
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -818,10 +786,12 @@ template <typename RW> void tryWriteLockWhileReadLockedThreaded(RW &lock) {
   std::atomic<bool> done(false);
   threadedExecute(10,
                   [&](int) {
-                    while (!done) {
+                    // Always perform at least one iteration of this loop to
+                    // avoid spurious failures if this thread is slow to run.
+                    do {
                       ASSERT_FALSE(lock.try_writeLock());
                       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    }
+                    } while (!done);
                   },
                   [&] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));

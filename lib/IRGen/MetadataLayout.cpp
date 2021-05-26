@@ -31,6 +31,7 @@
 #include "IRGenFunction.h"
 #include "StructMetadataVisitor.h"
 #include "ForeignClassMetadataVisitor.h"
+#include "TupleMetadataVisitor.h"
 
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/Optional.h"
@@ -266,6 +267,8 @@ ClassMetadataLayout::ClassMetadataLayout(IRGenModule &IGM, ClassDecl *decl)
 
     ClassMetadataLayout &Layout;
 
+    bool IsInTargetFields = false;
+
     Scanner(IRGenModule &IGM, ClassDecl *decl, ClassMetadataLayout &layout)
       : super(IGM, decl), Layout(layout) {}
 
@@ -280,7 +283,7 @@ ClassMetadataLayout::ClassMetadataLayout(IRGenModule &IGM, ClassDecl *decl)
         Layout.StartOfImmediateMembers = getNextOffset();
 
         if (Layout.HasResilientSuperclass ||
-            IGM.isResilient(forClass, ResilienceExpansion::Maximal)) {
+            IGM.hasResilientMetadata(forClass, ResilienceExpansion::Maximal)) {
           assert(!DynamicOffsetBase);
           DynamicOffsetBase = NextOffset;
         }
@@ -313,40 +316,68 @@ ClassMetadataLayout::ClassMetadataLayout(IRGenModule &IGM, ClassDecl *decl)
       super::noteStartOfGenericRequirements(forClass);
     }
 
-    void addGenericWitnessTable(ClassDecl *forClass) {
+    void addGenericWitnessTable(GenericRequirement requirement,
+                                ClassDecl *forClass) {
       if (forClass == Target) {
-        Layout.NumImmediateMembers++;
+        ++Layout.NumImmediateMembers;
       }
-      super::addGenericWitnessTable(forClass);
+      super::addGenericWitnessTable(requirement, forClass);
     }
 
-    void addGenericArgument(ClassDecl *forClass) {
+    void addGenericArgument(GenericRequirement requirement,
+                            ClassDecl *forClass) {
       if (forClass == Target) {
-        Layout.NumImmediateMembers++;
+        ++Layout.NumImmediateMembers;
       }
-      super::addGenericArgument(forClass);
+      super::addGenericArgument(requirement, forClass);
     }
 
-    void addMethod(SILDeclRef fn) {
+    void addReifiedVTableEntry(SILDeclRef fn) {
       if (fn.getDecl()->getDeclContext() == Target) {
-        Layout.NumImmediateMembers++;
+        ++Layout.NumImmediateMembers;
         Layout.MethodInfos.try_emplace(fn, getNextOffset());
       }
-      super::addMethod(fn);
+      super::addReifiedVTableEntry(fn);
+    }
+    
+    void noteNonoverriddenMethod(SILDeclRef fn) {
+      if (fn.getDecl()->getDeclContext() == Target) {
+        auto impl = VTable->getEntry(IGM.getSILModule(), fn);
+        Layout.MethodInfos.try_emplace(fn,
+         IGM.getAddrOfSILFunction(impl->getImplementation(), NotForDefinition));
+      }
     }
 
     void noteStartOfFieldOffsets(ClassDecl *forClass) {
-      if (forClass == Target)
+      if (forClass == Target) {
+        assert(!IsInTargetFields);
+        IsInTargetFields = true;
         Layout.FieldOffsetVector = getNextOffset();
+      }
       super::noteStartOfFieldOffsets(forClass);
     }
 
+    void noteEndOfFieldOffsets(ClassDecl *forClass) {
+      assert(IsInTargetFields == (forClass == Target));
+      if (IsInTargetFields)
+        IsInTargetFields = false;
+      super::noteEndOfFieldOffsets(forClass);
+    }
+
     void addFieldOffset(VarDecl *field) {
-      if (field->getDeclContext() == Target) {
-        Layout.NumImmediateMembers++;
+      assert(IsInTargetFields == (field->getDeclContext() == Target));
+      if (IsInTargetFields) {
+        ++Layout.NumImmediateMembers;
         Layout.FieldOffsets.try_emplace(field, getNextOffset());
       }
       super::addFieldOffset(field);
+    }
+
+    void addDefaultActorStorageFieldOffset() {
+      if (IsInTargetFields) {
+        ++Layout.NumImmediateMembers;
+      }
+      super::addDefaultActorStorageFieldOffset();
     }
 
     void addFieldOffsetPlaceholders(MissingMemberDecl *placeholder) {
@@ -395,8 +426,15 @@ Size ClassMetadataLayout::getInstanceAlignMaskOffset() const {
 ClassMetadataLayout::MethodInfo
 ClassMetadataLayout::getMethodInfo(IRGenFunction &IGF, SILDeclRef method) const{
   auto &stored = getStoredMethodInfo(method);
-  auto offset = emitOffset(IGF, stored.TheOffset);
-  return MethodInfo(offset);
+  switch (stored.TheKind) {
+  case MethodInfo::Kind::Offset: {
+    auto offset = emitOffset(IGF, stored.TheOffset);
+    return MethodInfo(offset);
+  }
+  case MethodInfo::Kind::DirectImpl:
+    return MethodInfo(stored.TheImpl);
+  }
+  llvm_unreachable("unhandled method info kind!");
 }
 
 Offset ClassMetadataLayout::getFieldOffset(IRGenFunction &IGF,
@@ -480,6 +518,39 @@ Address irgen::emitAddressOfSuperclassRefInClassMetadata(IRGenFunction &IGF,
   return IGF.Builder.CreateConstArrayGEP(addr, index, IGF.IGM.getPointerSize());
 }
 
+Size irgen::getStaticTupleElementOffset(IRGenModule &IGM,
+                                        SILType tupleType,
+                                        unsigned eltIdx) {
+  assert(tupleType.is<TupleType>() && "not a tuple type");
+
+  struct TupleElementOffsetScanner
+       : LayoutScanner<TupleElementOffsetScanner, TupleMetadataScanner> {
+  private:
+    using super = LayoutScanner;
+
+    // 8 seems a reasonable potential max number tuple elements to start with
+    llvm::SmallVector<Size, 8> Offsets;
+
+  public:
+    TupleElementOffsetScanner(IRGenModule &IGM, TupleType *const tupleType)
+      : super(IGM, tupleType) {}
+
+    void addElement(unsigned eltIdx, const TupleTypeElt &elt) {
+      Offsets.push_back(NextOffset);
+      super::addElement(eltIdx, elt);
+    }
+
+    Size getElementOffset(unsigned eltIdx) const {
+      return Offsets[eltIdx];
+    }
+  };
+
+  TupleElementOffsetScanner s(IGM, tupleType.getAs<TupleType>().getPointer());
+  s.layout();
+
+  return s.getElementOffset(eltIdx);
+}
+
 /*********************************** ENUMS ************************************/
 
 EnumMetadataLayout::EnumMetadataLayout(IRGenModule &IGM, EnumDecl *decl)
@@ -507,6 +578,11 @@ EnumMetadataLayout::EnumMetadataLayout(IRGenModule &IGM, EnumDecl *decl)
       super::noteStartOfGenericRequirements();
     }
 
+    void addTrailingFlags() {
+      Layout.TrailingFlagsOffset = getNextOffset();
+      super::addTrailingFlags();
+    }
+
     void layout() {
       super::layout();
       Layout.TheSize = getMetadataSize();
@@ -520,6 +596,11 @@ Offset
 EnumMetadataLayout::getPayloadSizeOffset() const {
   assert(PayloadSizeOffset.isStatic());
   return Offset(PayloadSizeOffset.getStaticOffset());
+}
+
+Offset EnumMetadataLayout::getTrailingFlagsOffset() const {
+  assert(TrailingFlagsOffset.isStatic());
+  return Offset(TrailingFlagsOffset.getStaticOffset());
 }
 
 /********************************** STRUCTS ***********************************/
@@ -558,6 +639,11 @@ StructMetadataLayout::StructMetadataLayout(IRGenModule &IGM, StructDecl *decl)
       super::noteEndOfFieldOffsets();
     }
 
+    void addTrailingFlags() {
+      Layout.TrailingFlagsOffset = getNextOffset();
+      super::addTrailingFlags();
+    }
+
     void layout() {
       super::layout();
       Layout.TheSize = getMetadataSize();
@@ -584,6 +670,11 @@ StructMetadataLayout::getFieldOffsetVectorOffset() const {
   return Offset(FieldOffsetVector.getStaticOffset());
 }
 
+Offset 
+StructMetadataLayout::getTrailingFlagsOffset() const {
+  assert(TrailingFlagsOffset.isStatic());
+  return Offset(TrailingFlagsOffset.getStaticOffset());
+}
 /****************************** FOREIGN CLASSES *******************************/
 ForeignClassMetadataLayout::ForeignClassMetadataLayout(IRGenModule &IGM,
                                                        ClassDecl *theClass)

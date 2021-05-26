@@ -59,6 +59,7 @@ enum class CustomBufferKind {
   InheritedTypesArray,
   DocStructureElementArray,
   AttributesArray,
+  ExpressionTypeArray,
   RawData
 };
 
@@ -82,10 +83,11 @@ public:
     void set(SourceKit::UIdent Key, int64_t val);
     void set(SourceKit::UIdent Key, llvm::ArrayRef<llvm::StringRef> Strs);
     void set(SourceKit::UIdent Key, llvm::ArrayRef<std::string> Strs);
+    void set(SourceKit::UIdent Key, llvm::ArrayRef<SourceKit::UIdent> UIDs);
     void setBool(SourceKit::UIdent Key, bool val);
     Array setArray(SourceKit::UIdent Key);
     Dictionary setDictionary(SourceKit::UIdent Key);
-    void setCustomBuffer(SourceKit::UIdent Key, CustomBufferKind Kind,
+    void setCustomBuffer(SourceKit::UIdent Key,
                          std::unique_ptr<llvm::MemoryBuffer> MemBuf);
 
   private:
@@ -129,7 +131,7 @@ public:
   Optional<llvm::StringRef> getString(SourceKit::UIdent Key);
   Optional<RequestDict> getDictionary(SourceKit::UIdent Key);
 
-  /// \brief Populate the vector with an array of C strings.
+  /// Populate the vector with an array of C strings.
   /// \param isOptional true if the key is optional. If false and the key is
   /// missing, the function will return true to indicate an error.
   /// \returns true if there is an error, like the key is not of an array type or
@@ -148,8 +150,23 @@ public:
   Optional<int64_t> getOptionalInt64(SourceKit::UIdent Key);
 };
 
-void initialize();
-void shutdown();
+/// Initialize the service. Must be called before attempting to handle requests.
+/// \param runtimeLibPath The path to the toolchain's library directory.
+/// \param diagnosticDocumentationPath The path to diagnostics documentation.
+/// \param postNotification Callback to post a notification.
+void initializeService(
+    llvm::StringRef runtimeLibPath, llvm::StringRef diagnosticDocumentationPath,
+    std::function<void(sourcekitd_response_t)> postNotification);
+/// Shutdown the service.
+void shutdownService();
+
+/// Initialize the sourcekitd client library. Returns true if this is the first
+/// time it is initialized.
+bool initializeClient();
+/// Shutdown the sourcekitd client. Returns true if this is the last active
+/// client and the service should be shutdown.
+bool shutdownClient();
+
 void set_interrupted_connection_handler(llvm::function_ref<void()> handler);
 
 typedef std::function<void(sourcekitd_response_t)> ResponseReceiver;
@@ -159,20 +176,14 @@ void handleRequest(sourcekitd_object_t Request, ResponseReceiver Receiver);
 void printRequestObject(sourcekitd_object_t Obj, llvm::raw_ostream &OS);
 void printResponse(sourcekitd_response_t Resp, llvm::raw_ostream &OS);
 
-sourcekitd_response_t createErrorRequestInvalid(const char *Description);
-sourcekitd_response_t createErrorRequestFailed(const char *Description);
-sourcekitd_response_t createErrorRequestInterrupted(const char *Description);
+sourcekitd_response_t createErrorRequestInvalid(llvm::StringRef Description);
+sourcekitd_response_t createErrorRequestFailed(llvm::StringRef Description);
+sourcekitd_response_t createErrorRequestInterrupted(llvm::StringRef Descr);
 sourcekitd_response_t createErrorRequestCancelled();
-
-/// Send notification object.
-/// The ownership of the object is transferred to the function.
-void postNotification(sourcekitd_response_t Notification);
 
 // The client & service have their own implementations for these.
 sourcekitd_uid_t SKDUIDFromUIdent(SourceKit::UIdent UID);
 SourceKit::UIdent UIdentFromSKDUID(sourcekitd_uid_t uid);
-
-std::string getRuntimeLibPath();
 
 void writeEscaped(llvm::StringRef Str, llvm::raw_ostream &OS);
 

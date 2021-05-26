@@ -13,8 +13,8 @@ class A {
   @objc var v2: Int { return 0 } // expected-note{{overri}}
   @objc var v3: Int = 0 // expected-note{{overri}}
 
-  dynamic func f3D() { } // expected-error{{'dynamic' instance method 'f3D()' must also be '@objc'}}{{3-3=@objc }}
-  dynamic func f4D() -> ObjCClassA { } // expected-error{{'dynamic' instance method 'f4D()' must also be '@objc'}}{{3-3=@objc }}
+  @objc dynamic func f3D() { }
+  @objc dynamic func f4D() -> ObjCClassA { }
 }
 
 extension A {
@@ -46,8 +46,8 @@ extension B {
   override func f3D() { }
   override func f4D() -> ObjCClassB { }
 
-  func f5() { }  // expected-error{{overridi}}
-  func f6() -> A { }  // expected-error{{overriding declarations in extensions is not supported}}
+  func f5() { }  // expected-error{{overri}}
+  func f6() -> A { }  // expected-error{{instance method 'f6()' is declared in extension of 'A' and cannot be overridden}}
 
   @objc override func f7() { }
   @objc override func f8() -> ObjCClassA { }
@@ -62,11 +62,11 @@ func callOverridden(_ b: B) {
 
 @objc
 class Base {
-  func meth(_ x: Undeclared) {} // expected-error {{use of undeclared type 'Undeclared'}}
+  func meth(_ x: Undeclared) {} // expected-error {{cannot find type 'Undeclared' in scope}}
 }
 @objc
 class Sub : Base {
-  func meth(_ x: Undeclared) {} // expected-error {{use of undeclared type 'Undeclared'}}
+  func meth(_ x: Undeclared) {} // expected-error {{cannot find type 'Undeclared' in scope}}
 }
 
 // Objective-C method overriding

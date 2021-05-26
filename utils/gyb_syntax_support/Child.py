@@ -1,7 +1,7 @@
 # flake8: noqa I201
-from Classification import classification_by_name
-from Token import SYNTAX_TOKEN_MAP
-from kinds import SYNTAX_BASE_KINDS, kind_to_type, lowercase_first_word
+from .Classification import classification_by_name
+from .Token import SYNTAX_TOKEN_MAP
+from .kinds import SYNTAX_BASE_KINDS, kind_to_type, lowercase_first_word
 
 
 class Child(object):
@@ -11,7 +11,9 @@ class Child(object):
     """
     def __init__(self, name, kind, description=None, is_optional=False,
                  token_choices=None, text_choices=None, node_choices=None,
-                 classification=None, force_classification=False):
+                 collection_element_name=None,
+                 classification=None, force_classification=False, 
+                 is_indented=False, requires_leading_newline=False):
         """
         If a classification is passed, it specifies the color identifiers in 
         that subtree should inherit for syntax coloring. Must be a member of 
@@ -25,14 +27,17 @@ class Child(object):
         self.description = description
         self.swift_syntax_kind = lowercase_first_word(self.syntax_kind)
         self.type_name = kind_to_type(self.syntax_kind)
+        self.collection_element_name = collection_element_name
         self.classification = classification_by_name(classification)
         self.force_classification = force_classification
+        self.is_indented = is_indented
+        self.requires_leading_newline = requires_leading_newline
 
-        # If the child has "token" anywhere in the kind, it's considered
+        # If the child ends with "token" in the kind, it's considered
         # a token node. Grab the existing reference to that token from the
         # global list.
         self.token_kind = \
-            self.syntax_kind if "Token" in self.syntax_kind else None
+            self.syntax_kind if self.syntax_kind.endswith("Token") else None
         self.token = SYNTAX_TOKEN_MAP.get(self.token_kind)
 
         self.is_optional = is_optional

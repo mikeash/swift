@@ -27,22 +27,41 @@
 namespace swift {
 
 class MetadataAllocator : public llvm::AllocatorBase<MetadataAllocator> {
+private:
+  uint16_t Tag;
+
 public:
+  constexpr MetadataAllocator(uint16_t tag) : Tag(tag) {}
+  MetadataAllocator() = delete;
+
   void Reset() {}
 
   LLVM_ATTRIBUTE_RETURNS_NONNULL void *Allocate(size_t size, size_t alignment);
   using AllocatorBase<MetadataAllocator>::Allocate;
 
-  void Deallocate(const void *Ptr, size_t size);
+  void Deallocate(const void *Ptr, size_t size, size_t Alignment);
   using AllocatorBase<MetadataAllocator>::Deallocate;
 
   void PrintStats() const {}
+  
+  MetadataAllocator withTag(uint16_t Tag) {
+    MetadataAllocator Allocator = *this;
+    Allocator.Tag = Tag;
+    return Allocator;
+  }
 };
 
-/// A typedef for simple global caches.
-template <class EntryTy>
+template <uint16_t StaticTag>
+class TaggedMetadataAllocator : public MetadataAllocator {
+public:
+  constexpr TaggedMetadataAllocator() : MetadataAllocator(StaticTag) {}
+};
+
+/// A typedef for simple global caches with stable addresses for the entries.
+template <class EntryTy, uint16_t Tag>
 using SimpleGlobalCache =
-  ConcurrentMap<EntryTy, /*destructor*/ false, MetadataAllocator>;
+    StableAddressConcurrentReadableHashMap<EntryTy,
+                                           TaggedMetadataAllocator<Tag>>;
 
 template <class T, bool ProvideDestructor = true>
 class StaticOwningPointer {
@@ -81,21 +100,27 @@ enum class ConcurrencyRequest {
 };
 
 struct ConcurrencyControl {
-  Mutex Lock;
+  ConditionVariable::Mutex Lock;
   ConditionVariable Queue;
 
   ConcurrencyControl() = default;
 };
 
-template <class EntryType, bool ProvideDestructor = true>
+template <class EntryType, uint16_t Tag>
 class LockingConcurrentMapStorage {
-  ConcurrentMap<EntryType, ProvideDestructor, MetadataAllocator> Map;
-  StaticOwningPointer<ConcurrencyControl, ProvideDestructor> Concurrency;
+  // This class must fit within
+  // TargetGenericMetadataInstantiationCache::PrivateData. On 32-bit archs, that
+  // space is not large enough to accommodate a Mutex along with everything
+  // else. There, use a SmallMutex to squeeze into the available space.
+  using MutexTy =
+      std::conditional_t<sizeof(void *) == 8, StaticMutex, SmallMutex>;
+  StableAddressConcurrentReadableHashMap<EntryType,
+                                         TaggedMetadataAllocator<Tag>, MutexTy>
+      Map;
+  StaticOwningPointer<ConcurrencyControl, false> Concurrency;
 
 public:
   LockingConcurrentMapStorage() : Concurrency(new ConcurrencyControl()) {}
-
-  MetadataAllocator &getAllocator() { return Map.getAllocator(); }
 
   ConcurrencyControl &getConcurrency() { return *Concurrency; }
 
@@ -166,8 +191,6 @@ class LockingConcurrentMap {
 public:
   LockingConcurrentMap() = default;
 
-  MetadataAllocator &getAllocator() { return Storage.getAllocator(); }
-
   template <class KeyType, class... ArgTys>
   std::pair<EntryType*, Status>
   getOrInsert(KeyType key, ArgTys &&...args) {
@@ -230,7 +253,7 @@ public:
 
   /// If an entry already exists, await it; otherwise report failure.
   template <class KeyType, class... ArgTys>
-  Optional<Status> tryAwaitExisting(KeyType key, ArgTys &&...args) {
+  llvm::Optional<Status> tryAwaitExisting(KeyType key, ArgTys &&... args) {
     EntryType *entry = Storage.find(key);
     if (!entry) return None;
     return entry->await(Storage.getConcurrency(),
@@ -324,8 +347,8 @@ public:
   }
 
   template <class... ArgTys>
-  Optional<Status> beginAllocation(ConcurrencyControl &concurrency,
-                                   ArgTys &&...args) {
+  llvm::Optional<Status> beginAllocation(ConcurrencyControl &concurrency,
+                                         ArgTys &&... args) {
     // Delegate to the implementation class.
     ValueType origValue = asImpl().allocate(std::forward<ArgTys>(args)...);
 
@@ -347,32 +370,101 @@ public:
   template <class... ArgTys>
   Status beginInitialization(ConcurrencyControl &concurrency,
                              ArgTys &&...args) {
-    swift_runtime_unreachable("beginAllocation always short-circuits");
+    swift_unreachable("beginAllocation always short-circuits");
   }
 };
 
 /// A key value as provided to the concurrent map.
 class MetadataCacheKey {
   const void * const *Data;
-  uint32_t Length;
+  uint16_t NumKeyParameters;
+  uint16_t NumWitnessTables;
   uint32_t Hash;
 
+  /// Compare two witness tables, which may involving checking the
+  /// contents of their conformance descriptors.
+  static int compareWitnessTables(const WitnessTable *awt,
+                                  const WitnessTable *bwt) {
+    if (awt == bwt)
+      return 0;
+
+    auto *aDescription = awt->getDescription();
+    auto *bDescription = bwt->getDescription();
+    return compareProtocolConformanceDescriptors(aDescription, bDescription);
+  }
+
 public:
-  MetadataCacheKey(const void * const *data, size_t size)
-    : Data(data), Length(size), Hash(computeHash()) {}
-  MetadataCacheKey(const void * const *data, size_t size, uint32_t hash)
-    : Data(data), Length(size), Hash(hash) {}
+  /// Compare two conformance descriptors, checking their contents if necessary.
+  static int compareProtocolConformanceDescriptors(
+      const ProtocolConformanceDescriptor *aDescription,
+      const ProtocolConformanceDescriptor *bDescription) {
+    if (aDescription == bDescription)
+      return 0;
+
+    if (!aDescription->isSynthesizedNonUnique() ||
+        !bDescription->isSynthesizedNonUnique())
+      return comparePointers(aDescription, bDescription);
+
+    auto aType = aDescription->getCanonicalTypeMetadata();
+    auto bType = bDescription->getCanonicalTypeMetadata();
+    if (!aType || !bType)
+      return comparePointers(aDescription, bDescription);
+
+    if (int result = comparePointers(aType, bType))
+      return result;
+
+    return comparePointers(aDescription->getProtocol(),
+                           bDescription->getProtocol());
+  }
+
+private:
+  /// Compare the content from two keys.
+  static int compareContent(const void * const *adata,
+                            const void * const *bdata,
+                            unsigned numKeyParameters,
+                            unsigned numWitnessTables) {
+    // Compare generic arguments for key parameters.
+    for (unsigned i = 0; i != numKeyParameters; ++i) {
+      if (auto result = comparePointers(*adata++, *bdata++))
+        return result;
+    }
+
+    // Compare witness tables.
+    for (unsigned i = 0; i != numWitnessTables; ++i) {
+      if (auto result =
+              compareWitnessTables((const WitnessTable *)*adata++,
+                                   (const WitnessTable *)*bdata++))
+        return result;
+    }
+
+    return 0;
+  }
+
+public:
+  MetadataCacheKey(uint16_t numKeyParams,
+                   uint16_t numWitnessTables,
+                   const void * const *data)
+      : Data(data), NumKeyParameters(numKeyParams),
+        NumWitnessTables(numWitnessTables), Hash(computeHash()) { }
+
+  MetadataCacheKey(uint16_t numKeyParams,
+                   uint16_t numWitnessTables,
+                   const void * const *data,
+                   uint32_t hash)
+    : Data(data), NumKeyParameters(numKeyParams),
+      NumWitnessTables(numWitnessTables), Hash(hash) {}
 
   bool operator==(MetadataCacheKey rhs) const {
+    // Compare the hashes.
+    if (hash() != rhs.hash()) return false;
+
     // Compare the sizes.
-    unsigned asize = size(), bsize = rhs.size();
-    if (asize != bsize) return false;
+    if (NumKeyParameters != rhs.NumKeyParameters) return false;
+    if (NumWitnessTables != rhs.NumWitnessTables) return false;
 
     // Compare the content.
-    auto abegin = begin(), bbegin = rhs.begin();
-    for (unsigned i = 0; i < asize; ++i)
-      if (abegin[i] != bbegin[i]) return false;
-    return true;
+    return compareContent(begin(), rhs.begin(), NumKeyParameters,
+                          NumWitnessTables) == 0;
   }
 
   int compare(const MetadataCacheKey &rhs) const {
@@ -381,38 +473,47 @@ public:
       return hashComparison;
     }
 
-    // Compare the sizes.
-    if (auto sizeComparison = compareIntegers(size(), rhs.size())) {
-      return sizeComparison;
+    // Compare the # of key parameters.
+    if (auto keyParamsComparison =
+            compareIntegers(NumKeyParameters, rhs.NumKeyParameters)) {
+      return keyParamsComparison;
+    }
+
+    // Compare the # of witness tables.
+    if (auto witnessTablesComparison =
+            compareIntegers(NumWitnessTables, rhs.NumWitnessTables)) {
+      return witnessTablesComparison;
     }
 
     // Compare the content.
-    auto lbegin = begin(), rbegin = rhs.begin();
-    for (unsigned i = 0, e = size(); i != e; ++i) {
-      if (auto ptrComparison = comparePointers(lbegin[i], rbegin[i]))
-        return ptrComparison;
-    }
-
-    // Equal.
-    return 0;
+    return compareContent(begin(), rhs.begin(), NumKeyParameters,
+                          NumWitnessTables);
   }
+
+  uint16_t numKeyParameters() const { return NumKeyParameters; }
+  uint16_t numWitnessTables() const { return NumWitnessTables; }
 
   uint32_t hash() const {
     return Hash;
   }
 
+  friend llvm::hash_code hash_value(const MetadataCacheKey &key) {
+    return key.Hash;
+  }
+
   const void * const *begin() const { return Data; }
-  const void * const *end() const { return Data + Length; }
-  unsigned size() const { return Length; }
+  const void * const *end() const { return Data + size(); }
+  unsigned size() const { return NumKeyParameters + NumWitnessTables; }
 
 private:
   uint32_t computeHash() const {
-    size_t H = 0x56ba80d1 * Length;
-    for (unsigned i = 0; i < Length; i++) {
+    size_t H = 0x56ba80d1u * NumKeyParameters;
+    for (unsigned index = 0; index != NumKeyParameters; ++index) {
       H = (H >> 10) | (H << ((sizeof(size_t) * 8) - 10));
-      H ^= (reinterpret_cast<size_t>(Data[i])
-            ^ (reinterpret_cast<size_t>(Data[i]) >> 19));
+      H ^= (reinterpret_cast<size_t>(Data[index])
+            ^ (reinterpret_cast<size_t>(Data[index]) >> 19));
     }
+
     H *= 0x27d4eb2d;
 
     // Rotate right by 10 and then truncate to 32 bits.
@@ -499,7 +600,7 @@ inline bool satisfies(PrivateMetadataState state, MetadataState requirement) {
   case MetadataState::Complete:
     return state >= PrivateMetadataState::Complete;
   }
-  swift_runtime_unreachable("unsupported requirement kind");
+  swift_unreachable("unsupported requirement kind");
 }
 
 class PrivateMetadataTrackingInfo {
@@ -549,7 +650,7 @@ public:
   MetadataState getAccomplishedRequestState() const {
     switch (getState()) {
     case PrivateMetadataState::Allocating:
-      swift_runtime_unreachable("cannot call on allocating state");
+      swift_unreachable("cannot call on allocating state");
     case PrivateMetadataState::Abstract:
       return MetadataState::Abstract;
     case PrivateMetadataState::LayoutComplete:
@@ -559,7 +660,7 @@ public:
     case PrivateMetadataState::Complete:
       return MetadataState::Complete;
     }
-    swift_runtime_unreachable("bad state");
+    swift_unreachable("bad state");
   }
 
   bool satisfies(MetadataState requirement) {
@@ -585,7 +686,7 @@ public:
       // Otherwise, if it's a non-blocking request, we do not need to block.
       return (request.isBlocking() && !satisfies(request.getState()));
     }
-    swift_runtime_unreachable("bad state");
+    swift_unreachable("bad state");
   }
 
   constexpr RawType getRawValue() const { return Data; }
@@ -682,10 +783,22 @@ protected:
   using super::asImpl;
 
 private:
+  #ifdef SWIFT_STDLIB_SINGLE_THREADED_RUNTIME
+  using ThreadID = int;
+  static ThreadID CurrentThreadID() {
+    return 0;
+  }
+  #else
+  using ThreadID = std::thread::id;
+  static ThreadID CurrentThreadID() {
+    return std::this_thread::get_id();
+  }
+  #endif
+
   /// Additional storage that is only ever accessed under the lock.
   union LockedStorage_t {
     /// The thread that is allocating the entry.
-    std::thread::id AllocatingThread;
+    ThreadID AllocatingThread;
 
     /// The completion queue.
     MetadataCompletionQueueEntry *CompletionQueue;
@@ -744,7 +857,7 @@ public:
   MetadataCacheEntryBase()
       : LockedStorageKind(LSK::AllocatingThread),
         TrackingInfo(PrivateMetadataTrackingInfo::initial().getRawValue()) {
-    LockedStorage.AllocatingThread = std::this_thread::get_id();
+    LockedStorage.AllocatingThread = CurrentThreadID();
   }
 
   // Note that having an explicit destructor here is important to make this
@@ -757,7 +870,7 @@ public:
 
   bool isBeingAllocatedByCurrentThread() const {
     return LockedStorageKind == LSK::AllocatingThread &&
-           LockedStorage.AllocatingThread == std::this_thread::get_id();
+           LockedStorage.AllocatingThread == CurrentThreadID();
   }
 
   /// Given that this thread doesn't own the right to initialize the
@@ -784,9 +897,9 @@ public:
 
   /// Perform the allocation operation.
   template <class... Args>
-  Optional<Status>
-  beginAllocation(ConcurrencyControl &concurrency, MetadataRequest request,
-                  Args &&...args) {
+  llvm::Optional<Status> beginAllocation(ConcurrencyControl &concurrency,
+                                         MetadataRequest request,
+                                         Args &&... args) {
     // Returning a non-None value here will preempt initialization, so we
     // should only do it if we're reached PrivateMetadataState::Complete.
 
@@ -1011,7 +1124,7 @@ private:
     case LSK::CompletionQueue:
       // Move the existing completion queue to the cache entry.
       queueEntry->CompletionQueue = LockedStorage.CompletionQueue;
-      LLVM_FALLTHROUGH;
+      SWIFT_FALLTHROUGH;
 
     case LSK::AllocatingThread:
       LockedStorageKind = LSK::QueueEntry;
@@ -1019,9 +1132,9 @@ private:
       return;
 
     case LSK::Complete:
-      swift_runtime_unreachable("preparing to enqueue when already complete?");
+      swift_unreachable("preparing to enqueue when already complete?");
     }
-    swift_runtime_unreachable("bad kind");
+    swift_unreachable("bad kind");
   }
 
   /// Claim all the satisfied completion queue entries, given that
@@ -1183,7 +1296,7 @@ public:
 
       switch (LockedStorageKind) {
       case LSK::Complete:
-        swift_runtime_unreachable("enqueuing on complete cache entry?");
+        swift_unreachable("enqueuing on complete cache entry?");
 
       case LSK::AllocatingThread:
         LockedStorageKind = LSK::CompletionQueue;
@@ -1235,7 +1348,7 @@ public:
       // Check for an existing dependency.
       switch (LockedStorageKind) {
       case LSK::Complete:
-        swift_runtime_unreachable("dependency on complete cache entry?");
+        swift_unreachable("dependency on complete cache entry?");
 
       case LSK::AllocatingThread:
       case LSK::CompletionQueue:
@@ -1270,7 +1383,7 @@ protected:
   using OverloadToken = typename TrailingObjects::template OverloadToken<T>;
 
   size_t numTrailingObjects(OverloadToken<const void *>) const {
-    return KeyLength;
+    return NumKeyParameters + NumWitnessTables;
   }
 
   template <class... Args>
@@ -1284,7 +1397,8 @@ private:
   // These are arranged to fit into the tail-padding of the superclass.
 
   /// These are set during construction and never changed.
-  const uint16_t KeyLength;
+  const uint16_t NumKeyParameters;
+  const uint16_t NumWitnessTables;
   const uint32_t Hash;
 
   /// Valid if TrackingInfo.getState() >= PrivateMetadataState::Abstract.
@@ -1300,29 +1414,36 @@ private:
 
 public:
   VariadicMetadataCacheEntryBase(const MetadataCacheKey &key)
-      : KeyLength(key.size()), Hash(key.hash()) {
+      : NumKeyParameters(key.numKeyParameters()),
+        NumWitnessTables(key.numWitnessTables()),
+        Hash(key.hash()) {
     memcpy(this->template getTrailingObjects<const void *>(),
            key.begin(), key.size() * sizeof(const void *));
   }
 
   MetadataCacheKey getKey() const {
-    return MetadataCacheKey(this->template getTrailingObjects<const void*>(),
-                            KeyLength, Hash);
+    return MetadataCacheKey(NumKeyParameters, NumWitnessTables,
+                            this->template getTrailingObjects<const void*>(),
+                            Hash);
   }
 
   intptr_t getKeyIntValueForDump() const {
     return Hash;
   }
 
-  int compareWithKey(const MetadataCacheKey &key) const {
-    return key.compare(getKey());
+  friend llvm::hash_code hash_value(const VariadicMetadataCacheEntryBase<Impl, Objects...> &value) {
+    return hash_value(value.getKey());
+  }
+
+  bool matchesKey(const MetadataCacheKey &key) const {
+    return key == getKey();
   }
 };
 
-template <class EntryType, bool ProvideDestructor = true>
+template <class EntryType, uint16_t Tag>
 class MetadataCache :
     public LockingConcurrentMap<EntryType,
-             LockingConcurrentMapStorage<EntryType, ProvideDestructor>> {
+             LockingConcurrentMapStorage<EntryType, Tag>> {
 };
 
 } // namespace swift

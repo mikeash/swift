@@ -11,6 +11,9 @@ public enum CodingKeys : String, CodingKey {
 // CodingKey enums during member type lookup.
 struct SynthesizedClass : Codable {
   let value: String = "foo"
+  // expected-warning@-1 {{immutable property will not be decoded because it is declared with an initial value which cannot be overwritten}}
+  // expected-note@-2 {{set the initial value via the initializer or explicitly define a CodingKeys enum including a 'value' case to silence this warning}}
+  // expected-note@-3 {{make the property mutable instead}}{{3-6=var}}
 
   // Qualified type lookup should always be unambiguous.
   public func qualifiedFoo(_ key: SynthesizedClass.CodingKeys) {} // expected-error {{method cannot be declared public because its parameter uses a private type}}
@@ -174,17 +177,17 @@ struct SynthesizedClass : Codable {
 
 // Classes which don't get synthesized Codable implementations should expose the
 // appropriate CodingKeys type.
-struct NonSynthesizedClass : Codable {
+struct NonSynthesizedClass : Codable { // expected-note 4 {{'NonSynthesizedClass' declared here}}
   // No synthesized type since we implemented both methods.
   init(from decoder: Decoder) throws {}
   func encode(to encoder: Encoder) throws {}
 
   // Qualified type lookup should clearly fail -- we shouldn't get a synthesized
   // type here.
-  public func qualifiedFoo(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedClass'}}
-  internal func qualifiedBar(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedClass'}}
-  fileprivate func qualfiedBaz(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedClass'}}
-  private func qualifiedQux(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedClass'}}
+  public func qualifiedFoo(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'class_codable_member_type_lookup.NonSynthesizedClass'}}
+  internal func qualifiedBar(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'class_codable_member_type_lookup.NonSynthesizedClass'}}
+  fileprivate func qualfiedBaz(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'class_codable_member_type_lookup.NonSynthesizedClass'}}
+  private func qualifiedQux(_ key: NonSynthesizedClass.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'class_codable_member_type_lookup.NonSynthesizedClass'}}
 
   // Unqualified lookups should find the public top-level CodingKeys type.
   public func unqualifiedFoo(_ key: CodingKeys) { print(CodingKeys.topLevel) }

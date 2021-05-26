@@ -8,11 +8,12 @@ class Concrete {
   func concreteMethod(_: ConcreteAlias) {}
 }
 
-class Generic<T> : Concrete {
+class Generic<T> : Concrete { // expected-note 6 {{arguments to generic parameter 'T' ('Int' and 'String') are expected to be equal}}
   typealias GenericAlias = (T, T)
 
   func genericMethod(_: GenericAlias) {}
 }
+
 
 protocol BaseProto {}
 
@@ -44,7 +45,7 @@ extension ProtoRefinesClass {
     let _: BaseProto & Concrete = self
 
     let _: Generic<String> = self
-    // expected-error@-1 {{cannot convert value of type 'Self' to specified type 'Generic<String>'}}
+    // expected-error@-1 {{cannot assign value of type 'Generic<Int>' to type 'Generic<String>'}}
   }
 }
 
@@ -68,7 +69,7 @@ func usesProtoRefinesClass1(_ t: ProtoRefinesClass) {
   let _: BaseProto & Concrete = t
 
   let _: Generic<String> = t
-  // expected-error@-1 {{cannot convert value of type 'ProtoRefinesClass' to specified type 'Generic<String>'}}
+  // expected-error@-1 {{cannot assign value of type 'Generic<Int>' to type 'Generic<String>'}}
 }
 
 func usesProtoRefinesClass2<T : ProtoRefinesClass>(_ t: T) {
@@ -91,20 +92,20 @@ func usesProtoRefinesClass2<T : ProtoRefinesClass>(_ t: T) {
   let _: BaseProto & Concrete = t
 
   let _: Generic<String> = t
-  // expected-error@-1 {{cannot convert value of type 'T' to specified type 'Generic<String>'}}
+  // expected-error@-1 {{cannot assign value of type 'Generic<Int>' to type 'Generic<String>'}}
 }
 
 class BadConformingClass1 : ProtoRefinesClass {
   // expected-error@-1 {{'ProtoRefinesClass' requires that 'BadConformingClass1' inherit from 'Generic<Int>'}}
   // expected-note@-2 {{requirement specified as 'Self' : 'Generic<Int>' [with Self = BadConformingClass1]}}
   func requirementUsesClassTypes(_: ConcreteAlias, _: GenericAlias) {
-    // expected-error@-1 {{use of undeclared type 'ConcreteAlias'}}
-    // expected-error@-2 {{use of undeclared type 'GenericAlias'}}
+    // expected-error@-1 {{cannot find type 'ConcreteAlias' in scope}}
+    // expected-error@-2 {{cannot find type 'GenericAlias' in scope}}
 
     _ = ConcreteAlias.self
-    // expected-error@-1 {{use of unresolved identifier 'ConcreteAlias'}}
+    // expected-error@-1 {{cannot find 'ConcreteAlias' in scope}}
     _ = GenericAlias.self
-    // expected-error@-1 {{use of unresolved identifier 'GenericAlias'}}
+    // expected-error@-1 {{cannot find 'GenericAlias' in scope}}
   }
 }
 
@@ -147,7 +148,7 @@ extension ProtoRefinesProtoWithClass {
     let _: BaseProto & Concrete = self
 
     let _: Generic<String> = self
-    // expected-error@-1 {{cannot convert value of type 'Self' to specified type 'Generic<String>'}}
+    // expected-error@-1 {{cannot assign value of type 'Generic<Int>' to type 'Generic<String>'}}
   }
 }
 
@@ -171,7 +172,7 @@ func usesProtoRefinesProtoWithClass1(_ t: ProtoRefinesProtoWithClass) {
   let _: BaseProto & Concrete = t
 
   let _: Generic<String> = t
-  // expected-error@-1 {{cannot convert value of type 'ProtoRefinesProtoWithClass' to specified type 'Generic<String>'}}
+  // expected-error@-1 {{cannot assign value of type 'Generic<Int>' to type 'Generic<String>'}}
 }
 
 func usesProtoRefinesProtoWithClass2<T : ProtoRefinesProtoWithClass>(_ t: T) {
@@ -194,7 +195,7 @@ func usesProtoRefinesProtoWithClass2<T : ProtoRefinesProtoWithClass>(_ t: T) {
   let _: BaseProto & Concrete = t
 
   let _: Generic<String> = t
-  // expected-error@-1 {{cannot convert value of type 'T' to specified type 'Generic<String>'}}
+  // expected-error@-1 {{cannot assign value of type 'Generic<Int>' to type 'Generic<String>'}}
 }
 
 class ClassWithInits<T> {
@@ -208,10 +209,10 @@ protocol ProtocolWithClassInits where Self : ClassWithInits<Int> {}
 
 func useProtocolWithClassInits1() {
   _ = ProtocolWithClassInits(notRequiredInit: ())
-  // expected-error@-1 {{member 'init' cannot be used on type 'ProtocolWithClassInits'}}
+  // expected-error@-1 {{protocol type 'ProtocolWithClassInits' cannot be instantiated}}
 
   _ = ProtocolWithClassInits(requiredInit: ())
-  // expected-error@-1 {{member 'init' cannot be used on type 'ProtocolWithClassInits'}}
+  // expected-error@-1 {{protocol type 'ProtocolWithClassInits' cannot be instantiated}}
 }
 
 func useProtocolWithClassInits2(_ t: ProtocolWithClassInits.Type) {
@@ -237,10 +238,10 @@ protocol ProtocolRefinesClassInits : ProtocolWithClassInits {}
 
 func useProtocolRefinesClassInits1() {
   _ = ProtocolRefinesClassInits(notRequiredInit: ())
-  // expected-error@-1 {{member 'init' cannot be used on type 'ProtocolRefinesClassInits'}}
+  // expected-error@-1 {{protocol type 'ProtocolRefinesClassInits' cannot be instantiated}}
 
   _ = ProtocolRefinesClassInits(requiredInit: ())
-  // expected-error@-1 {{member 'init' cannot be used on type 'ProtocolRefinesClassInits'}}
+  // expected-error@-1 {{protocol type 'ProtocolRefinesClassInits' cannot be instantiated}}
 }
 
 func useProtocolRefinesClassInits2(_ t: ProtocolRefinesClassInits.Type) {
@@ -300,6 +301,12 @@ class RefinedClass : BaseClass, RefinedProtocol {
   }
 }
 
+func takesBaseProtocol(_: BaseProtocol) {}
+
+func passesRefinedProtocol(_ r: RefinedProtocol) {
+  takesBaseProtocol(r)
+}
+
 class LoopClass : LoopProto {}
 protocol LoopProto where Self : LoopClass {}
 
@@ -317,10 +324,10 @@ class SecondConformer : SecondClass, SecondProtocol {}
 // Duplicate superclass
 // FIXME: Should be an error here too
 protocol DuplicateSuper1 : Concrete where Self : Concrete {}
-// expected-note@-1 {{superclass constraint 'Self' : 'Concrete' written here}}
+// expected-note@-1 {{superclass constraint 'Self' : 'Concrete' implied here}}
 // expected-warning@-2 {{redundant superclass constraint 'Self' : 'Concrete'}}
 protocol DuplicateSuper2 where Self : Concrete, Self : Concrete {}
-// expected-note@-1 {{superclass constraint 'Self' : 'Concrete' written here}}
+// expected-note@-1 {{superclass constraint 'Self' : 'Concrete' implied here}}
 // expected-warning@-2 {{redundant superclass constraint 'Self' : 'Concrete'}}
 
 // Ambiguous name lookup situation

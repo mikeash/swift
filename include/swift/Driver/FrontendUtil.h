@@ -15,6 +15,7 @@
 
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/StringSaver.h"
 
 #include <memory>
 
@@ -23,6 +24,11 @@ namespace swift {
 class DiagnosticEngine;
 
 namespace driver {
+/// Expand response files in the argument list with retrying.
+/// This function is a wrapper of lvm::cl::ExpandResponseFiles. It will
+/// retry calling the function if the previous expansion failed.
+void ExpandResponseFilesWithRetry(llvm::StringSaver &Saver,
+                                  llvm::SmallVectorImpl<const char *> &Args);
 
 /// Generates the list of arguments that would be passed to the compiler
 /// frontend from the given driver arguments.
@@ -33,6 +39,9 @@ namespace driver {
 /// \param Action Called with the list of frontend arguments if there were no
 /// errors in processing \p ArgList. This is a callback rather than a return
 /// value to avoid copying the arguments more than necessary.
+/// \param ForceNoOutputs If true, override the output mode to "-typecheck" and
+/// produce no outputs. For example, this disables "-emit-module" and "-c" and
+/// prevents the creation of temporary files.
 ///
 /// \returns True on error, or if \p Action returns true.
 ///
@@ -40,7 +49,8 @@ namespace driver {
 /// suitable for use in REPL or immediate modes.
 bool getSingleFrontendInvocationFromDriverArguments(
     ArrayRef<const char *> ArgList, DiagnosticEngine &Diags,
-    llvm::function_ref<bool(ArrayRef<const char *> FrontendArgs)> Action);
+    llvm::function_ref<bool(ArrayRef<const char *> FrontendArgs)> Action,
+    bool ForceNoOutputs = false);
 
 } // end namespace driver
 } // end namespace swift

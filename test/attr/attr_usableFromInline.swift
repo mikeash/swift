@@ -87,7 +87,7 @@ internal struct InternalStruct {}
 // expected-error@-1 {{type referenced from the underlying type of a '@usableFromInline' type alias must be '@usableFromInline' or public}}
 
 protocol InternalProtocol {
-  // expected-note@-1 4{{type declared here}}
+  // expected-note@-1 * {{type declared here}}
   associatedtype T
 }
 
@@ -147,3 +147,19 @@ enum BadEnum {
 @usableFromInline
 class BadClass : InternalClass {}
 // expected-error@-1 {{type referenced from the superclass of a '@usableFromInline' class must be '@usableFromInline' or public}}
+
+public struct TestGenericSubscripts {
+  @usableFromInline subscript<T: InternalProtocol>(_: T) -> Int { return 0 } // expected-warning {{type referenced from a generic parameter of a '@usableFromInline' subscript should be '@usableFromInline' or public}}
+  @usableFromInline subscript<T>(where _: T) -> Int where T: InternalProtocol { return 0 } // expected-warning {{type referenced from a generic requirement of a '@usableFromInline' subscript should be '@usableFromInline' or public}}
+}
+
+@usableFromInline typealias TestGenericAlias<T: InternalProtocol> = T // expected-warning {{type referenced from a generic parameter of a '@usableFromInline' type alias should be '@usableFromInline' or public}}
+@usableFromInline typealias TestGenericAliasWhereClause<T> = T where T: InternalProtocol // expected-warning {{type referenced from a generic requirement of a '@usableFromInline' type alias should be '@usableFromInline' or public}}
+
+@usableFromInline struct GenericStruct<T> {
+  @usableFromInline struct Nested where T : InternalProtocol {}
+  // expected-error@-1 {{type referenced from a generic requirement of a '@usableFromInline' struct must be '@usableFromInline' or public}}
+
+  @usableFromInline func nonGenericWhereClause() where T : InternalProtocol {}
+  // expected-error@-1 {{type referenced from a generic requirement of a '@usableFromInline' instance method must be '@usableFromInline' or public}}
+}

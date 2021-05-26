@@ -19,6 +19,7 @@ import datetime
 import itertools
 import json
 import os
+import platform
 import random
 import re
 
@@ -89,7 +90,7 @@ class JobStats(JobData):
                                     else max(a, b)),
                "max": lambda a, b: max(a, b)}
         op = ops[merge_by]
-        for k, v in self.stats.items() + other.stats.items():
+        for k, v in list(self.stats.items()) + list(other.stats.items()):
             if k in merged_stats:
                 merged_stats[k] = op(v, merged_stats[k])
             else:
@@ -199,7 +200,7 @@ AUXPATSTR = (r"(?P<module>[^-]+)-(?P<input>[^-]+)-(?P<triple>[^-]+)" +
 AUXPAT = re.compile(AUXPATSTR)
 
 TIMERPATSTR = (r"time\.swift-(?P<jobkind>\w+)\." + AUXPATSTR +
-               "\.(?P<timerkind>\w+)$")
+               r"\.(?P<timerkind>\w+)$")
 TIMERPAT = re.compile(TIMERPATSTR)
 
 FILEPATSTR = (r"^stats-(?P<start>\d+)-swift-(?P<kind>\w+)-" +
@@ -266,7 +267,7 @@ def find_profiles_in(profiledir, select_stat=[]):
                 if profiletype not in profiles:
                     profiles[profiletype] = dict()
                 profiles[profiletype][counter] = fullpath
-            except:
+            except Exception:
                 pass
     return profiles
 
@@ -315,18 +316,24 @@ def load_stats_dir(path, select_module=[], select_stat=[],
                 continue
             jobargs = [mg["input"], mg["triple"], mg["out"], mg["opt"]]
 
-            with open(os.path.join(root, f)) as fp:
+            if platform.system() == 'Windows':
+                p = str(u"\\\\?\\%s" % os.path.abspath(os.path.join(root, f)))
+            else:
+                p = os.path.join(root, f)
+
+            with open(p) as fp:
                 j = json.load(fp)
             dur_usec = 1
             stats = dict()
             for (k, v) in j.items():
                 if sre.search(k) is None:
                     continue
+                if k.startswith('time.'):
+                    v = int(1000000.0 * float(v))
                 if k.startswith('time.') and exclude_timers:
                     continue
                 tm = match_timerpat(k)
                 if tm:
-                    v = int(1000000.0 * float(v))
                     if tm['jobkind'] == jobkind and \
                        tm['timerkind'] == 'wall':
                         dur_usec = v

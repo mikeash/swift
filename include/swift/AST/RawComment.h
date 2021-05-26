@@ -13,11 +13,15 @@
 #ifndef SWIFT_AST_RAW_COMMENT_H
 #define SWIFT_AST_RAW_COMMENT_H
 
-#include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceLoc.h"
-#include "swift/Basic/SourceManager.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace swift {
+
+class SourceFile;
+class SourceManager;
+
 struct SingleRawComment {
   enum class CommentKind {
     OrdinaryLine,  ///< Any normal // comments
@@ -26,16 +30,14 @@ struct SingleRawComment {
     BlockDoc,      ///< \code /** stuff */ \endcode
   };
 
-  const CharSourceRange Range;
-  const StringRef RawText;
+  CharSourceRange Range;
+  StringRef RawText;
 
   unsigned Kind : 8;
-  unsigned StartColumn : 16;
-  unsigned StartLine;
-  unsigned EndLine;
+  unsigned ColumnIndent : 16;
 
   SingleRawComment(CharSourceRange Range, const SourceManager &SourceMgr);
-  SingleRawComment(StringRef RawText, unsigned StartColumn);
+  SingleRawComment(StringRef RawText, unsigned ColumnIndent);
 
   SingleRawComment(const SingleRawComment &) = default;
   SingleRawComment &operator=(const SingleRawComment &) = default;

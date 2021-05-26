@@ -19,11 +19,10 @@ use(z)
 // CHECK-SAME: !dbg ![[SP:[0-9]+]]
 // CHECK-NEXT: entry:
 // CHECK-NEXT: !dbg ![[ZERO:[0-9]+]]
-// CHECK-NEXT: !dbg ![[ZERO]]
 // CHECK-NEXT: }
 
-// CHECK: ![[SP]] = {{.*}}name: "transparent"
-// CHECK-SAME: file: ![[FILE:[0-9]+]]
-// CHECK-NOT: line:
+// CHECK: ![[SP]] = distinct !DISubprogram({{.*}}name: "transparent"
+// CHECK-SAME:                             file: ![[FILE:[0-9]+]]
 // CHECK: ![[FILE]] = {{.*}}"<compiler-generated>"
+// CHECK-NOT: line:
 // CHECK: ![[ZERO]] = !DILocation(line: 0,

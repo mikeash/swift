@@ -1,5 +1,10 @@
-// RUN: %target-run-stdlib-swiftgyb-swift3
+// RUN: %target-run-stdlib-swiftgyb
 // REQUIRES: executable_test
+
+// FIXME: [SR-14363]
+//   FixedPoint.swift.gyb slowed down with -Onone copy propagation
+//   We should be able to move this out of long_test once fixed.
+// REQUIRES: long_test
 
 import StdlibUnittest
 
@@ -8,6 +13,7 @@ var FixedPoint = TestSuite("FixedPoint")
 
 %{
 
+from __future__ import division
 import gyb
 from SwiftIntTypes import all_integer_types
 
@@ -58,7 +64,7 @@ def prepare_bit_pattern(bit_pattern, dst_bits, dst_signed):
 //===----------------------------------------------------------------------===//
 
 FixedPoint.test("Integers.Stride") {
-#if arch(i386) || arch(arm)
+#if arch(i386) || arch(arm) || arch(arm64_32)
 
 % for self_ty in all_integer_types(32):
 %   Self = self_ty.stdlib_name
@@ -80,7 +86,7 @@ _UnimplementedError()
 }
 
 //===----------------------------------------------------------------------===//
-// 'Int(truncatingBitPattern:)' initializer
+// 'Int(truncatingIfNeeded:)' initializer
 //===----------------------------------------------------------------------===//
 
 %{
@@ -97,11 +103,11 @@ truncating_bit_pattern_test_template = gyb.parse_template("truncating_bit_patter
 %
 %       for bit_pattern in test_bit_patterns:
 
-FixedPoint.test("${Dst}(truncatingBitPattern:) from ${Src}(${bit_pattern})") {
+FixedPoint.test("${Dst}(truncatingIfNeeded:) from ${Src}(${bit_pattern})") {
 %       input = prepare_bit_pattern(bit_pattern, src_ty.bits, src_ty.is_signed)
   let input = get${Src}(${input})
 %       input = prepare_bit_pattern(input, src_ty.bits, False)
-  let output = get${Dst}(${Dst}(truncatingBitPattern: input))
+  let output = get${Dst}(${Dst}(truncatingIfNeeded: input))
   let expected = get${Dst}(${prepare_bit_pattern(input, dst_ty.bits, dst_ty.is_signed)})
   expectEqual(expected, output)
 }
@@ -126,7 +132,7 @@ FixedPoint.test("${Dst}(truncatingBitPattern:) from ${Src}(${bit_pattern})") {
 
 }%
 
-#if arch(i386) || arch(arm)
+#if arch(i386) || arch(arm) || arch(arm64_32)
 
   ${gyb.execute_template(
       truncating_bit_pattern_test_template,
@@ -198,7 +204,7 @@ FixedPoint.test("${Dst}(bitPattern:) from ${Src}(${bit_pattern})") {
 
 }%
 
-#if arch(i386) || arch(arm)
+#if arch(i386) || arch(arm) || arch(arm64_32)
 
   ${gyb.execute_template(
       bit_pattern_test_template,
@@ -248,7 +254,7 @@ FixedPoint.test("${Self}.hash(into:)") {
 %     if self_ty.bits == 64:
     let expected = Hasher._hash(seed: 0, ${reference} as UInt64)
 %     else:
-    let expected = Hasher._hash(seed: 0, bytes: ${reference}, count: ${self_ty.bits / 8})
+    let expected = Hasher._hash(seed: 0, bytes: ${reference}, count: ${self_ty.bits // 8})
 %     end
     expectEqual(expected, output, "input: \(input)")
   }
@@ -263,7 +269,7 @@ FixedPoint.test("${Self}.hash(into:)") {
 
 }%
 
-#if arch(i386) || arch(arm)
+#if arch(i386) || arch(arm) || arch(arm64_32)
 
   ${gyb.execute_template(
       hash_value_test_template,

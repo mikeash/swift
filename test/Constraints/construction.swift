@@ -16,11 +16,13 @@ enum Z {
 
   init() { self = .none }
   init(_ c: UnicodeScalar) { self = .char(c) }
+  // expected-note@-1 2 {{candidate expects value of type 'UnicodeScalar' (aka 'Unicode.Scalar') for parameter #1}}
   init(_ s: String) { self = .string(s) }
+  // expected-note@-1 2 {{candidate expects value of type 'String' for parameter #1}}
   init(_ x: Int, _ y: Int) { self = .point(x, y) }
 }
 
-enum Optional<T> {  // expected-note {{'T' declared as parameter to type 'Optional'}}
+enum Optional<T> {
   case none
   case value(T)
 
@@ -57,7 +59,7 @@ acceptString("\(hello), \(world) #\(i)!")
 Optional<Int>(1) // expected-warning{{unused}}
 Optional(1) // expected-warning{{unused}}
 _ = .none as Optional<Int>
-Optional(.none) // expected-error{{generic parameter 'T' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}} {{9-9=<Any>}}
+Optional(.none) // expected-error {{cannot infer contextual base in reference to member 'none'}}
 
 // Interpolation
 _ = "\(hello), \(world) #\(i)!"
@@ -93,11 +95,9 @@ _ = b as! Derived
 //  are special cased in the library.
 Int(i) // expected-warning{{unused}}
 _ = i as Int
-Z(z) // expected-error{{cannot invoke initializer for type 'Z' with an argument list of type '(Z)'}}
-// expected-note @-1 {{overloads for 'Z' exist with these partially matching parameter lists: (UnicodeScalar), (String)}}
+Z(z) // expected-error{{no exact matches in call to initializer}}
 
-Z.init(z)  // expected-error {{cannot invoke 'Z.Type.init' with an argument list of type '(Z)'}}
-// expected-note @-1 {{overloads for 'Z.Type.init' exist with these partially matching parameter lists: (UnicodeScalar), (String)}}
+Z.init(z)  // expected-error {{no exact matches in call to initializer}}
 
 
 _ = z as Z
@@ -172,3 +172,95 @@ SR_5245(s: SR_5245.S(f: [.e1, .e2]))
 
 // rdar://problem/34670592 - Compiler crash on heterogeneous collection literal
 _ = Array([1, "hello"]) // Ok
+
+func init_via_non_const_metatype(_ s1: S1.Type) {
+  _ = s1(i: 42) // expected-error {{initializing from a metatype value must reference 'init' explicitly}} {{9-9=.init}}
+  _ = s1.init(i: 42) // ok
+}
+
+// rdar://problem/45535925 - diagnostic is attached to invalid source location
+func rdar_45535925() {
+  struct S {
+    var addr: String
+    var port: Int
+
+    private init(addr: String, port: Int?) {
+      // expected-note@-1 {{'init(addr:port:)' declared here}}
+      self.addr = addr
+      self.port = port ?? 31337
+    }
+
+    private init(port: Int) {
+      self.addr = "localhost"
+      self.port = port
+    }
+
+    private func foo(_: Int) {}  // expected-note {{'foo' declared here}}
+    private static func bar() {} // expected-note {{'bar()' declared here}}
+  }
+
+  _ = S(addr: "localhost", port: nil)
+  // expected-error@-1 {{'S' initializer is inaccessible due to 'private' protection level}}
+
+  func baz(_ s: S) {
+    s.foo(42)
+    // expected-error@-1 {{'foo' is inaccessible due to 'private' protection level}}
+    S.bar()
+    // expected-error@-1 {{'bar' is inaccessible due to 'private' protection level}}
+  }
+}
+
+// rdar://problem/50668864
+func rdar_50668864() {
+  struct Foo {
+    init(anchors: [Int]) { // expected-note {{'init(anchors:)' declared here}}
+      self = .init { _ in [] } // expected-error {{trailing closure passed to parameter of type '[Int]' that does not accept a closure}}
+    }
+  }
+}
+
+// SR-10837 (rdar://problem/51442825) - init partial application regression
+func sr_10837() {
+  struct S {
+    let value: Int
+
+    static func foo(_ v: Int?) {
+      _ = v.flatMap(self.init(value:)) // Ok
+      _ = v.flatMap(S.init(value:))    // Ok
+      _ = v.flatMap { S.init(value:)($0) }    // Ok
+      _ = v.flatMap { self.init(value:)($0) } // Ok
+    }
+  }
+
+  class A {
+    init(bar: Int) {}
+  }
+
+  class B : A {
+    init(value: Int) {}
+    convenience init(foo: Int = 42) {
+      self.init(value:)(foo) // Ok
+      self.init(value:)
+      // expected-error@-1 {{partial application of 'self.init' initializer delegation is not allowed}}
+    }
+  }
+
+  class C : A {
+    override init(bar: Int) {
+      super.init(bar:)(bar) // Ok
+      super.init(bar:)
+      // expected-error@-1 {{partial application of 'super.init' initializer chain is not allowed}}
+    }
+  }
+}
+
+// To make sure that hack related to type variable bindings works as expected we need to test
+// that in the following case result of a call to `reduce` maintains optionality.
+func test_that_optionality_of_closure_result_is_preserved() {
+  struct S {}
+
+  let arr: [S?] = []
+  let _: [S]? = arr.reduce([], { (a: [S]?, s: S?) -> [S]? in
+    a.flatMap { (group: [S]) -> [S]? in s.map { group + [$0] } } // Ok
+  })
+}

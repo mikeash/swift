@@ -14,8 +14,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef SWIFT_ABI_TARGET_H
-#define SWIFT_ABI_TARGET_H
+#ifndef SWIFT_STDLIB_SHIMS_ABI_TARGET_H
+#define SWIFT_STDLIB_SHIMS_ABI_TARGET_H
 
 #if !defined(__has_builtin)
 #define __has_builtin(x) 0
@@ -26,7 +26,9 @@
 #if __has_builtin(__is_target_environment)
 # if __is_target_environment(simulator)
 #  define SWIFT_TARGET_OS_SIMULATOR 1
+# else
+#  define SWIFT_TARGET_OS_SIMULATOR 0
 # endif
 #endif
 
-#endif /* SWIFT_ABI_TARGET_H */
+#endif // SWIFT_STDLIB_SHIMS_ABI_TARGET_H

@@ -79,7 +79,7 @@
 ///     var destBytes = someBytes[0..<n]
 ///
 /// Next, the bytes referenced by `destBytes` are copied into `byteArray`, a
-/// new `[UInt]` array, and then the remainder of `someBytes` is appended to
+/// new `[UInt8]` array, and then the remainder of `someBytes` is appended to
 /// `byteArray`:
 ///
 ///     var byteArray: [UInt8] = Array(destBytes)
@@ -92,7 +92,7 @@
 ///
 ///     destBytes[0..<n] = someBytes[n..<(n + n)]
 % end
-@_fixed_layout
+@frozen
 public struct Unsafe${Mutable}RawBufferPointer {
   @usableFromInline
   internal let _position, _end: Unsafe${Mutable}RawPointer?
@@ -101,7 +101,7 @@ public struct Unsafe${Mutable}RawBufferPointer {
 %if not mutable:
 extension UnsafeRawBufferPointer {
   /// An iterator over the bytes viewed by a raw buffer pointer.
-  @_fixed_layout
+  @frozen
   public struct Iterator {
     @usableFromInline
     internal var _position, _end: UnsafeRawPointer?
@@ -185,13 +185,13 @@ extension Unsafe${Mutable}RawBufferPointer: ${Mutable}Collection {
     get {
       _debugPrecondition(i >= 0)
       _debugPrecondition(i < endIndex)
-      return _position!.load(fromByteOffset: i, as: UInt8.self)
+      return _position._unsafelyUnwrappedUnchecked.load(fromByteOffset: i, as: UInt8.self)
     }
 %  if mutable:
     nonmutating set {
       _debugPrecondition(i >= 0)
       _debugPrecondition(i < endIndex)
-      _position!.storeBytes(of: newValue, toByteOffset: i, as: UInt8.self)
+      _position._unsafelyUnwrappedUnchecked.storeBytes(of: newValue, toByteOffset: i, as: UInt8.self)
     }
 %  end # mutable
   }
@@ -253,7 +253,7 @@ extension Unsafe${Mutable}RawBufferPointer: ${Mutable}Collection {
   @inlinable
   public var count: Int {
     if let pos = _position {
-      return _end! - pos
+      return _assumeNonNegative(_end! - pos)
     }
     return 0
   }
@@ -375,6 +375,9 @@ extension Unsafe${Mutable}RawBufferPointer {
   /// must be properly aligned for accessing `T`, and `source.count` must be a
   /// multiple of `MemoryLayout<T>.stride`.
   ///
+  /// The memory referenced by `source` may overlap with the memory referenced 
+  /// by this buffer.
+  ///
   /// After calling `copyMemory(from:)`, the first `source.count` bytes of
   /// memory referenced by this buffer are initialized to raw bytes. If the
   /// memory is bound to type `T`, then it contains values of type `T`.
@@ -402,7 +405,7 @@ extension Unsafe${Mutable}RawBufferPointer {
   /// - Parameter source: A collection of `UInt8` elements. `source.count` must
   ///   be less than or equal to this buffer's `count`.
   @inlinable
-  public func copyBytes<C : Collection>(from source: C
+  public func copyBytes<C: Collection>(from source: C
   ) where C.Element == UInt8 {
     _debugPrecondition(source.count <= self.count,
       "${Self}.copyBytes source has too many elements")
@@ -426,12 +429,14 @@ extension Unsafe${Mutable}RawBufferPointer {
   ///   - count: The number of bytes to include in the buffer. `count` must not
   ///     be negative.
   @inlinable
-  public init(start: Unsafe${Mutable}RawPointer?, count: Int) {
-    _precondition(count >= 0, "${Self} with negative count")
-    _precondition(count == 0 || start != nil,
+  public init(
+    @_nonEphemeral start: Unsafe${Mutable}RawPointer?, count: Int
+  ) {
+    _debugPrecondition(count >= 0, "${Self} with negative count")
+    _debugPrecondition(count == 0 || start != nil,
       "${Self} has a nil start and nonzero count")
     _position = start
-    _end = start.map { $0 + count }
+    _end = start.map { $0 + _assumeNonNegative(count) }
   }
 
   /// Creates a new buffer over the same memory as the given buffer.
@@ -467,7 +472,7 @@ extension Unsafe${Mutable}RawBufferPointer {
   ///   buffer's type `T` must be a trivial type.
   @inlinable
   public init<T>(_ buffer: UnsafeMutableBufferPointer<T>) {
-    self.init(start: buffer.baseAddress!,
+    self.init(start: buffer.baseAddress,
       count: buffer.count * MemoryLayout<T>.stride)
   }
 
@@ -478,7 +483,7 @@ extension Unsafe${Mutable}RawBufferPointer {
   ///   buffer's type `T` must be a trivial type.
   @inlinable
   public init<T>(_ buffer: UnsafeBufferPointer<T>) {
-    self.init(start: buffer.baseAddress!,
+    self.init(start: buffer.baseAddress,
       count: buffer.count * MemoryLayout<T>.stride)
   }
 %  end # !mutable
@@ -506,8 +511,20 @@ extension Unsafe${Mutable}RawBufferPointer {
   /// - Parameter slice: The raw buffer slice to rebase.
   @inlinable
   public init(rebasing slice: Slice<UnsafeRawBufferPointer>) {
-    self.init(start: slice.base.baseAddress! + slice.startIndex,
-      count: slice.count)
+    // NOTE: `Slice` does not guarantee that its start/end indices are valid
+    // in `base` -- it merely ensures that `startIndex <= endIndex`.
+    // We need manually check that we aren't given an invalid slice,
+    // or the resulting collection would allow access that was
+    // out-of-bounds with respect to the original base buffer.
+    // We only do this in debug builds to prevent a measurable performance
+    // degradation wrt passing around pointers not wrapped in a BufferPointer
+    // construct.
+    _debugPrecondition(
+      slice.startIndex >= 0 && slice.endIndex <= slice.base.count,
+      "Invalid slice")
+    let base = slice.base.baseAddress?.advanced(by: slice.startIndex)
+    let count = slice.endIndex &- slice.startIndex
+    self.init(start: base, count: count)
   }
 %  end # !mutable
 
@@ -533,8 +550,9 @@ extension Unsafe${Mutable}RawBufferPointer {
   /// - Parameter slice: The raw buffer slice to rebase.
   @inlinable
   public init(rebasing slice: Slice<UnsafeMutableRawBufferPointer>) {
-    self.init(start: slice.base.baseAddress! + slice.startIndex,
-      count: slice.count)
+    let base = slice.base.baseAddress?.advanced(by: slice.startIndex)
+    let count = slice.endIndex &- slice.startIndex
+    self.init(start: base, count: count)
   }
 
   /// A pointer to the first byte of the buffer.
@@ -677,7 +695,7 @@ extension Unsafe${Mutable}RawBufferPointer {
   }
 }
 
-extension Unsafe${Mutable}RawBufferPointer : CustomDebugStringConvertible {
+extension Unsafe${Mutable}RawBufferPointer: CustomDebugStringConvertible {
   /// A textual representation of the buffer, suitable for debugging.
   public var debugDescription: String {
     return "${Self}"
@@ -801,6 +819,11 @@ public func withUnsafeBytes<T, Result>(
   let buffer = UnsafeRawBufferPointer(start: addr, count: MemoryLayout<T>.size)
   return try body(buffer)
 }
+
+extension UnsafeRawBufferPointer: Sendable { }
+extension UnsafeRawBufferPointer.Iterator: Sendable { }
+extension UnsafeMutableRawBufferPointer: Sendable { }
+
 
 // ${'Local Variables'}:
 // eval: (read-only-mode 1)

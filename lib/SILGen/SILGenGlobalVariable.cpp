@@ -29,28 +29,35 @@ SILGlobalVariable *SILGenModule::getSILGlobalVariable(VarDecl *gDecl,
   {
     auto SILGenName = gDecl->getAttrs().getAttribute<SILGenNameAttr>();
     if (SILGenName && !SILGenName->Name.empty()) {
-      mangledName = SILGenName->Name;
+      mangledName = SILGenName->Name.str();
     } else {
       Mangle::ASTMangler NewMangler;
       mangledName = NewMangler.mangleGlobalVariableFull(gDecl);
     }
   }
 
+  // Get the linkage for SILGlobalVariable.
+  FormalLinkage formalLinkage;
+  if (gDecl->isResilient())
+    formalLinkage = FormalLinkage::Private;
+  else
+    formalLinkage = getDeclLinkage(gDecl);
+  auto silLinkage = getSILLinkage(formalLinkage, forDef);
+
   // Check if it is already created, and update linkage if necessary.
   if (auto gv = M.lookUpGlobalVariable(mangledName)) {
     // Update the SILLinkage here if this is a definition.
     if (forDef == ForDefinition) {
-      gv->setLinkage(getSILLinkage(getDeclLinkage(gDecl), ForDefinition));
+      gv->setLinkage(silLinkage);
       gv->setDeclaration(false);
     }
     return gv;
   }
 
-  // Get the linkage for SILGlobalVariable.
-  SILLinkage link = getSILLinkage(getDeclLinkage(gDecl), forDef);
-  SILType silTy = M.Types.getLoweredTypeOfGlobal(gDecl);
+  SILType silTy = SILType::getPrimitiveObjectType(
+    M.Types.getLoweredTypeOfGlobal(gDecl));
 
-  auto *silGlobal = SILGlobalVariable::create(M, link, IsNotSerialized,
+  auto *silGlobal = SILGlobalVariable::create(M, silLinkage, IsNotSerialized,
                                               mangledName, silTy,
                                               None, gDecl);
   silGlobal->setDeclaration(!forDef);
@@ -67,14 +74,8 @@ SILGenFunction::emitGlobalVariableRef(SILLocation loc, VarDecl *var) {
     SILFunction *accessorFn = SGM.getFunction(
                             SILDeclRef(var, SILDeclRef::Kind::GlobalAccessor),
                                                   NotForDefinition);
-    SILValue accessor = B.createFunctionRef(loc, accessorFn);
-    auto accessorTy = accessor->getType().castTo<SILFunctionType>();
-    (void)accessorTy;
-    assert(!accessorTy->isPolymorphic()
-           && "generic global variable accessors not yet implemented");
-    SILValue addr = B.createApply(
-        loc, accessor, accessor->getType(),
-        accessorFn->getConventions().getSingleSILResultType(), {}, {});
+    SILValue accessor = B.createFunctionRefFor(loc, accessorFn);
+    SILValue addr = B.createApply(loc, accessor, SubstitutionMap(), {});
     // FIXME: It'd be nice if the result of the accessor was natively an
     // address.
     addr = B.createPointerToAddress(
@@ -86,7 +87,7 @@ SILGenFunction::emitGlobalVariableRef(SILLocation loc, VarDecl *var) {
   // Global variables can be accessed directly with global_addr.  Emit this
   // instruction into the prolog of the function so we can memoize/CSE it in
   // VarLocs.
-  auto entryBB = getFunction().begin();
+  auto *entryBB = &*getFunction().begin();
   SILGenBuilder prologueB(*this, entryBB, entryBB->begin());
   prologueB.setTrackingList(B.getTrackingList());
 
@@ -125,9 +126,8 @@ struct GenGlobalAccessors : public PatternVisitor<GenGlobalAccessors>
     // Find Builtin.once.
     auto &C = SGM.M.getASTContext();
     SmallVector<ValueDecl*, 2> found;
-    C.TheBuiltinModule
-      ->lookupValue({}, C.getIdentifier("once"),
-                    NLKind::QualifiedLookup, found);
+    C.TheBuiltinModule->lookupValue(C.getIdentifier("once"),
+                                    NLKind::QualifiedLookup, found);
 
     assert(found.size() == 1 && "didn't find Builtin.once?!");
 
@@ -141,7 +141,7 @@ struct GenGlobalAccessors : public PatternVisitor<GenGlobalAccessors>
   void visitTypedPattern(TypedPattern *P) {
     return visit(P->getSubPattern());
   }
-  void visitVarPattern(VarPattern *P) {
+  void visitBindingPattern(BindingPattern *P) {
     return visit(P->getSubPattern());
   }
   void visitTuplePattern(TuplePattern *P) {
@@ -178,20 +178,8 @@ void SILGenModule::emitGlobalInitialization(PatternBindingDecl *pd,
                 ->areAllParamsConcrete());
   }
 
-  // Emit the lazy initialization token for the initialization expression.
-  auto counter = anonymousSymbolCounter++;
-
-  // Pick one variable of the pattern. Usually it's only one variable, but it
-  // can also be something like: var (a, b) = ...
-  Pattern *pattern = pd->getPattern(pbdEntry);
-  VarDecl *varDecl = nullptr;
-  pattern->forEachVariable([&](VarDecl *D) {
-    varDecl = D;
-  });
-  assert(varDecl);
-
   Mangle::ASTMangler TokenMangler;
-  std::string onceTokenBuffer = TokenMangler.mangleGlobalInit(varDecl, counter,
+  std::string onceTokenBuffer = TokenMangler.mangleGlobalInit(pd, pbdEntry,
                                                               false);
   
   auto onceTy = BuiltinIntegerType::getWordType(M.getASTContext());
@@ -207,7 +195,7 @@ void SILGenModule::emitGlobalInitialization(PatternBindingDecl *pd,
 
   // Emit the initialization code into a function.
   Mangle::ASTMangler FuncMangler;
-  std::string onceFuncBuffer = FuncMangler.mangleGlobalInit(varDecl, counter,
+  std::string onceFuncBuffer = FuncMangler.mangleGlobalInit(pd, pbdEntry,
                                                             true);
   
   SILFunction *onceFunc = emitLazyGlobalInitializer(onceFuncBuffer, pd,
@@ -233,7 +221,7 @@ void SILGenFunction::emitLazyGlobalInitializer(PatternBindingDecl *binding,
 
   // Return void.
   auto ret = emitEmptyTuple(binding);
-  B.createReturn(ImplicitReturnLocation::getImplicitReturnLoc(binding), ret);
+  B.createReturn(ImplicitReturnLocation(binding), ret);
 }
 
 static void emitOnceCall(SILGenFunction &SGF, VarDecl *global,
@@ -247,7 +235,7 @@ static void emitOnceCall(SILGenFunction &SGF, VarDecl *global,
                                                rawPointerSILTy);
 
   // Emit a reference to the function to execute.
-  SILValue onceFuncRef = SGF.B.createFunctionRef(global, onceFunc);
+  SILValue onceFuncRef = SGF.B.createFunctionRefFor(global, onceFunc);
 
   // Call Builtin.once.
   SILValue onceArgs[] = {onceTokenAddr, onceFuncRef};

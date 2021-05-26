@@ -29,6 +29,15 @@ class Workspace(object):
         return os.path.join(self.build_root,
                             '%s-%s' % (product, deployment_target))
 
+    def swiftpm_unified_build_dir(self, deployment_target):
+        """ swiftpm_unified_build_dir() -> str
+
+        Build directory that all SwiftPM unified build products share.
+        """
+        return os.path.join(self.build_root,
+                            'unified-swiftpm-build-%s' %
+                            deployment_target)
+
 
 def compute_build_subdir(args):
     # Create a name for the build directory.
@@ -93,3 +102,14 @@ def compute_build_subdir(args):
     if args.enable_tsan:
         build_subdir += "+tsan"
     return build_subdir
+
+
+def relocate_xdg_cache_home_under(new_cache_location):
+    """
+    This allows under Linux to relocate the default location
+    of the module cache -- this can be useful when there are
+    are lot of invocations to touch or when some invocations
+    can't be easily configured (as is the case for Swift
+    compiler detection in CMake)
+    """
+    os.environ['XDG_CACHE_HOME'] = new_cache_location

@@ -1,16 +1,16 @@
-// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil -emit-ir %s | %FileCheck %s
-// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil -disable-reflection-names -emit-ir %s | %FileCheck %s --check-prefix=STRIP_REFLECTION_NAMES
-// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil -disable-reflection-metadata -emit-ir %s | %FileCheck %s --check-prefix=STRIP_REFLECTION_METADATA
+// RUN: %target-swift-frontend -emit-ir %s | %FileCheck %s
+// RUN: %target-swift-frontend -disable-reflection-names -emit-ir %s | %FileCheck %s --check-prefix=STRIP_REFLECTION_NAMES
+// RUN: %target-swift-frontend -disable-reflection-metadata -emit-ir %s | %FileCheck %s --check-prefix=STRIP_REFLECTION_METADATA
 
 // STRIP_REFLECTION_NAMES_DAG: section "{{[^"]*swift5_reflect|.sw5rfst\$B}}
 // STRIP_REFLECTION_NAMES_DAG: section "{{[^"]*swift5_fieldmd|.sw5flmd\$B}}
 // STRIP_REFLECTION_NAMES_DAG: section "{{[^"]*swift5_assocty|.sw5asty\$B}}
 // STRIP_REFLECTION_NAMES-DAG: section "{{[^"]*swift5_capture|.sw5cptr\$B}}
 // STRIP_REFLECTION_NAMES-DAG: section "{{[^"]*swift5_typeref|.sw5tyrf\$B}}
+// STRIP_REFLECTION_NAMES-DAG: private constant [6 x i8] c"Inner\00", section "{{[^"]*swift5_reflstr|.sw5rfst\$B}}
 // STRIP_REFLECTION_NAMES-NOT: section "{{[^"]*swift5_reflstr|.sw5rfst\$B}}
 // STRIP_REFLECTION_NAMES-NOT: section "{{[^"]*swift5_builtin|.sw5bltn\$B}}
-
-// STRIP_REFLECTION_NAMES-DAG: @"$s19reflection_metadata10MyProtocol_pMF" = internal constant {{.*}}swift5_fieldmd
+// STRIP_REFLECTION_NAMES-DAG: @"$s19reflection_metadata10MyProtocol_pMF" = internal constant {{.*}}section "{{[^"]*swift5_fieldmd|.sw5flmd\$B}}
 
 // STRIP_REFLECTION_METADATA-NOT: section "{{[^"]*swift5_reflect|.sw5rfst\$B}}
 // STRIP_REFLECTION_METADATA-NOT: section "{{[^"]*swift5_fieldmd|.sw5flmd\$B}}

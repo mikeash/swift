@@ -78,6 +78,49 @@ func foo7() -> String {
   foo6()
 }
 
+struct Test {
+  init(x: Int = 42) {}
+  func callAsFunction(x: Int = 42) {}
+}
+
+Test.init
+Test.init()
+Test.init(x:)
+Test.init(x: 3)
+
+let callable = Test();
+callable(x: 89)
+callable.callAsFunction
+callable.callAsFunction()
+callable.callAsFunction(x:)
+callable.callAsFunction(x: 78)
+(callable.callAsFunction)(x: 78)
+(callable.callAsFunction)()
+
+func foo(_ x: Int) -> Test { fatalError() }
+foo(39)(x: 90)
+
+struct TestDefaultedParen {
+  init(_: Int = 42) {}
+}
+
+TestDefaultedParen.init()
+
+struct HasInitWithDefaultArgs {
+  init(x: Int = 10, y: Int = 20, z: Int = 10)
+}
+
+HasInitWithDefaultArgs(z: 45)
+HasInitWithDefaultArgs(y: 45, z: 89)
+
+func `hasBackticks`(`x`: Int) {}
+`hasBackticks`(`x`:2)
+
+func hasAsyncAlternative(completion: (String?, Error?) -> Void) { }
+func hasCallToAsyncAlternative() {
+  hasAsyncAlternative { str, err in print(str!) }
+}
+
 // RUN: %sourcekitd-test -req=cursor -pos=3:1 -end-pos=5:13 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK1
 
 // CHECK1: ACTIONS BEGIN
@@ -91,6 +134,40 @@ func foo7() -> String {
 // RUN: %sourcekitd-test -req=cursor -pos=21:5 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK4
 // RUN: %sourcekitd-test -req=cursor -pos=26:20 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
 // RUN: %sourcekitd-test -req=cursor -pos=27:11 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-LOCAL
+
+// RUN: %sourcekitd-test -req=cursor -pos=83:8  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=86:6  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-NORENAME
+// RUN: %sourcekitd-test -req=cursor -pos=87:6  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-NORENAME
+// RUN: %sourcekitd-test -req=cursor -pos=88:6  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=89:6  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=89:11  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+
+// RUN: %sourcekitd-test -req=cursor -pos=92:10  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=93:10  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-NORENAME
+// RUN: %sourcekitd-test -req=cursor -pos=94:10  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-NORENAME
+// RUN: %sourcekitd-test -req=cursor -pos=95:10  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=96:10  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=96:25  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=97:11  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=97:27  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=98:11  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-NORENAME
+
+// RUN: %sourcekitd-test -req=cursor -pos=107:20  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-NORENAME
+
+// RUN: %sourcekitd-test -req=cursor -pos=113:24  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=114:24  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=114:31  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=114:31  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+
+// RUN: %sourcekitd-test -req=cursor -pos=116:6  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=116:7  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=117:1  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=117:2  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=117:16  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+// RUN: %sourcekitd-test -req=cursor -pos=117:17  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-GLOBAL
+
+// RUN: %sourcekitd-test -req=cursor -pos=119:6  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-ASYNC
+// RUN: %sourcekitd-test -req=cursor -pos=121:3  -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-CALLASYNC
 
 // RUN: %sourcekitd-test -req=cursor -pos=35:10 -end-pos=35:16 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-RENAME-EXTRACT
 // RUN: %sourcekitd-test -req=cursor -pos=35:10 -end-pos=35:16 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-RENAME-EXTRACT
@@ -106,11 +183,16 @@ func foo7() -> String {
 // RUN: %sourcekitd-test -req=cursor -pos=72:5 -end-pos=72:11 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-RENAME-EXTRACT
 // RUN: %sourcekitd-test -req=cursor -pos=78:3 -end-pos=78:9 -cursor-action %s -- %s | %FileCheck %s -check-prefix=CHECK-RENAME-EXTRACT
 
+// CHECK-NORENAME-NOT: Global Rename
+// CHECK-NORENAME-NOT: Local Rename
+
 // CHECK2: ACTIONS BEGIN
-// CHECK2-NEXT: source.refactoring.kind.rename.global
+// CHECK2-NOT: Local Rename
+// CHECK2: source.refactoring.kind.rename.global
 // CHECK2-NEXT: Global Rename
 // CHECK2-NEXT: symbol from system module cannot be renamed
-// CHECK2-NEXT: ACTIONS END
+// CHECK2-NOT: Local Rename
+// CHECK2: ACTIONS END
 
 // CHECK3: ACTIONS BEGIN
 // CHECK3-NEXT: source.refactoring.kind.rename.global
@@ -124,14 +206,18 @@ func foo7() -> String {
 // CHECK4-NEXT: Expand Default
 
 // CHECK-GLOBAL: ACTIONS BEGIN
-// CHECK-GLOBAL-NEXT: source.refactoring.kind.rename.global
+// CHECK-GLOBAL-NOT: Local Rename
+// CHECK-GLOBAL: source.refactoring.kind.rename.global
 // CHECK-GLOBAL-NEXT: Global Rename
-// CHECK-GLOBAL-NEXT: ACTIONS END
+// CHECK-GLOBAL-NOT: Local Rename
+// CHECK-GLOBAL: ACTIONS END
 
 // CHECK-LOCAL: ACTIONS BEGIN
-// CHECK-LOCAL-NEXT: source.refactoring.kind.rename.local
+// CHECK-LOCAL-NOT: Global Rename
+// CHECK-LOCAL: source.refactoring.kind.rename.local
 // CHECK-LOCAL-NEXT: Local Rename
-// CHECK-LOCAL-NEXT: ACTIONS END
+// CHECK-LOCAL-NOT: Global Rename
+// CHECK-LOCAL: ACTIONS END
 
 // CHECK-RENAME-EXTRACT: Global Rename
 // CHECK-RENAME-EXTRACT: Extract Method
@@ -152,4 +238,26 @@ func foo7() -> String {
 
 // CHECK-LOCALIZE-STRING: source.refactoring.kind.localize.string
 
-// REQUIRES-ANY: OS=macosx, OS=linux-gnu
+// CHECK-ASYNC: ACTIONS BEGIN
+// CHECK-ASYNC-NOT: source.refactoring.kind.convert.call-to-async
+// CHECK-ASYNC: source.refactoring.kind.convert.func-to-async
+// CHECK-ASYNC-NEXT: Convert Function to Async
+// CHECK-ASYNC-NEXT: source.refactoring.kind.add.async-alternative
+// CHECK-ASYNC-NEXT: Add Async Alternative
+// CHECK-ASYNC-NEXT: source.refactoring.kind.add.async-wrapper
+// CHECK-ASYNC-NEXT: Add Async Wrapper
+// CHECK-ASYNC-NOT: source.refactoring.kind.convert.call-to-async
+// CHECK-ASYNC: ACTIONS END
+
+// CHECK-CALLASYNC: ACTIONS BEGIN
+// CHECK-CALLASYNC-NOT: source.refactoring.kind.add.async-alternative
+// CHECK-CALLASYNC-NOT: source.refactoring.kind.convert.func-to-async
+// CHECK-CALLASYNC-NOT: source.refactoring.kind.add.async-wrapper
+// CHECK-CALLASYNC: source.refactoring.kind.convert.call-to-async
+// CHECK-CALLASYNC-NEXT: Convert Call to Async Alternative
+// CHECK-CALLASYNC-NOT: source.refactoring.kind.add.async-alternative
+// CHECK-CALLASYNC-NOT: source.refactoring.kind.convert.func-to-async
+// CHECK-CALLASYNC-NOT: source.refactoring.kind.add.async-wrapper
+// CHECK-CALLASYNC: ACTIONS END
+
+// REQUIRES: OS=macosx || OS=linux-gnu

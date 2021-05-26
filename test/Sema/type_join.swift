@@ -31,7 +31,7 @@ protocol FakeExpressibleByFloatLiteral {}
 protocol FakeBinaryFloatingPoint : FakeFloatingPoint, FakeExpressibleByFloatLiteral {}
 
 func expectEqualType<T>(_: T.Type, _: T.Type) {}
-func commonSupertype<T>(_: T, _: T) -> T {}
+func commonSupertype<T>(_: T, _: T) -> T {} // expected-note 2 {{generic parameters are always considered '@escaping'}}
 
 expectEqualType(Builtin.type_join(Int.self, Int.self), Int.self)
 expectEqualType(Builtin.type_join_meta(D.self, C.self), C.self)
@@ -90,17 +90,17 @@ func joinFunctions(
 ) {
   _ = commonSupertype(escaping, escaping)
   _ = commonSupertype(nonescaping, escaping)
-  // expected-error@-1 {{converting non-escaping value to 'T' may allow it to escape}}
+  // expected-error@-1 {{converting non-escaping parameter 'nonescaping' to generic parameter 'T' may allow it to escape}}
   _ = commonSupertype(escaping, nonescaping)
-  // expected-error@-1 {{converting non-escaping value to 'T' may allow it to escape}}
+  // expected-error@-1 {{converting non-escaping parameter 'nonescaping' to generic parameter 'T' may allow it to escape}}
   let x: Int = 1
   // FIXME: We emit these diagnostics here because we refuse to allow
   //        Any to be inferred for the generic type. That's pretty
   //        arbitrary.
   _ = commonSupertype(escaping, x)
-  // expected-error@-1 {{cannot convert value of type 'Int' to expected argument type '() -> ()'}}
+  // expected-error@-1 {{conflicting arguments to generic parameter 'T' ('() -> ()' vs. 'Int')}}
   _ = commonSupertype(x, escaping)
-  // expected-error@-1 {{cannot convert value of type '() -> ()' to expected argument type 'Int'}}
+  // expected-error@-1 {{conflicting arguments to generic parameter 'T' ('Int' vs. '() -> ()')}}
 
   let a: Any = 1
   _ = commonSupertype(nonescaping, a)
@@ -119,4 +119,15 @@ func rdar37241221(_ a: C?, _ b: D?) {
   let array_c_opt = [c]
   let inferred = [a!, b]
   expectEqualType(type(of: array_c_opt).self, type(of: inferred).self)
+}
+
+extension FixedWidthInteger {
+  public static func test_nonstale_join_result<Other: BinaryInteger>(_ lhs: inout Self, _ rhs: Other) {
+    let shift = rhs < -Self.bitWidth ? -Self.bitWidth
+               : rhs > Self.bitWidth ? Self.bitWidth
+               : Int(rhs) // `shift` is `Int`
+
+    func accepts_int(_: Int) {}
+    accepts_int(shift) // Ok
+  }
 }

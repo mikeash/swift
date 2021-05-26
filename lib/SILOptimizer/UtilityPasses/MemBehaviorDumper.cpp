@@ -11,14 +11,15 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-mem-behavior-dumper"
-#include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
-#include "swift/SILOptimizer/Analysis/SideEffectAnalysis.h"
 #include "swift/SILOptimizer/Analysis/Analysis.h"
+#include "swift/SILOptimizer/Analysis/SideEffectAnalysis.h"
+#include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
@@ -53,11 +54,25 @@ class MemBehaviorDumper : public SILModuleTransform {
   // To reduce the amount of output, we only dump the memory behavior of
   // selected types of instructions.
   static bool shouldTestInstruction(SILInstruction *I) {
-    // Only consider function calls.
-    if (FullApplySite::isa(I))
+    switch (I->getKind()) {
+    case SILInstructionKind::ApplyInst:
+    case SILInstructionKind::TryApplyInst:
+    case SILInstructionKind::EndApplyInst:
+    case SILInstructionKind::BeginApplyInst:
+    case SILInstructionKind::AbortApplyInst:
+    case SILInstructionKind::BeginAccessInst:
+    case SILInstructionKind::EndAccessInst:
+    case SILInstructionKind::EndCOWMutationInst:
+    case SILInstructionKind::CopyValueInst:
+    case SILInstructionKind::DestroyValueInst:
+    case SILInstructionKind::EndBorrowInst:
+    case SILInstructionKind::LoadInst:
+    case SILInstructionKind::StoreInst:
+    case SILInstructionKind::CopyAddrInst:
       return true;
-
-    return false;
+    default:
+      return false;
+    }
   }
 
   void run() override {
@@ -78,13 +93,17 @@ class MemBehaviorDumper : public SILModuleTransform {
             // Print the memory behavior in relation to all other values in the
             // function.
             for (auto &V : Values) {
+              if (V->getDefiningInstruction() == &I)
+                continue;
+                
+              if (!V->getType().isAddress() && !isa<AddressToPointerInst>(V))
+                continue;
+
               bool Read = AA->mayReadFromMemory(&I, V);
               bool Write = AA->mayWriteToMemory(&I, V);
-              bool SideEffects = AA->mayHaveSideEffects(&I, V);
               llvm::outs() << "PAIR #" << PairCount++ << ".\n"
                            << "  " << I << "  " << V
-                           << "  r=" << Read << ",w=" << Write
-                           << ",se=" << SideEffects << "\n";
+                           << "  r=" << Read << ",w=" << Write << "\n";
             }
           }
         }

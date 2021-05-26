@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -dump-ast %s 2>&1 | %FileCheck %s
+// RUN: %target-swift-frontend -dump-ast %s | %FileCheck %s
 
 func doSomething<T>(_ t: T) {}
 
@@ -29,6 +29,6 @@ func outerGeneric<T>(t: T, x: AnyObject) {
   // CHECK: func_decl{{.*}}"localFunction(tt:)" interface type='<T> (tt: TT) -> ()' {{.*}} captures=(<generic> )
   func localFunction(tt: TT) {}
 
-  // CHECK: closure_expr type='((a: T, b: T)) -> ()' {{.*}} captures=(<generic> )
+  // CHECK: closure_expr type='(TT) -> ()' {{.*}} captures=(<generic> )
   let _: (TT) -> () = { _ in }
 }

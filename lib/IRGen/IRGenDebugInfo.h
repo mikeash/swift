@@ -17,6 +17,7 @@
 #ifndef SWIFT_IRGEN_DEBUGINFO_H
 #define SWIFT_IRGEN_DEBUGINFO_H
 
+#include <swift/SIL/SILInstruction.h>
 #include "DebugTypeInfo.h"
 #include "IRGenFunction.h"
 
@@ -37,7 +38,12 @@ class IRBuilder;
 class IRGenFunction;
 class IRGenModule;
 
-enum IndirectionKind : bool { DirectValue = false, IndirectValue = true };
+enum IndirectionKind {
+  DirectValue,
+  IndirectValue,
+  CoroDirectValue,
+  CoroIndirectValue
+};
 enum ArtificialKind : bool { RealValue = false, ArtificialValue = true };
 
 /// Helper object that keeps track of the current CompileUnit, File,
@@ -48,7 +54,8 @@ public:
   static std::unique_ptr<IRGenDebugInfo>
   createIRGenDebugInfo(const IRGenOptions &Opts, ClangImporter &CI,
                        IRGenModule &IGM, llvm::Module &M,
-                       StringRef MainOutputFilenameForDebugInfo);
+                       StringRef MainOutputFilenameForDebugInfo,
+                       StringRef PrivateDiscriminator);
   virtual ~IRGenDebugInfo();
 
   /// Finalize the llvm::DIBuilder owned by this object.
@@ -58,6 +65,13 @@ public:
   /// Loc and the lexical scope DS.
   void setCurrentLoc(IRBuilder &Builder, const SILDebugScope *DS,
                      SILLocation Loc);
+
+  /// Replace the current debug location in \p Builder with the same location,
+  /// but contained in an inlined function which is named like \p failureMsg.
+  ///
+  /// This lets the debugger display the \p failureMsg as an inlined function
+  /// frame.
+  void addFailureMessageToCurrentLoc(IRBuilder &Builder, StringRef failureMsg);
 
   void clearLoc(IRBuilder &Builder);
 
@@ -71,14 +85,14 @@ public:
   /// If we are not emitting CodeView, this does nothing since the ``llvm.trap``
   /// instructions should already have an artificial location of zero.
   /// In CodeView, since zero is not an artificial location, we emit the
-  /// location of the unified trap block at the end of the fuction as an
+  /// location of the unified trap block at the end of the function as an
   /// artificial inline location pointing to the user's instruction.
   void setInlinedTrapLocation(IRBuilder &Builder, const SILDebugScope *Scope);
 
-  /// Set the location for SWIFT_ENTRY_POINT_FUNCTION.
+  /// Set the location for entry point function (main by default).
   void setEntryPointLoc(IRBuilder &Builder);
 
-  /// Return the scope for SWIFT_ENTRY_POINT_FUNCTION.
+  /// Return the scope for the entry point function (main by default).
   llvm::DIScope *getEntryPointFn();
 
   /// Translate a SILDebugScope into an llvm::DIDescriptor.
@@ -127,8 +141,7 @@ public:
   void emitVariableDeclaration(IRBuilder &Builder,
                                ArrayRef<llvm::Value *> Storage,
                                DebugTypeInfo Ty, const SILDebugScope *DS,
-                               ValueDecl *VarDecl, StringRef Name,
-                               unsigned ArgNo = 0,
+                               ValueDecl *VarDecl, SILDebugVariable VarInfo,
                                IndirectionKind Indirection = DirectValue,
                                ArtificialKind Artificial = RealValue);
 
@@ -136,7 +149,7 @@ public:
   void emitDbgIntrinsic(IRBuilder &Builder, llvm::Value *Storage,
                         llvm::DILocalVariable *Var, llvm::DIExpression *Expr,
                         unsigned Line, unsigned Col, llvm::DILocalScope *Scope,
-                        const SILDebugScope *DS);
+                        const SILDebugScope *DS, bool InCoroContext = false);
 
   enum { NotHeapAllocated = false };
   
@@ -149,13 +162,13 @@ public:
 
   /// Emit debug metadata for type metadata (for generic types). So meta.
   void emitTypeMetadata(IRGenFunction &IGF, llvm::Value *Metadata,
-                        unsigned Depth, unsigned Index, StringRef AssocType);
+                        unsigned Depth, unsigned Index, StringRef Name);
 
   /// Return the DIBuilder.
   llvm::DIBuilder &getBuilder();
 
   /// Decode (and cache) a SourceLoc.
-  SILLocation::DebugLoc decodeSourceLoc(SourceLoc SL);
+  SILLocation::FilenameAndLocation decodeSourceLoc(SourceLoc SL);
 };
 
 /// An RAII object that autorestores the debug location.

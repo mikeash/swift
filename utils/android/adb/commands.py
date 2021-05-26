@@ -44,10 +44,24 @@ def rmdir(path):
     shell(['rm', '-rf', '{}/*'.format(path)])
 
 
-def push(local_path, device_path):
-    """Move the file at the given local path to the path on the device."""
-    return subprocess.check_output(['adb', 'push', local_path, device_path],
-                                   stderr=subprocess.STDOUT).strip()
+def push(local_paths, device_path):
+    """Move the files at the given local paths to the path on the device."""
+    if isinstance(local_paths, str):
+        local_paths = [local_paths]
+    try:
+        # In recent versions of ADB, push supports --sync, which checksums the
+        # files to be transmitted and skip the ones that haven't changed, which
+        # improves the effective transfer speed.
+        return subprocess.check_output(
+            ['adb', 'push', '--sync'] + local_paths + [device_path],
+            stderr=subprocess.STDOUT).strip()
+    except subprocess.CalledProcessError as e:
+        if "unrecognized option '--sync'" in e.output:
+            return subprocess.check_output(
+                ['adb', 'push'] + local_paths + [device_path],
+                stderr=subprocess.STDOUT).strip()
+        else:
+            raise e
 
 
 def reboot():
@@ -90,9 +104,12 @@ def execute_on_device(executable_path, executable_arguments):
     uuid_dir = '{}/{}'.format(DEVICE_TEMP_DIR, str(uuid.uuid4())[:10])
     shell(['mkdir', '-p', uuid_dir])
 
-    # `adb` can only handle commands under a certain length. No matter what the
-    # original executable's name, on device we call it `__executable`.
-    executable = '{}/__executable'.format(uuid_dir)
+    # `adb` can only handle commands under a certain length. That's why we
+    # hide the arguments and piping/status in executable files. However, at
+    # least one resilience test relies on checking the executable name, so we
+    # need to use the same name as the one provided.
+    executable_name = os.path.basename(executable_path)
+    executable = '{}/{}'.format(uuid_dir, executable_name)
     push(executable_path, executable)
 
     child_environment = ['{}="{}"'.format(k.replace(ENV_PREFIX, '', 1), v)

@@ -1,5 +1,5 @@
 
-// RUN: %target-swift-emit-silgen -module-name default_arguments_generic -enable-sil-ownership -swift-version 4 %s | %FileCheck %s
+// RUN: %target-swift-emit-silgen -module-name default_arguments_generic -swift-version 4 %s | %FileCheck %s
 
 func foo<T: ExpressibleByIntegerLiteral>(_: T.Type, x: T = 0) { }
 
@@ -11,7 +11,7 @@ struct Zim<T: ExpressibleByIntegerLiteral> {
   static func zang<U: ExpressibleByFloatLiteral>(_: U.Type, _ x: T = 0, y: U = 0.5) { }
 }
 
-// CHECK-LABEL: sil hidden @$s25default_arguments_generic3baryyF : $@convention(thin) () -> () {
+// CHECK-LABEL: sil hidden [ossa] @$s25default_arguments_generic3baryyF : $@convention(thin) () -> () {
 func bar() {
   // CHECK: [[FOO_DFLT:%.*]] = function_ref @$s25default_arguments_generic3foo
   // CHECK: apply [[FOO_DFLT]]<Int>
@@ -38,7 +38,7 @@ struct Generic<T: Initializable> {
 struct InitializableImpl: Initializable {
   init() {}
 }
-// CHECK-LABEL: sil hidden @$s25default_arguments_generic17testInitializableyyF
+// CHECK-LABEL: sil hidden [ossa] @$s25default_arguments_generic17testInitializableyyF
 func testInitializable() {
   // Previously the metatype construction crashed in the type checker
   // and the ".init" form crashed in SILGen. Test both forms.
@@ -57,7 +57,7 @@ func testInitializable() {
 
 // Local generic functions with default arguments
 
-// CHECK-LABEL: sil hidden @$s25default_arguments_generic5outer1tyx_tlF : $@convention(thin) <T> (@in_guaranteed T) -> ()
+// CHECK-LABEL: sil hidden [ossa] @$s25default_arguments_generic5outer1tyx_tlF : $@convention(thin) <T> (@in_guaranteed T) -> ()
 func outer<T>(t: T) {
   func inner1(x: Int = 0) {}
 
@@ -67,7 +67,28 @@ func outer<T>(t: T) {
 
   func inner2(x: Int = 0) { _ = T.self }
 
-  // CHECK: [[ARG_GENERATOR:%.*]] = function_ref @$s25default_arguments_generic5outer1tyx_tlF6inner2L_1xySi_tlFfA_ : $@convention(thin) <τ_0_0> () -> Int
-  // CHECK: [[ARG:%.*]] = apply [[ARG_GENERATOR]]<T>() : $@convention(thin) <τ_0_0> () -> Int
+  // CHECK: [[ARG_GENERATOR:%.*]] = function_ref @$s25default_arguments_generic5outer1tyx_tlF6inner2L_1xySi_tlFfA_ : $@convention(thin) () -> Int
+  // CHECK: [[ARG:%.*]] = apply [[ARG_GENERATOR]]() : $@convention(thin) () -> Int
   _ = inner2()
+}
+
+protocol StaticIntValue {
+  static var intValue: Int { get }
+}
+
+func f<T : StaticIntValue>(_: T) {
+  // CHECK-LABEL: sil private [ossa] @$s25default_arguments_generic1fyyxAA14StaticIntValueRzlF5innerL_1xySi_tAaCRzlFfA_ : $@convention(thin) <T where T : StaticIntValue> () -> Int
+  // CHECK-LABEL: sil private [ossa] @$s25default_arguments_generic1fyyxAA14StaticIntValueRzlF5innerL_1xySi_tAaCRzlF : $@convention(thin) <T where T : StaticIntValue> (Int) -> ()
+  func inner(x: Int = T.intValue) {}
+
+  // CHECK-LABEL: sil private [ossa] @$s25default_arguments_generic1fyyxAA14StaticIntValueRzlF5otherL_yyAaCRzlF : $@convention(thin) <T where T : StaticIntValue> () -> ()
+  func other() { inner() }
+}
+
+func g<T>(_: T) {
+  { inner() }()
+
+  func inner() {
+    _ = T.self
+  }
 }

@@ -1,8 +1,10 @@
-// RUN: %target-build-swift -sanitize=thread -target %sanitizers-target-triple %s -o %t_binary
-// RUN: %env-TSAN_OPTIONS=ignore_interceptors_accesses=1:halt_on_error=1 %target-run %t_binary
+// REQUIRES: rdar64809726
+// RUN: %target-build-swift -sanitize=thread %import-libdispatch -target %sanitizers-target-triple %s -o %t_binary
+// RUN: %env-TSAN_OPTIONS=halt_on_error=1 %target-run %t_binary
 // REQUIRES: executable_test
 // REQUIRES: stress_test
 // REQUIRES: tsan_runtime
+// UNSUPPORTED: CPU=powerpc64le
 
 // Check that TSan does not report spurious races in witness table lookup.
 

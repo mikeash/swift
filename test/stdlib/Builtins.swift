@@ -68,12 +68,12 @@ tests.test("_isUnique/NativeObjectWithUnownedRef") {
 
 tests.test("_isUniquelyReferenced/OptionalNativeObject") {
   var a: Builtin.NativeObject? = Builtin.castToNativeObject(X())
-  StdlibUnittest.expectTrue(_getBool(Builtin.isUnique(&a)))
+  StdlibUnittest.expectTrue(Bool(_builtinBooleanLiteral: Builtin.isUnique(&a)))
   var b = a
-  expectFalse(_getBool(Builtin.isUnique(&a)))
-  expectFalse(_getBool(Builtin.isUnique(&b)))
+  expectFalse(Bool(_builtinBooleanLiteral: Builtin.isUnique(&a)))
+  expectFalse(Bool(_builtinBooleanLiteral: Builtin.isUnique(&b)))
   var x: Builtin.NativeObject? = nil
-  expectFalse(_getBool(Builtin.isUnique(&x)))
+  expectFalse(Bool(_builtinBooleanLiteral: Builtin.isUnique(&x)))
 }
 
 #if _runtime(_ObjC)
@@ -165,7 +165,7 @@ tests.test("array value witnesses") {
   expectEqual(NoisyLifeCount, NoisyDeathCount)
 }
 
-protocol Classy : class {}
+protocol Classy : AnyObject {}
 class A : Classy {}
 class B : A {}
 class C : B {}
@@ -291,6 +291,20 @@ tests.test("_isOptional") {
   expectFalse(_isOptional(Int.self))
   expectFalse(_isOptional(X.self))
   expectFalse(_isOptional(P.self))
+}
+
+tests.test("_isConcrete") {
+  @_transparent
+  func isConcrete_true<T>(_ type: T.Type) -> Bool {
+    return _isConcrete(type)
+  }
+  @inline(never)
+  func isConcrete_false<T>(_ type: T.Type) -> Bool {
+    return _isConcrete(type)
+  }
+  expectTrue(_isConcrete(Int.self))
+  expectTrue(isConcrete_true(Int.self))
+  expectFalse(isConcrete_false(Int.self))
 }
 
 runAllTests()

@@ -81,7 +81,13 @@ class ElementLayout {
 public:
   enum class Kind {
     /// The element is known to require no storage in the aggregate.
+    /// Its offset in the aggregate is always statically zero.
     Empty,
+
+    /// The element is known to require no storage in the aggregate.
+    /// But it has an offset in the aggregate. This is to support getting the
+    /// offset of tail allocated storage using MemoryLayout<>.offset(of:).
+    EmptyTailAllocatedCType,
 
     /// The element can be positioned at a fixed offset within the
     /// aggregate.
@@ -95,16 +101,26 @@ public:
     /// offset zero.  This is necessary because LLVM forbids even a
     /// 'gep 0' on an unsized type.
     InitialNonFixedSize
+
+    // IncompleteKind comes here
   };
 
 private:
-  enum : unsigned { IncompleteKind  = 4 };
+  enum : unsigned { IncompleteKind  = unsigned(Kind::InitialNonFixedSize) + 1 };
 
   /// The swift type information for this element's layout.
   const TypeInfo *Type;
 
   /// The offset in bytes from the start of the struct.
   unsigned ByteOffset;
+
+  /// The offset in bytes from the start of the struct, except EmptyFields are
+  /// placed at the current byte offset instead of 0. For the purpose of the
+  /// final layout empty fields are placed at offset 0, that however creates a
+  /// whole slew of special cases to deal with. Instead of dealing with these
+  /// special cases during layout, we pretend that empty fields are placed
+  /// just like any other field at the current offset.
+  unsigned ByteOffsetForLayout;
 
   /// The index of this element, either in the LLVM struct (if fixed)
   /// or in the non-fixed elements array (if non-fixed).
@@ -134,22 +150,23 @@ public:
     TheKind = other.TheKind;
     IsPOD = other.IsPOD;
     ByteOffset = other.ByteOffset;
+    ByteOffsetForLayout = other.ByteOffsetForLayout;
     Index = other.Index;
   }
 
   void completeEmpty(IsPOD_t isPOD, Size byteOffset) {
     TheKind = unsigned(Kind::Empty);
     IsPOD = unsigned(isPOD);
-    // We still want to give empty fields an offset for use by things like
-    // ObjC ivar emission. We use the first field in a class layout as the
-    // instanceStart.
-    ByteOffset = byteOffset.getValue();
+    ByteOffset = 0;
+    ByteOffsetForLayout = byteOffset.getValue();
     Index = 0; // make a complete write of the bitfield
   }
 
   void completeInitialNonFixedSize(IsPOD_t isPOD) {
     TheKind = unsigned(Kind::InitialNonFixedSize);
     IsPOD = unsigned(isPOD);
+    ByteOffset = 0;
+    ByteOffsetForLayout = ByteOffset;
     Index = 0; // make a complete write of the bitfield
   }
 
@@ -157,7 +174,18 @@ public:
     TheKind = unsigned(Kind::Fixed);
     IsPOD = unsigned(isPOD);
     ByteOffset = byteOffset.getValue();
+    ByteOffsetForLayout = ByteOffset;
     Index = structIndex;
+
+    assert(getByteOffset() == byteOffset);
+  }
+
+  void completeEmptyTailAllocatedCType(IsPOD_t isPOD, Size byteOffset) {
+    TheKind = unsigned(Kind::EmptyTailAllocatedCType);
+    IsPOD = unsigned(isPOD);
+    ByteOffset = byteOffset.getValue();
+    ByteOffsetForLayout = ByteOffset;
+    Index = 0;
 
     assert(getByteOffset() == byteOffset);
   }
@@ -180,7 +208,8 @@ public:
 
   /// Is this element known to be empty?
   bool isEmpty() const {
-    return getKind() == Kind::Empty;
+    return getKind() == Kind::Empty ||
+           getKind() == Kind::EmptyTailAllocatedCType;
   }
 
   /// Is this element known to be POD?
@@ -189,11 +218,38 @@ public:
     return IsPOD_t(IsPOD);
   }
 
+  /// Can we access this element at a static offset?
+  bool hasByteOffset() const {
+    switch (getKind()) {
+    case Kind::Empty:
+    case Kind::EmptyTailAllocatedCType:
+    case Kind::Fixed:
+      return true;
+
+    // FIXME: InitialNonFixedSize should go in the above, but I'm being
+    // paranoid about changing behavior.
+    case Kind::InitialNonFixedSize:
+    case Kind::NonFixed:
+      return false;
+    }
+    llvm_unreachable("bad kind");
+  }
+
   /// Given that this element has a fixed offset, return that offset in bytes.
   Size getByteOffset() const {
-    assert(isCompleted() &&
-           (getKind() == Kind::Fixed || getKind() == Kind::Empty));
+    assert(isCompleted() && hasByteOffset());
     return Size(ByteOffset);
+  }
+
+  /// The offset in bytes from the start of the struct, except EmptyFields are
+  /// placed at the current byte offset instead of 0. For the purpose of the
+  /// final layout empty fields are placed at offset 0, that however creates a
+  /// whole slew of special cases to deal with. Instead of dealing with these
+  /// special cases during layout, we pretend that empty fields are placed
+  /// just like any other field at the current offset.
+  Size getByteOffsetDuringLayout() const {
+    assert(isCompleted() && hasByteOffset());
+    return Size(ByteOffsetForLayout);
   }
 
   /// Given that this element has a fixed offset, return the index in
@@ -221,9 +277,10 @@ protected:
   IRGenModule &IGM;
   SmallVector<llvm::Type*, 8> StructFields;
   Size CurSize = Size(0);
+  Size headerSize = Size(0);
 private:
   Alignment CurAlignment = Alignment(1);
-  SpareBitVector CurSpareBits;
+  SmallVector<SpareBitVector, 8> CurSpareBits;
   unsigned NextNonFixedOffsetIndex = 0;
   bool IsFixedLayout = true;
   IsPOD_t IsKnownPOD = IsPOD;
@@ -238,6 +295,9 @@ public:
   /// Add the NSObject object header to the layout. This must be the first
   /// thing added to the layout.
   void addNSObjectHeader();
+  /// Add the default-actor header to the layout.  This must be the second
+  /// thing added to the layout, following the Swift heap header.
+  void addDefaultActorHeader(ElementLayout &elt);
   
   /// Add a number of fields to the layout.  The field layouts need
   /// only have the TypeInfo set; the rest will be filled out.
@@ -282,14 +342,14 @@ public:
   /// Return the size of the structure built so far.
   Size getSize() const { return CurSize; }
 
+  // Return the size of the header.
+  Size getHeaderSize() const { return headerSize; }
+
   /// Return the alignment of the structure built so far.
   Alignment getAlignment() const { return CurAlignment; }
-  
-  /// Return the spare bit mask of the structure built so far.
-  const SpareBitVector &getSpareBits() const { return CurSpareBits; }
 
   /// Return the spare bit mask of the structure built so far.
-  SpareBitVector &getSpareBits() { return CurSpareBits; }
+  SpareBitVector getSpareBits() const;
 
   /// Build the current elements as a new anonymous struct type.
   llvm::StructType *getAsAnonStruct() const;
@@ -321,6 +381,9 @@ class StructLayout {
 
   /// The statically-known minimum bound on the size.
   Size MinimumSize;
+
+  /// The size of a header if present.
+  Size headerSize;
   
   /// The statically-known spare bit mask.
   SpareBitVector SpareBits;
@@ -357,6 +420,7 @@ public:
                ArrayRef<ElementLayout> elements)
     : MinimumAlign(builder.getAlignment()),
       MinimumSize(builder.getSize()),
+      headerSize(builder.getHeaderSize()),
       SpareBits(builder.getSpareBits()),
       IsFixedLayout(builder.isFixedLayout()),
       IsKnownPOD(builder.isPOD()),
@@ -372,6 +436,7 @@ public:
   
   llvm::Type *getType() const { return Ty; }
   Size getSize() const { return MinimumSize; }
+  Size getHeaderSize() const { return headerSize; }
   Alignment getAlignment() const { return MinimumAlign; }
   const SpareBitVector &getSpareBits() const { return SpareBits; }
   SpareBitVector &getSpareBits() { return SpareBits; }
@@ -392,6 +457,8 @@ public:
   Address emitCastTo(IRGenFunction &IGF, llvm::Value *ptr,
                      const llvm::Twine &name = "") const;
 };
+
+Size getDefaultActorStorageFieldOffset(IRGenModule &IGM);
 
 } // end namespace irgen
 } // end namespace swift

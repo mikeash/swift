@@ -106,11 +106,12 @@ swift::swift_getErrorValue(const SwiftError *errorObject,
   out->errorConformance = errorObject->errorConformance;
 }
 
-/// Breakpoint hook for debuggers.
-SWIFT_CC(swift) void
-swift::swift_willThrow(SWIFT_CONTEXT void *unused,
-                       SWIFT_ERROR_RESULT SwiftError **error) {
-  // do nothing
+SwiftError *swift::swift_errorRetain(SwiftError *error) {
+  return static_cast<SwiftError*>(swift_retain(error));
+}
+
+void swift::swift_errorRelease(SwiftError *error) {
+  swift_release(error);
 }
 
 #endif

@@ -1,16 +1,19 @@
 // RUN: %empty-directory(%t)
 
 // -- build resilient library
-// RUN: %target-build-swift -force-single-frontend-invocation -Xfrontend -enable-resilience -module-name ExtraInhabitantResilientTypes -emit-module-path %t/ExtraInhabitantResilientTypes.swiftmodule -parse-as-library -c -o %t/ExtraInhabitantResilientTypes.o %S/Inputs/struct_extra_inhabitants_ExtraInhabitantResilientTypes.swift
+// RUN: %target-build-swift -whole-module-optimization -enable-library-evolution -module-name ExtraInhabitantResilientTypes -emit-module-path %t/ExtraInhabitantResilientTypes.swiftmodule -parse-as-library -c -o %t/ExtraInhabitantResilientTypes.o %S/Inputs/struct_extra_inhabitants_ExtraInhabitantResilientTypes.swift
 
 // -- run tests
 // RUN: %target-build-swift -parse-stdlib -Xfrontend -verify-type-layout -Xfrontend PairWithPointerFirst -Xfrontend -verify-type-layout -Xfrontend PairWithPointerSecond -Xfrontend -verify-type-layout -Xfrontend PairWithPointerSecondAndPhantomParam_Int -Xfrontend -verify-type-layout -Xfrontend GenericPairWithPointerFirst_Int -Xfrontend -verify-type-layout -Xfrontend GenericPairWithPointerFirst_AnyObject -Xfrontend -verify-type-layout -Xfrontend GenericPairWithPointerSecond_Int -Xfrontend -verify-type-layout -Xfrontend GenericPairWithPointerSecond_AnyObject -Xfrontend -verify-type-layout -Xfrontend StringAlike32 -Xfrontend -verify-type-layout -Xfrontend StringAlike64 -I %t -o %t/a.out.tests %s %t/ExtraInhabitantResilientTypes.o
+// RUN: %target-codesign %t/a.out.tests
 // RUN: %target-run %t/a.out.tests 2>&1
 
 // Type layout verifier is only compiled into the runtime in asserts builds.
 // REQUIRES: swift_stdlib_asserts
 
 // REQUIRES: executable_test
+// UNSUPPORTED: use_os_stdlib
+// UNSUPPORTED: back_deployment_runtime
 
 // CHECK-NOT: Type verification
 
@@ -113,13 +116,36 @@ typealias GenericPairWithPointerSecond_AnyObject
 var tests = TestSuite("extra inhabitants of structs")
 
 @inline(never)
-func expectHasExtraInhabitant<T>(_: T.Type, nil: T?,
+func expectHasAtLeastThreeExtraInhabitants<T>(_: T.Type,
+                                              nil theNil: T???,
+                                              someNil: T???,
+                                              someSomeNil: T???,
+                                 file: String = #file, line: UInt = #line) {
+  expectEqual(MemoryLayout<T>.size, MemoryLayout<T???>.size,
+              "\(T.self) has at least three extra inhabitants",
+              file: file, line: line)
+
+  expectNil(theNil,
+            "\(T.self) extra inhabitant should agree in generic and concrete " +
+            "context")
+
+  expectNil(someNil!,
+            "\(T.self) extra inhabitant should agree in generic and concrete " +
+            "context")
+
+  expectNil(someSomeNil!!,
+            "\(T.self) extra inhabitant should agree in generic and concrete " +
+            "context")
+}
+
+@inline(never)
+func expectHasExtraInhabitant<T>(_: T.Type, nil theNil: T?,
                                  file: String = #file, line: UInt = #line) {
   expectEqual(MemoryLayout<T>.size, MemoryLayout<T?>.size,
               "\(T.self) has extra inhabitant",
               file: file, line: line)
 
-  expectNil(Optional<T>.none,
+  expectNil(theNil,
             "\(T.self) extra inhabitant should agree in generic and concrete " +
             "context")
 }
@@ -165,6 +191,11 @@ tests.test("types that have extra inhabitants") {
   expectHasExtraInhabitant(GenericFullHouse<AnyObject, UnsafeRawPointer>.self, nil: nil)
   expectHasExtraInhabitant(GenericFullHouse<UnsafeRawPointer, AnyObject>.self, nil: nil)
   expectHasExtraInhabitant(GenericFullHouse<UnsafeRawPointer, UnsafeRawPointer>.self, nil: nil)
+}
+
+tests.test("types that have more than one extra inhabitant") {
+  expectHasAtLeastThreeExtraInhabitants(StringAlike64.self, nil: nil, someNil: .some(nil), someSomeNil: .some(.some(nil)))
+  expectHasAtLeastThreeExtraInhabitants(StringAlike32.self, nil: nil, someNil: .some(nil), someSomeNil: .some(.some(nil)))
 }
 
 runAllTests()

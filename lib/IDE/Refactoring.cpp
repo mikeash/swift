@@ -16,6 +16,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsRefactoring.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/GenericParamList.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -24,25 +25,30 @@
 #include "swift/AST/USRGeneration.h"
 #include "swift/Basic/Edit.h"
 #include "swift/Basic/StringExtras.h"
+#include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Frontend/Frontend.h"
+#include "swift/IDE/IDERequests.h"
 #include "swift/Index/Index.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "swift/Subsystems.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
-#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringSet.h"
 
 using namespace swift;
 using namespace swift::ide;
 using namespace swift::index;
 
 namespace {
+
 class ContextFinder : public SourceEntityWalker {
   SourceFile &SF;
   ASTContext &Ctx;
   SourceManager &SM;
   SourceRange Target;
-  llvm::function_ref<bool(ASTNode)> IsContext;
+  function_ref<bool(ASTNode)> IsContext;
   SmallVector<ASTNode, 4> AllContexts;
   bool contains(ASTNode Enclosing) {
     auto Result = SM.rangeContains(Enclosing.getSourceRange(), Target);
@@ -52,12 +58,12 @@ class ContextFinder : public SourceEntityWalker {
   }
 public:
   ContextFinder(SourceFile &SF, ASTNode TargetNode,
-                llvm::function_ref<bool(ASTNode)> IsContext =
+                function_ref<bool(ASTNode)> IsContext =
                   [](ASTNode N) { return true; }) :
                   SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
                   Target(TargetNode.getSourceRange()), IsContext(IsContext) {}
   ContextFinder(SourceFile &SF, SourceLoc TargetLoc,
-                llvm::function_ref<bool(ASTNode)> IsContext =
+                function_ref<bool(ASTNode)> IsContext =
                   [](ASTNode N) { return true; }) :
                   SF(SF), Ctx(SF.getASTContext()), SM(Ctx.SourceMgr),
                   Target(TargetLoc), IsContext(IsContext) {
@@ -67,7 +73,7 @@ public:
   bool walkToStmtPre(Stmt *S) override { return contains(S); }
   bool walkToExprPre(Expr *E) override { return contains(E); }
   void resolve() { walk(SF); }
-  llvm::ArrayRef<ASTNode> getContexts() const {
+  ArrayRef<ASTNode> getContexts() const {
     return llvm::makeArrayRef(AllContexts);
   }
 };
@@ -97,8 +103,7 @@ public:
   bool renameBase(CharSourceRange Range, RefactoringRangeKind RangeKind) {
     assert(Range.isValid());
 
-    StringRef Existing = Range.str();
-    if (Existing != Old.base())
+    if (stripBackticks(Range).str() != Old.base())
       return true;
     doRenameBase(Range, RangeKind);
     return false;
@@ -107,10 +112,12 @@ public:
   /// Adds replacements to rename the given label ranges
   /// \return true if the label ranges do not match the old name
   bool renameLabels(ArrayRef<CharSourceRange> LabelRanges,
+                    Optional<unsigned> FirstTrailingLabel,
                     LabelRangeType RangeType, bool isCallSite) {
     if (isCallSite)
-      return renameLabelsLenient(LabelRanges, RangeType);
+      return renameLabelsLenient(LabelRanges, FirstTrailingLabel, RangeType);
 
+    assert(!FirstTrailingLabel);
     ArrayRef<StringRef> OldLabels = Old.args();
 
     if (OldLabels.size() != LabelRanges.size())
@@ -129,6 +136,27 @@ public:
   bool isOperator() const { return Lexer::isOperator(Old.base()); }
 
 private:
+
+  /// Returns the range of the  (possibly escaped) identifier at the start of
+  /// \p Range and updates \p IsEscaped to indicate whether it's escaped or not.
+  CharSourceRange getLeadingIdentifierRange(CharSourceRange Range, bool &IsEscaped) {
+    assert(Range.isValid() && Range.getByteLength());
+    IsEscaped = Range.str().front() == '`';
+    SourceLoc Start = Range.getStart();
+    if (IsEscaped)
+      Start = Start.getAdvancedLoc(1);
+    return Lexer::getCharSourceRangeFromSourceRange(SM, Start);
+  }
+
+  CharSourceRange stripBackticks(CharSourceRange Range) {
+    StringRef Content = Range.str();
+    if (Content.size() < 3 || Content.front() != '`' || Content.back() != '`') {
+      return Range;
+    }
+    return CharSourceRange(Range.getStart().getAdvancedLoc(1),
+                           Range.getByteLength() - 2);
+  }
+
   void splitAndRenameLabel(CharSourceRange Range, LabelRangeType RangeType,
                            size_t NameIndex) {
     switch (RangeType) {
@@ -216,13 +244,15 @@ private:
 
   bool labelRangeMatches(CharSourceRange Range, LabelRangeType RangeType, StringRef Expected) {
     if (Range.getByteLength()) {
-      CharSourceRange ExistingLabelRange =
-          Lexer::getCharSourceRangeFromSourceRange(SM, Range.getStart());
+      bool IsEscaped = false;
+      CharSourceRange ExistingLabelRange = getLeadingIdentifierRange(Range, IsEscaped);
       StringRef ExistingLabel = ExistingLabelRange.str();
+      bool IsSingleName = Range == ExistingLabelRange ||
+        (IsEscaped && Range.getByteLength() == ExistingLabel.size() + 2);
 
       switch (RangeType) {
       case LabelRangeType::NoncollapsibleParam:
-        if (ExistingLabelRange == Range && Expected.empty()) // subscript([x]: Int)
+        if (IsSingleName && Expected.empty()) // subscript([x]: Int)
           return true;
         LLVM_FALLTHROUGH;
       case LabelRangeType::CallArg:
@@ -237,10 +267,56 @@ private:
   }
 
   bool renameLabelsLenient(ArrayRef<CharSourceRange> LabelRanges,
+                           Optional<unsigned> FirstTrailingLabel,
                            LabelRangeType RangeType) {
 
     ArrayRef<StringRef> OldNames = Old.args();
 
+    // First, match trailing closure arguments in reverse
+    if (FirstTrailingLabel) {
+      auto TrailingLabels = LabelRanges.drop_front(*FirstTrailingLabel);
+      LabelRanges = LabelRanges.take_front(*FirstTrailingLabel);
+
+      for (auto LabelIndex: llvm::reverse(indices(TrailingLabels))) {
+        CharSourceRange Label = TrailingLabels[LabelIndex];
+
+        if (Label.getByteLength()) {
+          if (OldNames.empty())
+            return true;
+
+          while (!labelRangeMatches(Label, LabelRangeType::Selector,
+                                    OldNames.back())) {
+            if ((OldNames = OldNames.drop_back()).empty())
+              return true;
+          }
+          splitAndRenameLabel(Label, LabelRangeType::Selector,
+                              OldNames.size() - 1);
+          OldNames = OldNames.drop_back();
+          continue;
+        }
+
+        // empty labelled trailing closure label
+        if (LabelIndex) {
+          if (OldNames.empty())
+            return true;
+
+          while (!OldNames.back().empty()) {
+            if ((OldNames = OldNames.drop_back()).empty())
+              return true;
+          }
+          splitAndRenameLabel(Label, LabelRangeType::Selector,
+                              OldNames.size() - 1);
+          OldNames = OldNames.drop_back();
+          continue;
+        }
+
+        // unlabelled trailing closure label
+        OldNames = OldNames.drop_back();
+        continue;
+      }
+    }
+
+    // Next, match the non-trailing arguments.
     size_t NameIndex = 0;
 
     for (CharSourceRange Label : LabelRanges) {
@@ -314,21 +390,35 @@ public:
     // FIXME: handle escaped keyword names `init`
     bool IsSubscript = Old.base() == "subscript" && Config.IsFunctionLike;
     bool IsInit = Old.base() == "init" && Config.IsFunctionLike;
-    bool IsKeywordBase = IsInit || IsSubscript;
+
+    // FIXME: this should only be treated specially for instance methods.
+    bool IsCallAsFunction = Old.base() == "callAsFunction" &&
+        Config.IsFunctionLike;
+
+    bool IsSpecialBase = IsInit || IsSubscript || IsCallAsFunction;
     
-    // Filter out non-semantic keyword basename locations with no labels.
+    // Filter out non-semantic special basename locations with no labels.
     // We've already filtered out those in active code, so these are
-    // any appearance of just 'init' or 'subscript' in strings, comments, and
-    // inactive code.
-    if (IsKeywordBase && (Config.Usage == NameUsage::Unknown &&
-                           Resolved.LabelType == LabelRangeType::None))
+    // any appearance of just 'init', 'subscript', or 'callAsFunction' in
+    // strings, comments, and inactive code.
+    if (IsSpecialBase && (Config.Usage == NameUsage::Unknown &&
+                          Resolved.LabelType == LabelRangeType::None))
       return RegionType::Unmatched;
 
-    if (!Config.IsFunctionLike || !IsKeywordBase) {
+    if (!Config.IsFunctionLike || !IsSpecialBase) {
       if (renameBase(Resolved.Range, RefactoringRangeKind::BaseName))
         return RegionType::Mismatch;
 
-    } else if (IsKeywordBase && Config.Usage == NameUsage::Definition) {
+    } else if (IsInit || IsCallAsFunction) {
+      if (renameBase(Resolved.Range, RefactoringRangeKind::KeywordBaseName)) {
+        // The base name doesn't need to match (but may) for calls, but
+        // it should for definitions and references.
+        if (Config.Usage == NameUsage::Definition ||
+            Config.Usage == NameUsage::Reference) {
+          return RegionType::Mismatch;
+        }
+      }
+    } else if (IsSubscript && Config.Usage == NameUsage::Definition) {
       if (renameBase(Resolved.Range, RefactoringRangeKind::KeywordBaseName))
         return RegionType::Mismatch;
     }
@@ -361,7 +451,8 @@ public:
                         (Config.Usage != NameUsage::Reference || IsSubscript) &&
                         Resolved.LabelType == LabelRangeType::CallArg;
 
-      if (renameLabels(Resolved.LabelRanges, Resolved.LabelType, isCallSite))
+      if (renameLabels(Resolved.LabelRanges, Resolved.FirstTrailingLabel,
+                       Resolved.LabelType, isCallSite))
         return Config.Usage == NameUsage::Unknown ?
             RegionType::Unmatched : RegionType::Mismatch;
     }
@@ -422,7 +513,7 @@ private:
     assert(OldArgLabel.empty());
     if (NewArgLabel.empty())
       return "";
-    return registerText((llvm::Twine(NewArgLabel) + ": ").str());
+    return registerText((Twine(NewArgLabel) + ": ").str());
   }
 
   StringRef getParamNameReplacement(StringRef OldParam, StringRef OldArgLabel,
@@ -436,7 +527,7 @@ private:
     // If we're renaming foo(x: Int) to foo(_:), then use the original argument
     // label as the parameter name so as to not break references in the body.
     if (NewArgLabel.empty() && !OldArgLabel.empty() && OldParam.empty())
-      return registerText((llvm::Twine(" ") + OldArgLabel).str());
+      return registerText((Twine(" ") + OldArgLabel).str());
 
     return registerText(OldParam);
   }
@@ -448,7 +539,7 @@ private:
         return OldLabelRange.empty() ? "" : "_";
 
       if (OldLabelRange.empty())
-        return registerText((llvm::Twine(NewArgLabel) + " ").str());
+        return registerText((Twine(NewArgLabel) + " ").str());
       return registerText(NewArgLabel);
   }
 
@@ -526,9 +617,12 @@ static const ValueDecl *getRelatedSystemDecl(const ValueDecl *VD) {
   return nullptr;
 }
 
-static Optional<RefactoringKind> getAvailableRenameForDecl(const ValueDecl *VD) {
-  std::vector<RenameAvailabiliyInfo> Scratch;
-  for (auto &Info : collectRenameAvailabilityInfo(VD, Scratch)) {
+static Optional<RefactoringKind>
+getAvailableRenameForDecl(const ValueDecl *VD,
+                          Optional<RenameRefInfo> RefInfo) {
+  SmallVector<RenameAvailabilityInfo, 2> Infos;
+  collectRenameAvailabilityInfo(VD, RefInfo, Infos);
+  for (auto &Info : Infos) {
     if (Info.AvailableKind == RenameAvailableKind::Available)
       return Info.Kind;
   }
@@ -543,7 +637,7 @@ public:
   RenameRangeCollector(const ValueDecl *D, StringRef newName)
       : newName(newName.str()) {
     llvm::raw_string_ostream OS(USR);
-    printDeclUSR(D, OS);
+    printValueDeclUSR(D, OS);
   }
 
   ArrayRef<RenameLoc> results() const { return locations; }
@@ -551,9 +645,7 @@ public:
 private:
   bool indexLocals() override { return true; }
   void failed(StringRef error) override {}
-  bool recordHash(StringRef hash, bool isKnown) override { return true; }
-  bool startDependency(StringRef name, StringRef path, bool isClangModule,
-                       bool isSystem, StringRef hash) override {
+  bool startDependency(StringRef name, StringRef path, bool isClangModule, bool isSystem) override {
     return true;
   }
   bool finishDependency(bool isClangModule) override { return true; }
@@ -626,7 +718,7 @@ RenameRangeCollector::indexSymbolToRenameLoc(const index::IndexSymbol &symbol,
 }
 
 ArrayRef<SourceFile*>
-collectSourceFiles(ModuleDecl *MD, llvm::SmallVectorImpl<SourceFile*> &Scratch) {
+collectSourceFiles(ModuleDecl *MD, SmallVectorImpl<SourceFile *> &Scratch) {
   for (auto Unit : MD->getFiles()) {
     if (auto SF = dyn_cast<SourceFile>(Unit)) {
       Scratch.push_back(SF);
@@ -637,7 +729,7 @@ collectSourceFiles(ModuleDecl *MD, llvm::SmallVectorImpl<SourceFile*> &Scratch) 
 
 /// Get the source file that contains the given range and belongs to the module.
 SourceFile *getContainingFile(ModuleDecl *M, RangeConfig Range) {
-  llvm::SmallVector<SourceFile*, 4> Files;
+  SmallVector<SourceFile*, 4> Files;
   for (auto File : collectSourceFiles(M, Files)) {
     if (File->getBufferID()) {
       if (File->getBufferID().getValue() == Range.BufferId) {
@@ -690,12 +782,10 @@ public:
                               SourceEditConsumer &EditConsumer,
                               DiagnosticConsumer &DiagConsumer) :
   RefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {
-    // We can only proceed with valid location and source file.
-    if (StartLoc.isValid() && TheFile) {
-      // Resolve the sema token and save it for later use.
-      CursorInfoResolver Resolver(*TheFile);
-      CursorInfo = Resolver.resolve(StartLoc);
-    }
+  // Resolve the sema token and save it for later use.
+  CursorInfo = evaluateOrDefault(TheFile->getASTContext().evaluator,
+                          CursorInfoRequest{ CursorInfoOwner(TheFile, StartLoc)},
+                                 ResolvedCursorInfo());
   }
 };
 
@@ -707,7 +797,8 @@ class RefactoringAction##KIND: public TokenBasedRefactoringAction {           \
                           DiagnosticConsumer &DiagConsumer) :                 \
     TokenBasedRefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {}      \
   bool performChange() override;                                              \
-  static bool isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag);   \
+  static bool isApplicable(const ResolvedCursorInfo &Info,                    \
+                           DiagnosticEngine &Diag);                           \
   bool isApplicable() {                                                       \
     return RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine) ;    \
   }                                                                           \
@@ -715,7 +806,6 @@ class RefactoringAction##KIND: public TokenBasedRefactoringAction {           \
 #include "swift/IDE/RefactoringKinds.def"
 
 class RangeBasedRefactoringAction : public RefactoringAction {
-  RangeResolver Resolver;
 protected:
   ResolvedRangeInfo RangeInfo;
 public:
@@ -723,8 +813,9 @@ public:
                               SourceEditConsumer &EditConsumer,
                               DiagnosticConsumer &DiagConsumer) :
   RefactoringAction(MD, Opts, EditConsumer, DiagConsumer),
-  Resolver(*TheFile, Opts.Range.getStart(SM), Opts.Range.getEnd(SM)),
-  RangeInfo(Resolver.resolve()) {}
+  RangeInfo(evaluateOrDefault(MD->getASTContext().evaluator,
+    RangeInfoRequest(RangeInfoOwner(TheFile, Opts.Range.getStart(SM), Opts.Range.getEnd(SM))),
+                              ResolvedRangeInfo())) {}
 };
 
 #define RANGE_REFACTORING(KIND, NAME, ID)                                     \
@@ -735,7 +826,8 @@ class RefactoringAction##KIND: public RangeBasedRefactoringAction {           \
                           DiagnosticConsumer &DiagConsumer) :                 \
     RangeBasedRefactoringAction(MD, Opts, EditConsumer, DiagConsumer) {}      \
   bool performChange() override;                                              \
-  static bool isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag);   \
+  static bool isApplicable(const ResolvedRangeInfo &Info,                     \
+                           DiagnosticEngine &Diag);                           \
   bool isApplicable() {                                                       \
     return RefactoringAction##KIND::isApplicable(RangeInfo, DiagEngine) ;     \
   }                                                                           \
@@ -743,19 +835,25 @@ class RefactoringAction##KIND: public RangeBasedRefactoringAction {           \
 #include "swift/IDE/RefactoringKinds.def"
 
 bool RefactoringActionLocalRename::
-isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
   if (CursorInfo.Kind != CursorInfoKind::ValueRef)
     return false;
-  auto RenameOp = getAvailableRenameForDecl(CursorInfo.ValueD);
+
+  Optional<RenameRefInfo> RefInfo;
+  if (CursorInfo.IsRef)
+    RefInfo = {CursorInfo.SF, CursorInfo.Loc, CursorInfo.IsKeywordArgument};
+
+  auto RenameOp = getAvailableRenameForDecl(CursorInfo.ValueD, RefInfo);
   return RenameOp.hasValue() &&
     RenameOp.getValue() == RefactoringKind::LocalRename;
 }
 
-static void analyzeRenameScope(ValueDecl *VD, DiagnosticEngine &Diags,
-                               llvm::SmallVectorImpl<DeclContext *> &Scopes) {
+static void analyzeRenameScope(ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
+                               DiagnosticEngine &Diags,
+                               SmallVectorImpl<DeclContext *> &Scopes) {
   Scopes.clear();
-  if (!getAvailableRenameForDecl(VD).hasValue()) {
-    Diags.diagnose(SourceLoc(), diag::value_decl_no_loc, VD->getFullName());
+  if (!getAvailableRenameForDecl(VD, RefInfo).hasValue()) {
+    Diags.diagnose(SourceLoc(), diag::value_decl_no_loc, VD->getName());
     return;
   }
 
@@ -782,12 +880,18 @@ bool RefactoringActionLocalRename::performChange() {
                         MD->getNameStr());
     return true;
   }
-  CursorInfoResolver Resolver(*TheFile);
-  ResolvedCursorInfo CursorInfo = Resolver.resolve(StartLoc);
+  CursorInfo = evaluateOrDefault(TheFile->getASTContext().evaluator,
+                          CursorInfoRequest{CursorInfoOwner(TheFile, StartLoc)},
+                                 ResolvedCursorInfo());
   if (CursorInfo.isValid() && CursorInfo.ValueD) {
-    ValueDecl *VD = CursorInfo.ValueD;
-    llvm::SmallVector<DeclContext *, 8> Scopes;
-    analyzeRenameScope(VD, DiagEngine, Scopes);
+    ValueDecl *VD = CursorInfo.typeOrValue();
+    SmallVector<DeclContext *, 8> Scopes;
+
+    Optional<RenameRefInfo> RefInfo;
+    if (CursorInfo.IsRef)
+      RefInfo = {CursorInfo.SF, CursorInfo.Loc, CursorInfo.IsKeywordArgument};
+
+    analyzeRenameScope(VD, RefInfo, DiagEngine, Scopes);
     if (Scopes.empty())
       return true;
     RenameRangeCollector rangeCollector(VD, PreferredName);
@@ -828,14 +932,14 @@ enum class CannotExtractReason {
 
 class ExtractCheckResult {
   bool KnownFailure;
-  llvm::SmallVector<CannotExtractReason, 2> AllReasons;
+  SmallVector<CannotExtractReason, 2> AllReasons;
 
 public:
   ExtractCheckResult(): KnownFailure(true) {}
   ExtractCheckResult(ArrayRef<CannotExtractReason> AllReasons):
     KnownFailure(false), AllReasons(AllReasons.begin(), AllReasons.end()) {}
   bool success() { return success({}); }
-  bool success(llvm::ArrayRef<CannotExtractReason> ExpectedReasons) {
+  bool success(ArrayRef<CannotExtractReason> ExpectedReasons) {
     if (KnownFailure)
       return false;
     bool Result = true;
@@ -852,9 +956,9 @@ public:
 /// Check whether a given range can be extracted.
 /// Return true on successful condition checking,.
 /// Return false on failed conditions.
-ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
+ExtractCheckResult checkExtractConditions(const ResolvedRangeInfo &RangeInfo,
                                           DiagnosticEngine &DiagEngine) {
-  llvm::SmallVector<CannotExtractReason, 2> AllReasons;
+  SmallVector<CannotExtractReason, 2> AllReasons;
   // If any declared declaration is refered out of the given range, return false.
   auto Declared = RangeInfo.DeclaredDecls;
   auto It = std::find_if(Declared.begin(), Declared.end(),
@@ -862,7 +966,7 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
   if (It != Declared.end()) {
     DiagEngine.diagnose(It->VD->getLoc(),
                         diag::value_decl_referenced_out_of_range,
-                        It->VD->getFullName());
+                        It->VD->getName());
     return ExtractCheckResult();
   }
 
@@ -915,7 +1019,7 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
     Stmt *S = RangeInfo.ContainedNodes[0].get<Stmt *>();
 
     // These aren't independent statement.
-    if (isa<BraceStmt>(S) || isa<CatchStmt>(S) || isa<CaseStmt>(S))
+    if (isa<BraceStmt>(S) || isa<CaseStmt>(S))
       return ExtractCheckResult();
   }
 
@@ -935,6 +1039,7 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
   switch (RangeInfo.RangeContext->getContextKind()) {
   case swift::DeclContextKind::Initializer:
   case swift::DeclContextKind::SubscriptDecl:
+  case swift::DeclContextKind::EnumElementDecl:
   case swift::DeclContextKind::AbstractFunctionDecl:
   case swift::DeclContextKind::AbstractClosureExpr:
   case swift::DeclContextKind::TopLevelCodeDecl:
@@ -951,7 +1056,7 @@ ExtractCheckResult checkExtractConditions(ResolvedRangeInfo &RangeInfo,
 }
 
 bool RefactoringActionExtractFunction::
-isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
   case RangeKind::PartOfExpression:
   case RangeKind::SingleDecl:
@@ -1004,7 +1109,7 @@ static StringRef correctNewDeclName(DeclContext *DC, StringRef Name) {
   llvm::SmallVector<ValueDecl*, 16> AllVisibles;
   VectorDeclConsumer Consumer(AllVisibles);
   ASTContext &Ctx = DC->getASTContext();
-  lookupVisibleDecls(Consumer, DC, Ctx.getLazyResolver(), true);
+  lookupVisibleDecls(Consumer, DC, true);
   return correctNameInternal(Ctx, Name, AllVisibles);
 }
 
@@ -1074,19 +1179,18 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
   CompilerInvocation Invocation{};
 
   Invocation.getFrontendOptions().InputsAndOutputs.addInput(
-      InputFile("<extract>", true, InputBuffer.get()));
+      InputFile("<extract>", true, InputBuffer.get(), file_types::TY_Swift));
   Invocation.getFrontendOptions().ModuleName = "extract";
+  Invocation.getLangOptions().DisablePoundIfEvaluation = true;
 
-  auto Instance = llvm::make_unique<swift::CompilerInstance>();
+  auto Instance = std::make_unique<swift::CompilerInstance>();
   if (Instance->setup(Invocation))
     llvm_unreachable("Failed setup");
-
-  Instance->performParseOnly();
 
   unsigned BufferId = Instance->getPrimarySourceFile()->getBufferID().getValue();
   SourceManager &SM = Instance->getSourceMgr();
   SourceLoc NameLoc = SM.getLocForOffset(BufferId, NameOffset);
-  auto LineAndCol = SM.getLineAndColumn(NameLoc);
+  auto LineAndCol = SM.getLineAndColumnInBuffer(NameLoc);
 
   UnresolvedLoc UnresoledName{NameLoc, true};
 
@@ -1104,12 +1208,14 @@ getNotableRegions(StringRef SourceText, unsigned NameOffset, StringRef Name,
   auto Ranges = Renamer.Ranges;
 
   std::vector<NoteRegion> NoteRegions(Renamer.Ranges.size());
-  std::transform(Ranges.begin(), Ranges.end(), NoteRegions.begin(),
-                 [&SM](RenameRangeDetail &Detail) -> NoteRegion {
-    auto Start = SM.getLineAndColumn(Detail.Range.getStart());
-    auto End = SM.getLineAndColumn(Detail.Range.getEnd());
-    return {Detail.RangeKind, Start.first, Start.second, End.first, End.second, Detail.Index};
-  });
+  llvm::transform(
+      Ranges, NoteRegions.begin(),
+      [&SM](RenameRangeDetail &Detail) -> NoteRegion {
+        auto Start = SM.getLineAndColumnInBuffer(Detail.Range.getStart());
+        auto End = SM.getLineAndColumnInBuffer(Detail.Range.getEnd());
+        return {Detail.RangeKind, Start.first, Start.second,
+                End.first,        End.second,  Detail.Index};
+      });
 
   return NoteRegions;
 }
@@ -1293,7 +1399,7 @@ public:
 
 /// This is to ensure all decl references in two expressions are identical.
 struct ReferenceCollector: public SourceEntityWalker {
-  llvm::SmallVector<ValueDecl*, 4> References;
+  SmallVector<ValueDecl*, 4> References;
 
   ReferenceCollector(Expr *E) { walk(E); }
   bool visitDeclReference(ValueDecl *D, CharSourceRange Range,
@@ -1315,11 +1421,11 @@ struct SimilarExprCollector: public SourceEntityWalker {
 
   /// The expression under selection.
   Expr *SelectedExpr;
-  llvm::ArrayRef<Token> AllTokens;
+  ArrayRef<Token> AllTokens;
   llvm::SetVector<Expr*> &Bucket;
 
   /// The tokens included in the expression under selection.
-  llvm::ArrayRef<Token> SelectedTokens;
+  ArrayRef<Token> SelectedTokens;
 
   /// The referenced decls in the expression under selection.
   ReferenceCollector SelectedReferences;
@@ -1334,12 +1440,12 @@ struct SimilarExprCollector: public SourceEntityWalker {
   }
 
   /// Find all tokens included by an expression.
-  llvm::ArrayRef<Token> getExprSlice(Expr *E) {
+  ArrayRef<Token> getExprSlice(Expr *E) {
     return slice_token_array(AllTokens, E->getStartLoc(), E->getEndLoc());
   }
 
-  SimilarExprCollector(SourceManager &SM, Expr* SelectedExpr,
-                       llvm::ArrayRef<Token> AllTokens,
+  SimilarExprCollector(SourceManager &SM, Expr *SelectedExpr,
+                       ArrayRef<Token> AllTokens,
     llvm::SetVector<Expr*> &Bucket): SM(SM), SelectedExpr(SelectedExpr),
     AllTokens(AllTokens), Bucket(Bucket),
     SelectedTokens(getExprSlice(SelectedExpr)),
@@ -1433,7 +1539,7 @@ bool RefactoringActionExtractExprBase::performChange() {
                                       AllVisibleDecls.getArrayRef());
 
   // Print the type name of this expression.
-  llvm::SmallString<16> TyBuffer;
+  SmallString<16> TyBuffer;
 
   // We are not sure about the type of repeated expressions.
   if (!ExtractRepeated) {
@@ -1444,7 +1550,7 @@ bool RefactoringActionExtractExprBase::performChange() {
     }
   }
 
-  llvm::SmallString<64> DeclBuffer;
+  SmallString<64> DeclBuffer;
   llvm::raw_svector_ostream OS(DeclBuffer);
   unsigned StartOffset, EndOffset;
   OS << tok::kw_let << " ";
@@ -1479,7 +1585,7 @@ bool RefactoringActionExtractExprBase::performChange() {
 }
 
 bool RefactoringActionExtractExpr::
-isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
     case RangeKind::SingleExpression:
       // We disallow extract literal expression for two reasons:
@@ -1505,7 +1611,7 @@ bool RefactoringActionExtractExpr::performChange() {
 }
 
 bool RefactoringActionExtractRepeatedExpr::
-isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
     case RangeKind::SingleExpression:
       return checkExtractConditions(Info, Diag).
@@ -1528,7 +1634,7 @@ bool RefactoringActionExtractRepeatedExpr::performChange() {
 
 
 bool RefactoringActionMoveMembersToExtension::isApplicable(
-    ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+    const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
   case RangeKind::SingleDecl:
   case RangeKind::MultiTypeMemberDecl: {
@@ -1607,30 +1713,31 @@ namespace {
 // a var decl has accessors that aren't included. This will find those missing
 // decls.
 class FindAllSubDecls : public SourceEntityWalker {
-  llvm::SmallPtrSetImpl<Decl *> &Found;
+  SmallPtrSetImpl<Decl *> &Found;
   public:
-  FindAllSubDecls(llvm::SmallPtrSetImpl<Decl *> &found)
+  FindAllSubDecls(SmallPtrSetImpl<Decl *> &found)
     : Found(found) {}
 
-  bool walkToDeclPre(Decl *D, CharSourceRange range) {
+  bool walkToDeclPre(Decl *D, CharSourceRange range) override {
     // Record this Decl, and skip its contents if we've already touched it.
     if (!Found.insert(D).second)
       return false;
 
     if (auto ASD = dyn_cast<AbstractStorageDecl>(D)) {
-      auto accessors = ASD->getAllAccessors();
-      Found.insert(accessors.begin(), accessors.end());
+      ASD->visitParsedAccessors([&](AccessorDecl *accessor) {
+        Found.insert(accessor);
+      });
     }
     return true;
   }
 };
 }
 bool RefactoringActionReplaceBodiesWithFatalError::isApplicable(
-  ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+  const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   switch (Info.Kind) {
   case RangeKind::SingleDecl:
   case RangeKind::MultiTypeMemberDecl: {
-    llvm::SmallPtrSet<Decl *, 16> Found;
+    SmallPtrSet<Decl *, 16> Found;
     for (auto decl : Info.DeclaredDecls) {
       FindAllSubDecls(Found).walk(decl.VD);
     }
@@ -1654,7 +1761,7 @@ bool RefactoringActionReplaceBodiesWithFatalError::isApplicable(
 
 bool RefactoringActionReplaceBodiesWithFatalError::performChange() {
   const StringRef replacement = "{\nfatalError()\n}";
-  llvm::SmallPtrSet<Decl *, 16> Found;
+  SmallPtrSet<Decl *, 16> Found;
   for (auto decl : RangeInfo.DeclaredDecls) {
     FindAllSubDecls(Found).walk(decl.VD);
   }
@@ -1674,7 +1781,7 @@ bool RefactoringActionReplaceBodiesWithFatalError::performChange() {
 }
 
 static std::pair<IfStmt *, IfStmt *>
-findCollapseNestedIfTarget(ResolvedCursorInfo CursorInfo) {
+findCollapseNestedIfTarget(const ResolvedCursorInfo &CursorInfo) {
   if (CursorInfo.Kind != CursorInfoKind::StmtStart)
     return {};
 
@@ -1691,7 +1798,7 @@ findCollapseNestedIfTarget(ResolvedCursorInfo CursorInfo) {
     return {};
 
   IfStmt *InnerIf =
-      dyn_cast_or_null<IfStmt>(Body->getElement(0).dyn_cast<Stmt *>());
+      dyn_cast_or_null<IfStmt>(Body->getFirstElement().dyn_cast<Stmt *>());
   if (!InnerIf)
     return {};
 
@@ -1703,7 +1810,7 @@ findCollapseNestedIfTarget(ResolvedCursorInfo CursorInfo) {
 }
 
 bool RefactoringActionCollapseNestedIfStmt::
-isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
   return findCollapseNestedIfTarget(CursorInfo).first;
 }
 
@@ -1741,16 +1848,12 @@ bool RefactoringActionCollapseNestedIfStmt::performChange() {
 }
 
 static std::unique_ptr<llvm::SetVector<Expr*>>
-findConcatenatedExpressions(ResolvedRangeInfo Info, ASTContext &Ctx) {
+findConcatenatedExpressions(const ResolvedRangeInfo &Info, ASTContext &Ctx) {
   Expr *E = nullptr;
 
   switch (Info.Kind) {
   case RangeKind::SingleExpression:
-    // FIXME: the range info kind should imply non-empty list.
-    if (!Info.ContainedNodes.empty())
-      E = Info.ContainedNodes[0].get<Expr*>();
-    else
-      return nullptr;
+    E = Info.ContainedNodes[0].get<Expr*>();
     break;
   case RangeKind::PartOfExpression:
     E = Info.CommonExprParent;
@@ -1762,8 +1865,8 @@ findConcatenatedExpressions(ResolvedRangeInfo Info, ASTContext &Ctx) {
   assert(E);
 
   struct StringInterpolationExprFinder: public SourceEntityWalker {
-    std::unique_ptr<llvm::SetVector<Expr*>> Bucket = llvm::
-    make_unique<llvm::SetVector<Expr*>>();
+    std::unique_ptr<llvm::SetVector<Expr *>> Bucket =
+        std::make_unique<llvm::SetVector<Expr *>>();
     ASTContext &Ctx;
 
     bool IsValidInterpolation = true;
@@ -1780,26 +1883,26 @@ findConcatenatedExpressions(ResolvedRangeInfo Info, ASTContext &Ctx) {
       return true;
     }
 
-    bool walkToExprPre(Expr *E) {
+    bool walkToExprPre(Expr *E) override {
       if (E->isImplicit())
         return true;
       // FIXME: we should have ErrorType instead of null.
       if (E->getType().isNull())
         return true;
-      auto ExprType = E->getType()->getNominalOrBoundGenericNominal();
+
       //Only binary concatenation operators should exist in expression
       if (E->getKind() == ExprKind::Binary) {
         auto *BE = dyn_cast<BinaryExpr>(E);
         auto *OperatorDeclRef = BE->getSemanticFn()->getMemberOperatorRef();
-        if (!(isConcatenationExpr(OperatorDeclRef)
-            && ExprType == Ctx.getStringDecl())) {
+        if (!(isConcatenationExpr(OperatorDeclRef) &&
+            E->getType()->isString())) {
           IsValidInterpolation = false;
           return false;
         }
         return true;
       }
       // Everything that evaluates to string should be gathered.
-      if (ExprType == Ctx.getStringDecl()) {
+      if (E->getType()->isString()) {
         Bucket->insert(E);
         return false;
       }
@@ -1843,7 +1946,7 @@ static void interpolatedExpressionForm(Expr *E, SourceManager &SM,
 }
 
 bool RefactoringActionConvertStringsConcatenationToInterpolation::
-isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   auto RangeContext = Info.RangeContext;
   if (RangeContext) {
     auto &Ctx = Info.RangeContext->getASTContext();
@@ -1858,7 +1961,7 @@ bool RefactoringActionConvertStringsConcatenationToInterpolation::performChange(
     return true;
   EditorConsumerInsertStream OS(EditConsumer, SM, RangeInfo.ContentRange);
   OS << "\"";
-  for (auto It = Expressions->begin(); It != Expressions->end(); It++) {
+  for (auto It = Expressions->begin(); It != Expressions->end(); ++It) {
     interpolatedExpressionForm(*It, SM, OS);
   }
   OS << "\"";
@@ -1905,14 +2008,13 @@ class ExpandableAssignTernaryExprInfo: public ExpandableTernaryExprInfo {
 public:
   ExpandableAssignTernaryExprInfo(AssignExpr *Assign): Assign(Assign) {}
 
-  IfExpr *getIf() {
+  IfExpr *getIf() override {
     if (!Assign)
       return nullptr;
-
-    return dyn_cast<IfExpr>(Assign->getSrc());
+    return dyn_cast_or_null<IfExpr>(Assign->getSrc());
   }
 
-  SourceRange getNameRange() {
+  SourceRange getNameRange() override {
     auto Invalid = SourceRange();
 
     if (!Assign)
@@ -1924,7 +2026,7 @@ public:
     return Invalid;
   }
 
-  Type getType() {
+  Type getType() override {
     return nullptr;
   }
 
@@ -1940,7 +2042,7 @@ public:
   ExpandableBindingTernaryExprInfo(PatternBindingDecl *Binding):
   Binding(Binding) {}
 
-  IfExpr *getIf() {
+  IfExpr *getIf() override {
     if (Binding && Binding->getNumPatternEntries() == 1) {
       if (auto *Init = Binding->getInit(0)) {
         return dyn_cast<IfExpr>(Init);
@@ -1950,14 +2052,14 @@ public:
     return nullptr;
   }
 
-  SourceRange getNameRange() {
+  SourceRange getNameRange() override {
     if (auto Pattern = getNamePattern())
       return Pattern->getSourceRange();
 
     return SourceRange();
   }
 
-  Type getType() {
+  Type getType() override {
     if (auto Pattern = getNamePattern())
       return Pattern->getType();
 
@@ -1984,7 +2086,7 @@ private:
 };
 
 std::unique_ptr<ExpandableTernaryExprInfo>
-findExpandableTernaryExpression(ResolvedRangeInfo Info) {
+findExpandableTernaryExpression(const ResolvedRangeInfo &Info) {
 
   if (Info.Kind != RangeKind::SingleDecl
       && Info.Kind != RangeKind:: SingleExpression)
@@ -1995,17 +2097,17 @@ findExpandableTernaryExpression(ResolvedRangeInfo Info) {
 
   if (auto D = Info.ContainedNodes[0].dyn_cast<Decl*>())
     if (auto Binding = dyn_cast<PatternBindingDecl>(D))
-      return llvm::make_unique<ExpandableBindingTernaryExprInfo>(Binding);
+      return std::make_unique<ExpandableBindingTernaryExprInfo>(Binding);
 
   if (auto E = Info.ContainedNodes[0].dyn_cast<Expr*>())
     if (auto Assign = dyn_cast<AssignExpr>(E))
-      return llvm::make_unique<ExpandableAssignTernaryExprInfo>(Assign);
+      return std::make_unique<ExpandableAssignTernaryExprInfo>(Assign);
 
   return nullptr;
 }
 
 bool RefactoringActionExpandTernaryExpr::
-isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   auto Target = findExpandableTernaryExpression(Info);
   return Target && Target->isValid();
 }
@@ -2030,11 +2132,11 @@ bool RefactoringActionExpandTernaryExpr::performChange() {
   auto ElseRange = Target->getIf()->getElseExpr()->getSourceRange();
   auto ElseCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, ElseRange);
 
-  llvm::SmallString<64> DeclBuffer;
+  SmallString<64> DeclBuffer;
   llvm::raw_svector_ostream OS(DeclBuffer);
 
-  llvm::StringRef Space = " ";
-  llvm::StringRef NewLine = "\n";
+  StringRef Space = " ";
+  StringRef NewLine = "\n";
 
   if (Target->shouldDeclareNameAndType()) {
     //Specifier will not be replaced; append after specifier
@@ -2069,6 +2171,444 @@ bool RefactoringActionExpandTernaryExpr::performChange() {
   return false; //don't abort
 }
 
+bool RefactoringActionConvertIfLetExprToGuardExpr::
+  isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
+
+  if (Info.Kind != RangeKind::SingleStatement
+      && Info.Kind != RangeKind::MultiStatement)
+    return false;
+
+  if (Info.ContainedNodes.empty())
+    return false;
+
+  IfStmt *If = nullptr;
+
+  if (Info.ContainedNodes.size() == 1) {
+    if (auto S = Info.ContainedNodes[0].dyn_cast<Stmt*>()) {
+      If = dyn_cast<IfStmt>(S);
+    }
+  }
+
+  if (!If)
+    return false;
+
+  auto CondList = If->getCond();
+
+  if (CondList.size() == 1) {
+    auto E = CondList[0];
+    auto P = E.getKind();
+    if (P == swift::StmtConditionElement::CK_PatternBinding) {
+      auto Body = dyn_cast_or_null<BraceStmt>(If->getThenStmt());
+      if (Body)
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool RefactoringActionConvertIfLetExprToGuardExpr::performChange() {
+
+  auto S = RangeInfo.ContainedNodes[0].dyn_cast<Stmt*>();
+  IfStmt *If = dyn_cast<IfStmt>(S);
+  auto CondList = If->getCond();
+
+  // Get if-let condition
+  SourceRange range = CondList[0].getSourceRange();
+  SourceManager &SM = RangeInfo.RangeContext->getASTContext().SourceMgr;
+  auto CondCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, range);
+  
+  auto Body = dyn_cast_or_null<BraceStmt>(If->getThenStmt());
+  
+  // Get if-let then body.
+  auto firstElement = Body->getFirstElement();
+  auto lastElement = Body->getLastElement();
+  SourceRange bodyRange = firstElement.getSourceRange();
+  bodyRange.widen(lastElement.getSourceRange());
+  auto BodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, bodyRange);
+  
+  SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+  
+  StringRef Space = " ";
+  StringRef NewLine = "\n";
+  
+  OS << tok::kw_guard << Space;
+  OS << CondCharRange.str().str() << Space;
+  OS << tok::kw_else << Space;
+  OS << tok::l_brace << NewLine;
+  
+  // Get if-let else body.
+  if (auto *ElseBody = dyn_cast_or_null<BraceStmt>(If->getElseStmt())) {
+    auto firstElseElement = ElseBody->getFirstElement();
+    auto lastElseElement = ElseBody->getLastElement();
+    SourceRange elseBodyRange = firstElseElement.getSourceRange();
+    elseBodyRange.widen(lastElseElement.getSourceRange());
+    auto ElseBodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, elseBodyRange);
+    OS << ElseBodyCharRange.str().str() << NewLine;
+  }
+  
+  OS << tok::kw_return << NewLine;
+  OS << tok::r_brace << NewLine;
+  OS << BodyCharRange.str().str();
+  
+  // Replace if-let to guard
+  auto ReplaceRange = RangeInfo.ContentRange;
+  EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
+
+  return false;
+}
+
+bool RefactoringActionConvertGuardExprToIfLetExpr::
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
+  if (Info.Kind != RangeKind::SingleStatement
+      && Info.Kind != RangeKind::MultiStatement)
+    return false;
+
+  if (Info.ContainedNodes.empty())
+    return false;
+
+  GuardStmt *guardStmt = nullptr;
+
+  if (Info.ContainedNodes.size() > 0) {
+    if (auto S = Info.ContainedNodes[0].dyn_cast<Stmt*>()) {
+      guardStmt = dyn_cast<GuardStmt>(S);
+    }
+  }
+
+  if (!guardStmt)
+    return false;
+
+  auto CondList = guardStmt->getCond();
+
+  if (CondList.size() == 1) {
+    auto E = CondList[0];
+    auto P = E.getPatternOrNull();
+    if (P && E.getKind() == swift::StmtConditionElement::CK_PatternBinding)
+      return true;
+  }
+
+  return false;
+}
+
+bool RefactoringActionConvertGuardExprToIfLetExpr::performChange() {
+
+  // Get guard stmt
+  auto S = RangeInfo.ContainedNodes[0].dyn_cast<Stmt*>();
+  GuardStmt *Guard = dyn_cast<GuardStmt>(S);
+
+  // Get guard condition
+  auto CondList = Guard->getCond();
+
+  // Get guard condition source
+  SourceRange range = CondList[0].getSourceRange();
+  SourceManager &SM = RangeInfo.RangeContext->getASTContext().SourceMgr;
+  auto CondCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, range);
+  
+  SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+  
+  StringRef Space = " ";
+  StringRef NewLine = "\n";
+  
+  OS << tok::kw_if << Space;
+  OS << CondCharRange.str().str() << Space;
+  OS << tok::l_brace << NewLine;
+
+  // Get nodes after guard to place them at if-let body
+  if (RangeInfo.ContainedNodes.size() > 1) {
+    auto S = RangeInfo.ContainedNodes[1].getSourceRange();
+    S.widen(RangeInfo.ContainedNodes.back().getSourceRange());
+    auto BodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, S);
+    OS << BodyCharRange.str().str() << NewLine;
+  }
+  OS << tok::r_brace;
+
+  // Get guard body
+  auto Body = dyn_cast_or_null<BraceStmt>(Guard->getBody());
+  
+  if (Body && Body->getNumElements() > 1) {
+    auto firstElement = Body->getFirstElement();
+    auto lastElement = Body->getLastElement();
+    SourceRange bodyRange = firstElement.getSourceRange();
+    bodyRange.widen(lastElement.getSourceRange());
+    auto BodyCharRange = Lexer::getCharSourceRangeFromSourceRange(SM, bodyRange);
+    OS << Space << tok::kw_else << Space << tok::l_brace << NewLine;
+    OS << BodyCharRange.str().str() << NewLine;
+    OS << tok::r_brace;
+  }
+  
+  // Replace guard to if-let
+  auto ReplaceRange = RangeInfo.ContentRange;
+  EditConsumer.accept(SM, ReplaceRange, DeclBuffer.str());
+  
+  return false;
+}
+
+bool RefactoringActionConvertToSwitchStmt::
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
+
+  class ConditionalChecker : public ASTWalker {
+  public:
+    bool ParamsUseSameVars = true;
+    bool ConditionUseOnlyAllowedFunctions = false;
+    StringRef ExpectName;
+
+    Expr *walkToExprPost(Expr *E) override {
+      if (E->getKind() != ExprKind::DeclRef)
+        return E;
+      auto D = dyn_cast<DeclRefExpr>(E)->getDecl();
+      if (D->getKind() == DeclKind::Var || D->getKind() == DeclKind::Param)
+        ParamsUseSameVars = checkName(dyn_cast<VarDecl>(D));
+      if (D->getKind() == DeclKind::Func)
+        ConditionUseOnlyAllowedFunctions = checkName(dyn_cast<FuncDecl>(D));
+      if (allCheckPassed())
+        return E;
+      return nullptr;
+    }
+
+    bool allCheckPassed() {
+      return ParamsUseSameVars && ConditionUseOnlyAllowedFunctions;
+    }
+
+  private:
+    bool checkName(VarDecl *VD) {
+      auto Name = VD->getName().str();
+      if (ExpectName.empty())
+        ExpectName = Name;
+      return Name == ExpectName;
+    }
+
+    bool checkName(FuncDecl *FD) {
+      const auto Name = FD->getBaseIdentifier().str();
+      return Name == "~="
+      || Name == "=="
+      || Name == "__derived_enum_equals"
+      || Name == "__derived_struct_equals"
+      || Name == "||"
+      || Name == "...";
+    }
+  };
+
+  class SwitchConvertable {
+  public:
+    SwitchConvertable(const ResolvedRangeInfo &Info) : Info(Info) { }
+
+    bool isApplicable() {
+      if (Info.Kind != RangeKind::SingleStatement)
+        return false;
+      if (!findIfStmt())
+        return false;
+      return checkEachCondition();
+    }
+
+  private:
+    const ResolvedRangeInfo &Info;
+    IfStmt *If = nullptr;
+    ConditionalChecker checker;
+
+    bool findIfStmt() {
+      if (Info.ContainedNodes.size() != 1)
+        return false;
+      if (auto S = Info.ContainedNodes.front().dyn_cast<Stmt*>())
+        If = dyn_cast<IfStmt>(S);
+      return If != nullptr;
+    }
+
+    bool checkEachCondition() {
+      checker = ConditionalChecker();
+      do {
+        if (!checkEachElement())
+          return false;
+      } while ((If = dyn_cast_or_null<IfStmt>(If->getElseStmt())));
+      return true;
+    }
+
+    bool checkEachElement() {
+      bool result = true;
+      auto ConditionalList = If->getCond();
+      for (auto Element : ConditionalList) {
+        result &= check(Element);
+      }
+      return result;
+    }
+
+    bool check(StmtConditionElement ConditionElement) {
+      if (ConditionElement.getKind() == StmtConditionElement::CK_Availability)
+        return false;
+      if (ConditionElement.getKind() == StmtConditionElement::CK_PatternBinding)
+        checker.ConditionUseOnlyAllowedFunctions = true;
+      ConditionElement.walk(checker);
+      return checker.allCheckPassed();
+    }
+  };
+  return SwitchConvertable(Info).isApplicable();
+}
+
+bool RefactoringActionConvertToSwitchStmt::performChange() {
+
+  class VarNameFinder : public ASTWalker {
+  public:
+    std::string VarName;
+
+    Expr *walkToExprPost(Expr *E) override {
+      if (E->getKind() != ExprKind::DeclRef)
+        return E;
+      auto D = dyn_cast<DeclRefExpr>(E)->getDecl();
+      if (D->getKind() != DeclKind::Var && D->getKind() != DeclKind::Param)
+        return E;
+      VarName = dyn_cast<VarDecl>(D)->getName().str().str();
+      return nullptr;
+    }
+  };
+
+  class ConditionalPatternFinder : public ASTWalker {
+  public:
+    ConditionalPatternFinder(SourceManager &SM) : SM(SM) {}
+
+    SmallString<64> ConditionalPattern = SmallString<64>();
+
+    Expr *walkToExprPost(Expr *E) override {
+      auto *BE = dyn_cast<BinaryExpr>(E);
+      if (!BE)
+        return E;
+      if (isFunctionNameAllowed(BE))
+        appendPattern(BE->getLHS(), BE->getRHS());
+      return E;
+    }
+
+    std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override {
+      ConditionalPattern.append(Lexer::getCharSourceRangeFromSourceRange(SM, P->getSourceRange()).str());
+      if (P->getKind() == PatternKind::OptionalSome)
+        ConditionalPattern.append("?");
+      return { true, nullptr };
+    }
+
+  private:
+
+    SourceManager &SM;
+
+    bool isFunctionNameAllowed(BinaryExpr *E) {
+      auto FunctionBody = dyn_cast<DotSyntaxCallExpr>(E->getFn())->getFn();
+      auto FunctionDeclaration = dyn_cast<DeclRefExpr>(FunctionBody)->getDecl();
+      const auto FunctionName = dyn_cast<FuncDecl>(FunctionDeclaration)
+          ->getBaseIdentifier().str();
+      return FunctionName == "~="
+      || FunctionName == "=="
+      || FunctionName == "__derived_enum_equals"
+      || FunctionName == "__derived_struct_equals";
+    }
+
+    void appendPattern(Expr *LHS, Expr *RHS) {
+      auto *PatternArgument = RHS;
+      if (PatternArgument->getKind() == ExprKind::DeclRef)
+        PatternArgument = LHS;
+      if (ConditionalPattern.size() > 0)
+        ConditionalPattern.append(", ");
+      ConditionalPattern.append(Lexer::getCharSourceRangeFromSourceRange(SM, PatternArgument->getSourceRange()).str());
+    }
+  };
+
+  class ConverterToSwitch {
+  public:
+    ConverterToSwitch(const ResolvedRangeInfo &Info,
+                      SourceManager &SM) : Info(Info), SM(SM) { }
+
+    void performConvert(SmallString<64> &Out) {
+      If = findIf();
+      OptionalLabel = If->getLabelInfo().Name.str().str();
+      ControlExpression = findControlExpression();
+      findPatternsAndBodies(PatternsAndBodies);
+      DefaultStatements = findDefaultStatements();
+      makeSwitchStatement(Out);
+    }
+
+  private:
+    const ResolvedRangeInfo &Info;
+    SourceManager &SM;
+
+    IfStmt *If;
+    IfStmt *PreviousIf;
+
+    std::string OptionalLabel;
+    std::string ControlExpression;
+    SmallVector<std::pair<std::string, std::string>, 16> PatternsAndBodies;
+    std::string DefaultStatements;
+
+    IfStmt *findIf() {
+      auto S = Info.ContainedNodes[0].dyn_cast<Stmt*>();
+      return dyn_cast<IfStmt>(S);
+    }
+
+    std::string findControlExpression() {
+      auto ConditionElement = If->getCond().front();
+      auto Finder = VarNameFinder();
+      ConditionElement.walk(Finder);
+      return Finder.VarName;
+    }
+
+    void findPatternsAndBodies(SmallVectorImpl<std::pair<std::string, std::string>> &Out) {
+      do {
+        auto pattern = findPattern();
+        auto body = findBodyStatements();
+        Out.push_back(std::make_pair(pattern, body));
+        PreviousIf = If;
+      } while ((If = dyn_cast_or_null<IfStmt>(If->getElseStmt())));
+    }
+
+    std::string findPattern() {
+      auto ConditionElement = If->getCond().front();
+      auto Finder = ConditionalPatternFinder(SM);
+      ConditionElement.walk(Finder);
+      return Finder.ConditionalPattern.str().str();
+    }
+
+    std::string findBodyStatements() {
+      return findBodyWithoutBraces(If->getThenStmt());
+    }
+
+    std::string findDefaultStatements() {
+      auto ElseBody = dyn_cast_or_null<BraceStmt>(PreviousIf->getElseStmt());
+      if (!ElseBody)
+        return getTokenText(tok::kw_break).str();
+      return findBodyWithoutBraces(ElseBody);
+    }
+
+    std::string findBodyWithoutBraces(Stmt *body) {
+      auto BS = dyn_cast<BraceStmt>(body);
+      if (!BS)
+        return Lexer::getCharSourceRangeFromSourceRange(SM, body->getSourceRange()).str().str();
+      if (BS->getElements().empty())
+        return getTokenText(tok::kw_break).str();
+      SourceRange BodyRange = BS->getElements().front().getSourceRange();
+      BodyRange.widen(BS->getElements().back().getSourceRange());
+      return Lexer::getCharSourceRangeFromSourceRange(SM, BodyRange).str().str();
+    }
+
+    void makeSwitchStatement(SmallString<64> &Out) {
+      StringRef Space = " ";
+      StringRef NewLine = "\n";
+      llvm::raw_svector_ostream OS(Out);
+      if (OptionalLabel.size() > 0)
+        OS << OptionalLabel << ":" << Space;
+      OS << tok::kw_switch << Space << ControlExpression << Space << tok::l_brace << NewLine;
+      for (auto &pair : PatternsAndBodies) {
+        OS << tok::kw_case << Space << pair.first << tok::colon << NewLine;
+        OS << pair.second << NewLine;
+      }
+      OS << tok::kw_default << tok::colon << NewLine;
+      OS << DefaultStatements << NewLine;
+      OS << tok::r_brace;
+    }
+
+  };
+
+  SmallString<64> result;
+  ConverterToSwitch(RangeInfo, SM).performConvert(result);
+  EditConsumer.accept(SM, RangeInfo.ContentRange, result.str());
+  return false;
+}
+
 /// Struct containing info about an IfStmt that can be converted into an IfExpr.
 struct ConvertToTernaryExprInfo {
   ConvertToTernaryExprInfo() {}
@@ -2092,8 +2632,8 @@ struct ConvertToTernaryExprInfo {
         if (!ThenRef || !ThenRef->getDecl() || !ElseRef || !ElseRef->getDecl())
           return nullptr;
 
-        auto ThenName = ThenRef->getDecl()->getFullName();
-        auto ElseName = ElseRef->getDecl()->getFullName();
+        const auto ThenName = ThenRef->getDecl()->getName();
+        const auto ElseName = ElseRef->getDecl()->getName();
 
         if (ThenName.compare(ElseName) != 0)
           return nullptr;
@@ -2149,7 +2689,7 @@ struct ConvertToTernaryExprInfo {
 };
 
 ConvertToTernaryExprInfo
-findConvertToTernaryExpression(ResolvedRangeInfo Info) {
+findConvertToTernaryExpression(const ResolvedRangeInfo &Info) {
 
   auto notFound = ConvertToTernaryExprInfo();
 
@@ -2169,7 +2709,7 @@ findConvertToTernaryExpression(ResolvedRangeInfo Info) {
         walk(S);
     }
 
-    virtual bool walkToExprPre(Expr *E) {
+    virtual bool walkToExprPre(Expr *E) override {
       Assign = dyn_cast<AssignExpr>(E);
       return false;
     }
@@ -2209,7 +2749,7 @@ findConvertToTernaryExpression(ResolvedRangeInfo Info) {
 }
 
 bool RefactoringActionConvertToTernaryExpr::
-isApplicable(ResolvedRangeInfo Info, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
   return findConvertToTernaryExpression(Info).isValid();
 }
 
@@ -2219,10 +2759,10 @@ bool RefactoringActionConvertToTernaryExpr::performChange() {
   if (!Target.isValid())
     return true; //abort
 
-  llvm::SmallString<64> DeclBuffer;
+  SmallString<64> DeclBuffer;
   llvm::raw_svector_ostream OS(DeclBuffer);
 
-  llvm::StringRef Space = " ";
+  StringRef Space = " ";
 
   auto IfRange = Target.IfRange;
   auto ReplaceRange = Lexer::getCharSourceRangeFromSourceRange(SM, IfRange);
@@ -2262,7 +2802,8 @@ bool RefactoringActionConvertToTernaryExpr::performChange() {
 /// these stubs should be filled.
 class FillProtocolStubContext {
 
-  std::vector<ValueDecl*> getUnsatisfiedRequirements(const DeclContext *DC);
+  std::vector<ValueDecl*>
+  getUnsatisfiedRequirements(const IterableDeclContext *IDC);
 
   /// Context in which the content should be filled; this could be either a
   /// nominal type declaraion or an extension declaration.
@@ -2298,7 +2839,8 @@ public:
 
   FillProtocolStubContext() : DC(nullptr), Adopter(), FillingContents({}) {};
 
-  static FillProtocolStubContext getContextFromCursorInfo(ResolvedCursorInfo Tok);
+  static FillProtocolStubContext getContextFromCursorInfo(
+      const ResolvedCursorInfo &Tok);
 
   ArrayRef<ValueDecl*> getFillingContents() const {
     return llvm::makeArrayRef(FillingContents);
@@ -2317,7 +2859,7 @@ public:
 };
 
 FillProtocolStubContext FillProtocolStubContext::
-getContextFromCursorInfo(ResolvedCursorInfo CursorInfo) {
+getContextFromCursorInfo(const ResolvedCursorInfo &CursorInfo) {
   if(!CursorInfo.isValid())
     return FillProtocolStubContext();
   if (!CursorInfo.IsRef) {
@@ -2333,15 +2875,15 @@ getContextFromCursorInfo(ResolvedCursorInfo CursorInfo) {
 }
 
 std::vector<ValueDecl*> FillProtocolStubContext::
-getUnsatisfiedRequirements(const DeclContext *DC) {
+getUnsatisfiedRequirements(const IterableDeclContext *IDC) {
   // The results to return.
   std::vector<ValueDecl*> NonWitnessedReqs;
 
   // For each conformance of the extended nominal.
-  for(ProtocolConformance *Con : DC->getLocalConformances()) {
+  for(ProtocolConformance *Con : IDC->getLocalConformances()) {
 
     // Collect non-witnessed requirements.
-    Con->forEachNonWitnessedRequirement(DC->getASTContext().getLazyResolver(),
+    Con->forEachNonWitnessedRequirement(
       [&](ValueDecl *VD) { NonWitnessedReqs.push_back(VD); });
   }
 
@@ -2349,7 +2891,7 @@ getUnsatisfiedRequirements(const DeclContext *DC) {
 }
 
 bool RefactoringActionFillProtocolStub::
-isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
   return FillProtocolStubContext::getContextFromCursorInfo(Tok).canProceed();
 };
 
@@ -2361,7 +2903,7 @@ bool RefactoringActionFillProtocolStub::performChange() {
   assert(Context.canProceed());
   assert(!Context.getFillingContents().empty());
   assert(Context.getFillingContext());
-  llvm::SmallString<128> Text;
+  SmallString<128> Text;
   {
     llvm::raw_svector_ostream SS(Text);
     Type Adopter = Context.getAdopter();
@@ -2379,23 +2921,24 @@ bool RefactoringActionFillProtocolStub::performChange() {
   return false;
 }
 
-ArrayRef<RefactoringKind>
-collectAvailableRefactoringsAtCursor(SourceFile *SF, unsigned Line,
-                                     unsigned Column,
-                                     std::vector<RefactoringKind> &Scratch,
-                            llvm::ArrayRef<DiagnosticConsumer*> DiagConsumers) {
+static void collectAvailableRefactoringsAtCursor(
+    SourceFile *SF, unsigned Line, unsigned Column,
+    SmallVectorImpl<RefactoringKind> &Kinds,
+    ArrayRef<DiagnosticConsumer *> DiagConsumers) {
   // Prepare the tool box.
   ASTContext &Ctx = SF->getASTContext();
   SourceManager &SM = Ctx.SourceMgr;
   DiagnosticEngine DiagEngine(SM);
   std::for_each(DiagConsumers.begin(), DiagConsumers.end(),
                 [&](DiagnosticConsumer *Con) { DiagEngine.addConsumer(*Con); });
-  CursorInfoResolver Resolver(*SF);
   SourceLoc Loc = SM.getLocForLineCol(SF->getBufferID().getValue(), Line, Column);
   if (Loc.isInvalid())
-    return {};
-  ResolvedCursorInfo Tok = Resolver.resolve(Lexer::getLocForStartOfToken(SM, Loc));
-  return collectAvailableRefactorings(SF, Tok, Scratch, /*Exclude rename*/false);
+    return;
+
+  ResolvedCursorInfo Tok = evaluateOrDefault(SF->getASTContext().evaluator,
+    CursorInfoRequest{CursorInfoOwner(SF, Lexer::getLocForStartOfToken(SM, Loc))},
+                                             ResolvedCursorInfo());
+  collectAvailableRefactorings(Tok, Kinds, /*Exclude rename*/ false);
 }
 
 static EnumDecl* getEnumDeclFromSwitchStmt(SwitchStmt *SwitchS) {
@@ -2467,7 +3010,7 @@ static SwitchStmt* findEnclosingSwitchStmt(CaseStmt *CS,
 }
 
 bool RefactoringActionExpandDefault::
-isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
   auto Exit = [&](bool Applicable) {
     if (!Applicable)
       Diag.diagnose(SourceLoc(), diag::invalid_default_location);
@@ -2504,7 +3047,7 @@ bool RefactoringActionExpandDefault::performChange() {
 }
 
 bool RefactoringActionExpandSwitchCases::
-isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &DiagEngine) {
+isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &DiagEngine) {
   if (!CursorInfo.TrailingStmt)
     return false;
   if (auto *Switch = dyn_cast<SwitchStmt>(CursorInfo.TrailingStmt)) {
@@ -2530,8 +3073,8 @@ bool RefactoringActionExpandSwitchCases::performChange() {
     InsertRange = CharSourceRange(SM, RBraceLoc, RBraceLoc);
   }
   EditorConsumerInsertStream OS(EditConsumer, SM, InsertRange);
-  if (SM.getLineNumber(SwitchS->getLBraceLoc()) ==
-      SM.getLineNumber(SwitchS->getRBraceLoc())) {
+  if (SM.getLineAndColumnInBuffer(SwitchS->getLBraceLoc()).first ==
+      SM.getLineAndColumnInBuffer(SwitchS->getRBraceLoc()).first) {
     OS << "\n";
   }
   auto Result = performCasesExpansionInSwitchStmt(SwitchS,
@@ -2541,14 +3084,14 @@ bool RefactoringActionExpandSwitchCases::performChange() {
   return Result;
 }
 
-static Expr *findLocalizeTarget(ResolvedCursorInfo CursorInfo) {
+static Expr *findLocalizeTarget(const ResolvedCursorInfo &CursorInfo) {
   if (CursorInfo.Kind != CursorInfoKind::ExprStart)
     return nullptr;
   struct StringLiteralFinder: public SourceEntityWalker {
     SourceLoc StartLoc;
     Expr *Target;
     StringLiteralFinder(SourceLoc StartLoc): StartLoc(StartLoc), Target(nullptr) {}
-    bool walkToExprPre(Expr *E) {
+    bool walkToExprPre(Expr *E) override {
       if (E->getStartLoc() != StartLoc)
         return false;
       if (E->getKind() == ExprKind::InterpolatedStringLiteral)
@@ -2565,7 +3108,7 @@ static Expr *findLocalizeTarget(ResolvedCursorInfo CursorInfo) {
 }
 
 bool RefactoringActionLocalizeString::
-isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
   return findLocalizeTarget(Tok);
 }
 
@@ -2578,78 +3121,115 @@ bool RefactoringActionLocalizeString::performChange() {
   return false;
 }
 
+struct MemberwiseParameter {
+  Identifier Name;
+  Type MemberType;
+  Expr *DefaultExpr;
+
+  MemberwiseParameter(Identifier name, Type type, Expr *initialExpr)
+      : Name(name), MemberType(type), DefaultExpr(initialExpr) {}
+};
+
 static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
-                            SourceManager &SM,
-                            SmallVectorImpl<std::string>& memberNameVector,
-                            SmallVectorImpl<std::string>& memberTypeVector,
-                            SourceLoc targetLocation) {
+                                   SourceManager &SM,
+                                   ArrayRef<MemberwiseParameter> memberVector,
+                                   SourceLoc targetLocation) {
   
-  assert(!memberTypeVector.empty());
-  assert(memberTypeVector.size() == memberNameVector.size());
-  
+  assert(!memberVector.empty());
+
   EditConsumer.accept(SM, targetLocation, "\ninternal init(");
-  
-  for (size_t i = 0, n = memberTypeVector.size(); i < n ; i++) {
-    EditConsumer.accept(SM, targetLocation, memberNameVector[i] + ": " +
-                        memberTypeVector[i]);
-    
-    if (i != memberTypeVector.size() - 1) {
-      EditConsumer.accept(SM, targetLocation, ", ");
+  auto insertMember = [&SM](const MemberwiseParameter &memberData,
+                            raw_ostream &OS, bool wantsSeparator) {
+    {
+      OS << memberData.Name << ": ";
+      // Unconditionally print '@escaping' if we print out a function type -
+      // the assignments we generate below will escape this parameter.
+      if (isa<AnyFunctionType>(memberData.MemberType->getCanonicalType())) {
+        OS << "@" << TypeAttributes::getAttrName(TAK_escaping) << " ";
+      }
+      OS << memberData.MemberType.getString();
     }
+
+    if (auto *expr = memberData.DefaultExpr) {
+      if (isa<NilLiteralExpr>(expr)) {
+        OS << " = nil";
+      } else if (expr->getSourceRange().isValid()) {
+        auto range =
+          Lexer::getCharSourceRangeFromSourceRange(
+            SM, expr->getSourceRange());
+        OS << " = " << SM.extractText(range);
+      }
+    }
+
+    if (wantsSeparator) {
+      OS << ", ";
+    }
+  };
+
+  // Process the initial list of members, inserting commas as appropriate.
+  std::string Buffer;
+  llvm::raw_string_ostream OS(Buffer);
+  for (const auto &memberData : memberVector.drop_back()) {
+    insertMember(memberData, OS, /*wantsSeparator*/ true);
   }
-  
-  EditConsumer.accept(SM, targetLocation, ") {\n");
-  
-  for (auto varName: memberNameVector) {
-    EditConsumer.accept(SM, targetLocation,
-                        "self." + varName + " = " + varName + "\n");
+
+  // Process the last (or perhaps, only) member.
+  insertMember(memberVector.back(), OS, /*wantsSeparator*/ false);
+
+  // Synthesize the body.
+  OS << ") {\n";
+  for (auto &member : memberVector) {
+    // self.<property> = <property>
+    OS << "self." << member.Name << " = " << member.Name << "\n";
   }
-  
-  EditConsumer.accept(SM, targetLocation, "}\n");
+  OS << "}\n";
+
+  // Accept the entire edit.
+  EditConsumer.accept(SM, targetLocation, OS.str());
 }
-  
-static SourceLoc collectMembersForInit(ResolvedCursorInfo CursorInfo,
-                           SmallVectorImpl<std::string>& memberNameVector,
-                           SmallVectorImpl<std::string>& memberTypeVector) {
-  
+
+static SourceLoc
+collectMembersForInit(const ResolvedCursorInfo &CursorInfo,
+                      SmallVectorImpl<MemberwiseParameter> &memberVector) {
+
   if (!CursorInfo.ValueD)
     return SourceLoc();
   
-  ClassDecl *classDecl = dyn_cast<ClassDecl>(CursorInfo.ValueD);
-  if (!classDecl || classDecl->getStoredProperties().empty() ||
+  NominalTypeDecl *nominalDecl = dyn_cast<NominalTypeDecl>(CursorInfo.ValueD);
+  if (!nominalDecl || nominalDecl->getStoredProperties().empty() ||
       CursorInfo.IsRef) {
     return SourceLoc();
   }
-  
-  SourceLoc bracesStart = classDecl->getBraces().Start;
+
+  SourceLoc bracesStart = nominalDecl->getBraces().Start;
   if (!bracesStart.isValid())
     return SourceLoc();
   
   SourceLoc targetLocation = bracesStart.getAdvancedLoc(1);
   if (!targetLocation.isValid())
     return SourceLoc();
-  
-  for (auto varDecl : classDecl->getStoredProperties()) {
-    auto parentPatternBinding = varDecl->getParentPatternBinding();
-    if (!parentPatternBinding)
+
+  for (auto varDecl : nominalDecl->getStoredProperties()) {
+    auto patternBinding = varDecl->getParentPatternBinding();
+    if (!patternBinding)
       continue;
-    
-    auto varDeclIndex =
-      parentPatternBinding->getPatternEntryIndexForVarDecl(varDecl);
-    
-    if (auto init = varDecl->getParentPatternBinding()->getInit(varDeclIndex)) {
-      if (init->getStartLoc().isValid())
-        continue;
+
+    if (!varDecl->isMemberwiseInitialized(/*preferDeclaredProperties=*/true)) {
+      continue;
     }
-    
-    StringRef memberName = varDecl->getName().str();
-    memberNameVector.push_back(memberName.str());
-    
-    std::string memberType = varDecl->getType().getString();
-    memberTypeVector.push_back(memberType);
+
+    const auto i = patternBinding->getPatternEntryIndexForVarDecl(varDecl);
+    Expr *defaultInit = nullptr;
+    if (patternBinding->isExplicitlyInitialized(i) ||
+        patternBinding->isDefaultInitializable()) {
+      defaultInit = varDecl->getParentInitializer();
+    }
+
+    memberVector.emplace_back(varDecl->getName(),
+                              varDecl->getType(), defaultInit);
   }
   
-  if (memberNameVector.empty() || memberTypeVector.empty()) {
+  if (memberVector.empty()) {
     return SourceLoc();
   }
   
@@ -2657,35 +3237,274 @@ static SourceLoc collectMembersForInit(ResolvedCursorInfo CursorInfo,
 }
 
 bool RefactoringActionMemberwiseInitLocalRefactoring::
-isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
   
-  SmallVector<std::string, 8> memberNameVector;
-  SmallVector<std::string, 8> memberTypeVector;
-  
-  return collectMembersForInit(Tok, memberNameVector,
-                               memberTypeVector).isValid();
+  SmallVector<MemberwiseParameter, 8> memberVector;
+  return collectMembersForInit(Tok, memberVector).isValid();
 }
     
 bool RefactoringActionMemberwiseInitLocalRefactoring::performChange() {
   
-  SmallVector<std::string, 8> memberNameVector;
-  SmallVector<std::string, 8> memberTypeVector;
-  
-  SourceLoc targetLocation = collectMembersForInit(CursorInfo, memberNameVector,
-                                         memberTypeVector);
+  SmallVector<MemberwiseParameter, 8> memberVector;
+  SourceLoc targetLocation = collectMembersForInit(CursorInfo, memberVector);
   if (targetLocation.isInvalid())
     return true;
   
-  generateMemberwiseInit(EditConsumer, SM, memberNameVector,
-                         memberTypeVector, targetLocation);
+  generateMemberwiseInit(EditConsumer, SM, memberVector, targetLocation);
   
   return false;
 }
 
+class AddEquatableContext {
+
+  /// Declaration context
+  DeclContext *DC;
+
+  /// Adopter type
+  Type Adopter;
+
+  /// Start location of declaration context brace
+  SourceLoc StartLoc;
+
+  /// Array of all inherited protocols' locations
+  ArrayRef<TypeLoc> ProtocolsLocations;
+
+  /// Array of all conformed protocols
+  SmallVector<swift::ProtocolDecl *, 2> Protocols;
+
+  /// Start location of declaration,
+  /// a place to write protocol name
+  SourceLoc ProtInsertStartLoc;
+
+  /// Stored properties of extending adopter
+  ArrayRef<VarDecl *> StoredProperties;
+
+  /// Range of internal members in declaration
+  DeclRange Range;
+
+  bool conformsToEquatableProtocol() {
+    for (ProtocolDecl *Protocol : Protocols) {
+      if (Protocol->getKnownProtocolKind() == KnownProtocolKind::Equatable) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isRequirementValid() {
+    auto Reqs = getProtocolRequirements();
+    if (Reqs.empty()) {
+      return false;
+    }
+    auto Req = dyn_cast<FuncDecl>(Reqs[0]);
+    return Req && Req->getParameters()->size() == 2;
+  }
+
+  bool isPropertiesListValid() {
+    return !getUserAccessibleProperties().empty();
+  }
+
+  void printFunctionBody(ASTPrinter &Printer, StringRef ExtraIndent,
+  ParameterList *Params);
+
+  std::vector<ValueDecl *> getProtocolRequirements();
+
+  std::vector<VarDecl *> getUserAccessibleProperties();
+
+public:
+
+  AddEquatableContext(NominalTypeDecl *Decl) : DC(Decl),
+  Adopter(Decl->getDeclaredType()), StartLoc(Decl->getBraces().Start),
+  ProtocolsLocations(Decl->getInherited()),
+  Protocols(Decl->getAllProtocols()), ProtInsertStartLoc(Decl->getNameLoc()),
+  StoredProperties(Decl->getStoredProperties()), Range(Decl->getMembers()) {};
+
+  AddEquatableContext(ExtensionDecl *Decl) : DC(Decl),
+  Adopter(Decl->getExtendedType()), StartLoc(Decl->getBraces().Start),
+  ProtocolsLocations(Decl->getInherited()),
+  Protocols(Decl->getExtendedNominal()->getAllProtocols()),
+  ProtInsertStartLoc(Decl->getExtendedTypeRepr()->getEndLoc()),
+  StoredProperties(Decl->getExtendedNominal()->getStoredProperties()), Range(Decl->getMembers()) {};
+
+  AddEquatableContext() : DC(nullptr), Adopter(), ProtocolsLocations(),
+  Protocols(), StoredProperties(), Range(nullptr, nullptr) {};
+
+  static AddEquatableContext getDeclarationContextFromInfo(ResolvedCursorInfo Info);
+
+  std::string getInsertionTextForProtocol();
+
+  std::string getInsertionTextForFunction(SourceManager &SM);
+
+  bool isValid() {
+    // FIXME: Allow to generate explicit == method for declarations which already have
+    // compiler-generated == method
+    return StartLoc.isValid() && ProtInsertStartLoc.isValid() &&
+    !conformsToEquatableProtocol() && isPropertiesListValid() &&
+    isRequirementValid();
+  }
+
+  SourceLoc getStartLocForProtocolDecl() {
+    if (ProtocolsLocations.empty()) {
+      return ProtInsertStartLoc;
+    }
+    return ProtocolsLocations.back().getSourceRange().Start;
+  }
+
+  bool isMembersRangeEmpty() {
+    return Range.empty();
+  }
+
+  SourceLoc getInsertStartLoc();
+};
+
+SourceLoc AddEquatableContext::
+getInsertStartLoc() {
+  SourceLoc MaxLoc = StartLoc;
+  for (auto Mem : Range) {
+    if (Mem->getEndLoc().getOpaquePointerValue() >
+        MaxLoc.getOpaquePointerValue()) {
+      MaxLoc = Mem->getEndLoc();
+    }
+  }
+  return MaxLoc;
+}
+
+std::string AddEquatableContext::
+getInsertionTextForProtocol() {
+  StringRef ProtocolName = getProtocolName(KnownProtocolKind::Equatable);
+  std::string Buffer;
+  llvm::raw_string_ostream OS(Buffer);
+  if (ProtocolsLocations.empty()) {
+    OS << ": " << ProtocolName;
+    return Buffer;
+  }
+  OS << ", " << ProtocolName;
+  return Buffer;
+}
+
+std::string AddEquatableContext::
+getInsertionTextForFunction(SourceManager &SM) {
+  auto Reqs = getProtocolRequirements();
+  auto Req = dyn_cast<FuncDecl>(Reqs[0]);
+  auto Params = Req->getParameters();
+  StringRef ExtraIndent;
+  StringRef CurrentIndent =
+    Lexer::getIndentationForLine(SM, getInsertStartLoc(), &ExtraIndent);
+  std::string Indent;
+  if (isMembersRangeEmpty()) {
+    Indent = (CurrentIndent + ExtraIndent).str();
+  } else {
+    Indent = CurrentIndent.str();
+  }
+  PrintOptions Options = PrintOptions::printVerbose();
+  Options.PrintDocumentationComments = false;
+  Options.setBaseType(Adopter);
+  Options.FunctionBody = [&](const ValueDecl *VD, ASTPrinter &Printer) {
+    Printer << " {";
+    Printer.printNewline();
+    printFunctionBody(Printer, ExtraIndent, Params);
+    Printer.printNewline();
+    Printer << "}";
+  };
+  std::string Buffer;
+  llvm::raw_string_ostream OS(Buffer);
+  ExtraIndentStreamPrinter Printer(OS, Indent);
+  Printer.printNewline();
+  if (!isMembersRangeEmpty()) {
+    Printer.printNewline();
+  }
+  Reqs[0]->print(Printer, Options);
+  return Buffer;
+}
+
+std::vector<VarDecl *> AddEquatableContext::
+getUserAccessibleProperties() {
+  std::vector<VarDecl *> PublicProperties;
+  for (VarDecl *Decl : StoredProperties) {
+    if (Decl->Decl::isUserAccessible()) {
+      PublicProperties.push_back(Decl);
+    }
+  }
+  return PublicProperties;
+}
+
+std::vector<ValueDecl *> AddEquatableContext::
+getProtocolRequirements() {
+  std::vector<ValueDecl *> Collection;
+  auto Proto = DC->getASTContext().getProtocol(KnownProtocolKind::Equatable);
+  for (auto Member : Proto->getMembers()) {
+    auto Req = dyn_cast<ValueDecl>(Member);
+    if (!Req || Req->isInvalid() || !Req->isProtocolRequirement()) {
+      continue;
+    }
+    Collection.push_back(Req);
+  }
+  return Collection;
+}
+
+AddEquatableContext AddEquatableContext::
+getDeclarationContextFromInfo(ResolvedCursorInfo Info) {
+  if (Info.isInvalid()) {
+    return AddEquatableContext();
+  }
+  if (!Info.IsRef) {
+    if (auto *NomDecl = dyn_cast<NominalTypeDecl>(Info.ValueD)) {
+      return AddEquatableContext(NomDecl);
+    }
+  } else if (auto *ExtDecl = Info.ExtTyRef) {
+    if (ExtDecl->getExtendedNominal()) {
+      return AddEquatableContext(ExtDecl);
+    }
+  }
+  return AddEquatableContext();
+}
+
+void AddEquatableContext::
+printFunctionBody(ASTPrinter &Printer, StringRef ExtraIndent, ParameterList *Params) {
+  SmallString<128> Return;
+  llvm::raw_svector_ostream SS(Return);
+  SS << tok::kw_return;
+  StringRef Space = " ";
+  StringRef AdditionalSpace = "       ";
+  StringRef Point = ".";
+  StringRef Join = " == ";
+  StringRef And = " &&";
+  auto Props = getUserAccessibleProperties();
+  auto FParam = Params->get(0)->getName();
+  auto SParam = Params->get(1)->getName();
+  auto Prop = Props[0]->getName();
+  Printer << ExtraIndent << Return << Space
+  << FParam << Point << Prop << Join << SParam << Point << Prop;
+  if (Props.size() > 1) {
+    std::for_each(Props.begin() + 1, Props.end(), [&](VarDecl *VD){
+      auto Name = VD->getName();
+      Printer << And;
+      Printer.printNewline();
+      Printer << ExtraIndent << AdditionalSpace << FParam << Point
+      << Name << Join << SParam << Point << Name;
+    });
+  }
+}
+
+bool RefactoringActionAddEquatableConformance::
+isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
+  return AddEquatableContext::getDeclarationContextFromInfo(Tok).isValid();
+}
+
+bool RefactoringActionAddEquatableConformance::
+performChange() {
+  auto Context = AddEquatableContext::getDeclarationContextFromInfo(CursorInfo);
+  EditConsumer.insertAfter(SM, Context.getStartLocForProtocolDecl(),
+                           Context.getInsertionTextForProtocol());
+  EditConsumer.insertAfter(SM, Context.getInsertStartLoc(),
+                           Context.getInsertionTextForFunction(SM));
+  return false;
+}
+
 static CharSourceRange
-  findSourceRangeToWrapInCatch(ResolvedCursorInfo CursorInfo,
-                               SourceFile *TheFile,
-                               SourceManager &SM) {
+findSourceRangeToWrapInCatch(const ResolvedCursorInfo &CursorInfo,
+                             SourceFile *TheFile,
+                             SourceManager &SM) {
   Expr *E = CursorInfo.TrailingExpr;
   if (!E)
     return CharSourceRange();
@@ -2713,7 +3532,7 @@ static CharSourceRange
 }
 
 bool RefactoringActionConvertToDoCatch::
-isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
   if (!Tok.TrailingExpr)
     return false;
   return isa<ForceTryExpr>(Tok.TrailingExpr);
@@ -2739,40 +3558,47 @@ bool RefactoringActionConvertToDoCatch::performChange() {
 
 /// Given a cursor position, this function tries to collect a number literal
 /// expression immediately following the cursor.
-static NumberLiteralExpr *getTrailingNumberLiteral(ResolvedCursorInfo Tok) {
+static NumberLiteralExpr *getTrailingNumberLiteral(
+    const ResolvedCursorInfo &Tok) {
   // This cursor must point to the start of an expression.
   if (Tok.Kind != CursorInfoKind::ExprStart)
     return nullptr;
-  Expr *Parent = Tok.TrailingExpr;
-  assert(Parent);
 
-  // Check if an expression is a number literal.
-  auto IsLiteralNumber = [&](Expr *E) -> NumberLiteralExpr* {
-    if (auto *NL = dyn_cast<NumberLiteralExpr>(E)) {
-
-      // The sub-expression must have the same start loc with the outermost
-      // expression, i.e. the cursor position.
-      if (Parent->getStartLoc().getOpaquePointerValue() ==
-        E->getStartLoc().getOpaquePointerValue()) {
-        return NL;
-      }
-    }
-    return nullptr;
-  };
   // For every sub-expression, try to find the literal expression that matches
   // our criteria.
-  for (auto Pair: Parent->getDepthMap()) {
-    if (auto Result = IsLiteralNumber(Pair.getFirst())) {
-      return Result;
+  class FindLiteralNumber : public ASTWalker {
+    Expr * const parent;
+
+  public:
+    NumberLiteralExpr *found = nullptr;
+
+    explicit FindLiteralNumber(Expr *parent) : parent(parent) { }
+
+    std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
+      if (auto *literal = dyn_cast<NumberLiteralExpr>(expr)) {
+        // The sub-expression must have the same start loc with the outermost
+        // expression, i.e. the cursor position.
+        if (!found &&
+            parent->getStartLoc().getOpaquePointerValue() ==
+              expr->getStartLoc().getOpaquePointerValue()) {
+          found = literal;
+        }
+      }
+
+      return { found == nullptr, expr };
     }
-  }
-  return nullptr;
+  };
+
+  auto parent = Tok.TrailingExpr;
+  FindLiteralNumber finder(parent);
+  parent->walk(finder);
+  return finder.found;
 }
 
 static std::string insertUnderscore(StringRef Text) {
-  llvm::SmallString<64> Buffer;
+  SmallString<64> Buffer;
   llvm::raw_svector_ostream OS(Buffer);
-  for (auto It = Text.begin(); It != Text.end(); It++) {
+  for (auto It = Text.begin(); It != Text.end(); ++It) {
     unsigned Distance = It - Text.begin();
     if (Distance && !(Distance % 3)) {
       OS << '_';
@@ -2782,10 +3608,13 @@ static std::string insertUnderscore(StringRef Text) {
   return OS.str().str();
 }
 
-static void insertUnderscoreInDigits(StringRef Digits,
-                                     llvm::raw_ostream &OS) {
-  std::string BeforePoint, AfterPoint;
-  std::tie(BeforePoint, AfterPoint) = Digits.split('.');
+void insertUnderscoreInDigits(StringRef Digits,
+                              raw_ostream &OS) {
+  StringRef BeforePointRef, AfterPointRef;
+  std::tie(BeforePointRef, AfterPointRef) = Digits.split('.');
+
+  std::string BeforePoint(BeforePointRef);
+  std::string AfterPoint(AfterPointRef);
 
   // Insert '_' for the part before the decimal point.
   std::reverse(BeforePoint.begin(), BeforePoint.end());
@@ -2801,9 +3630,9 @@ static void insertUnderscoreInDigits(StringRef Digits,
 }
 
 bool RefactoringActionSimplifyNumberLiteral::
-isApplicable(ResolvedCursorInfo Tok, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &Tok, DiagnosticEngine &Diag) {
   if (auto *Literal = getTrailingNumberLiteral(Tok)) {
-    llvm::SmallString<64> Buffer;
+    SmallString<64> Buffer;
     llvm::raw_svector_ostream OS(Buffer);
     StringRef Digits = Literal->getDigitsText();
     insertUnderscoreInDigits(Digits, OS);
@@ -2829,8 +3658,8 @@ bool RefactoringActionSimplifyNumberLiteral::performChange() {
   return true;
 }
 
-static CallExpr *findTrailingClosureTarget(SourceManager &SM,
-                                           ResolvedCursorInfo CursorInfo) {
+static CallExpr *findTrailingClosureTarget(
+    SourceManager &SM, const ResolvedCursorInfo &CursorInfo) {
   if (CursorInfo.Kind == CursorInfoKind::StmtStart)
     // StmtStart postion can't be a part of CallExpr.
     return nullptr;
@@ -2842,22 +3671,29 @@ static CallExpr *findTrailingClosureTarget(SourceManager &SM,
            return N.isStmt(StmtKind::Brace) || N.isExpr(ExprKind::Call);
          });
   Finder.resolve();
-  if (Finder.getContexts().empty()
-      || !Finder.getContexts().back().is<Expr*>())
+  auto contexts = Finder.getContexts();
+  if (contexts.empty())
     return nullptr;
-  CallExpr *CE = cast<CallExpr>(Finder.getContexts().back().get<Expr*>());
+
+  // If the innermost context is a statement (which will be a BraceStmt per
+  // the filtering condition above), drop it.
+  if (contexts.back().is<Stmt *>()) {
+    contexts = contexts.drop_back();
+  }
+
+  if (contexts.empty() || !contexts.back().is<Expr*>())
+    return nullptr;
+  CallExpr *CE = cast<CallExpr>(contexts.back().get<Expr*>());
 
   if (CE->hasTrailingClosure())
     // Call expression already has a trailing closure.
     return nullptr;
 
-  // The last arugment is a closure?
+  // The last argument is a closure?
   Expr *Args = CE->getArg();
   if (!Args)
     return nullptr;
   Expr *LastArg;
-  if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
-    Args = TSE->getSubExpr();
   if (auto *PE = dyn_cast<ParenExpr>(Args)) {
     LastArg = PE->getSubExpr();
   } else {
@@ -2876,7 +3712,7 @@ static CallExpr *findTrailingClosureTarget(SourceManager &SM,
 }
 
 bool RefactoringActionTrailingClosure::
-isApplicable(ResolvedCursorInfo CursorInfo, DiagnosticEngine &Diag) {
+isApplicable(const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
   SourceManager &SM = CursorInfo.SF->getASTContext().SourceMgr;
   return findTrailingClosureTarget(SM, CursorInfo);
 }
@@ -2885,33 +3721,24 @@ bool RefactoringActionTrailingClosure::performChange() {
   auto *CE = findTrailingClosureTarget(SM, CursorInfo);
   if (!CE)
     return true;
-  Expr *Args = CE->getArg();
-  if (auto *TSE = dyn_cast<TupleShuffleExpr>(Args))
-    Args = TSE->getSubExpr();
+  Expr *Arg = CE->getArg();
 
   Expr *ClosureArg = nullptr;
   Expr *PrevArg = nullptr;
-  SourceLoc LPLoc, RPLoc;
 
-  if (auto *PE = dyn_cast<ParenExpr>(Args)) {
-    ClosureArg = PE->getSubExpr();
-    LPLoc = PE->getLParenLoc();
-    RPLoc = PE->getRParenLoc();
-  } else {
-    auto *TE = cast<TupleExpr>(Args);
-    auto NumArgs = TE->getNumElements();
-    if (NumArgs == 0)
-      return true;
-    LPLoc = TE->getLParenLoc();
-    RPLoc = TE->getRParenLoc();
-    ClosureArg = TE->getElement(NumArgs - 1);
-    if (NumArgs > 1)
-      PrevArg = TE->getElement(NumArgs - 2);
-  }
+  OriginalArgumentList ArgList = getOriginalArgumentList(Arg);
+
+  auto NumArgs = ArgList.args.size();
+  if (NumArgs == 0)
+    return true;
+  ClosureArg = ArgList.args[NumArgs - 1];
+  if (NumArgs > 1)
+    PrevArg = ArgList.args[NumArgs - 2];
+
   if (auto *ICE = dyn_cast<ImplicitConversionExpr>(ClosureArg))
     ClosureArg = ICE->getSyntacticSubExpr();
 
-  if (LPLoc.isInvalid() || RPLoc.isInvalid())
+  if (ArgList.lParenLoc.isInvalid() || ArgList.rParenLoc.isInvalid())
     return true;
 
   // Replace:
@@ -2925,19 +3752,19 @@ bool RefactoringActionTrailingClosure::performChange() {
     EditConsumer.accept(SM, PreRange, ") ");
   } else {
     CharSourceRange PreRange(
-        SM, LPLoc, ClosureArg->getStartLoc());
+        SM, ArgList.lParenLoc, ClosureArg->getStartLoc());
     EditConsumer.accept(SM, PreRange, " ");
   }
   // Remove original closing paren.
   CharSourceRange PostRange(
       SM,
       Lexer::getLocForEndOfToken(SM, ClosureArg->getEndLoc()),
-      Lexer::getLocForEndOfToken(SM, RPLoc));
+      Lexer::getLocForEndOfToken(SM, ArgList.rParenLoc));
   EditConsumer.remove(SM, PostRange);
   return false;
 }
 
-static bool rangeStartMayNeedRename(ResolvedRangeInfo Info) {
+static bool rangeStartMayNeedRename(const ResolvedRangeInfo &Info) {
   switch(Info.Kind) {
     case RangeKind::SingleExpression: {
       Expr *E = Info.ContainedNodes[0].get<Expr*>();
@@ -2975,7 +3802,3017 @@ static bool rangeStartMayNeedRename(ResolvedRangeInfo Info) {
   }
   llvm_unreachable("unhandled kind");
 }
-}// end of anonymous namespace
+    
+bool RefactoringActionConvertToComputedProperty::
+isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
+  if (Info.Kind != RangeKind::SingleDecl) {
+    return false;
+  }
+  
+  if (Info.ContainedNodes.size() != 1) {
+    return false;
+  }
+  
+  auto D = Info.ContainedNodes[0].dyn_cast<Decl*>();
+  if (!D) {
+    return false;
+  }
+  
+  auto Binding = dyn_cast<PatternBindingDecl>(D);
+  if (!Binding) {
+    return false;
+  }
+
+  auto SV = Binding->getSingleVar();
+  if (!SV) {
+    return false;
+  }
+
+  // willSet, didSet cannot be provided together with a getter
+  for (auto AD : SV->getAllAccessors()) {
+    if (AD->isObservingAccessor()) {
+      return false;
+    }
+  }
+  
+  // 'lazy' must not be used on a computed property
+  // NSCopying and IBOutlet attribute requires property to be mutable
+  auto Attributies = SV->getAttrs();
+  if (Attributies.hasAttribute<LazyAttr>() ||
+      Attributies.hasAttribute<NSCopyingAttr>() ||
+      Attributies.hasAttribute<IBOutletAttr>()) {
+    return false;
+  }
+
+  // Property wrapper cannot be applied to a computed property
+  if (SV->hasAttachedPropertyWrapper()) {
+    return false;
+  }
+
+  // has an initializer
+  return Binding->hasInitStringRepresentation(0);
+}
+
+bool RefactoringActionConvertToComputedProperty::performChange() {
+  // Get an initialization
+  auto D = RangeInfo.ContainedNodes[0].dyn_cast<Decl*>();
+  auto Binding = dyn_cast<PatternBindingDecl>(D);
+  SmallString<128> scratch;
+  auto Init = Binding->getInitStringRepresentation(0, scratch);
+  
+  // Get type
+  auto SV = Binding->getSingleVar();
+  auto SVType = SV->getType();
+  auto TR = SV->getTypeReprOrParentPatternTypeRepr();
+  
+  SmallString<64> DeclBuffer;
+  llvm::raw_svector_ostream OS(DeclBuffer);
+  StringRef Space = " ";
+  StringRef NewLine = "\n";
+  
+  OS << tok::kw_var << Space;
+  // Add var name
+  OS << SV->getNameStr().str() << ":" << Space;
+  // For computed property must write a type of var
+  if (TR) {
+    OS << Lexer::getCharSourceRangeFromSourceRange(SM, TR->getSourceRange()).str();
+  } else {
+    SVType.print(OS);
+  }
+
+  OS << Space << tok::l_brace << NewLine;
+  // Add an initialization
+  OS << tok::kw_return << Space << Init.str() << NewLine;
+  OS << tok::r_brace;
+  
+  // Replace initializer to computed property
+  auto ReplaceStartLoc = Binding->getLoc();
+  auto ReplaceEndLoc = Binding->getSourceRange().End;
+  auto ReplaceRange = SourceRange(ReplaceStartLoc, ReplaceEndLoc);
+  auto ReplaceCharSourceRange = Lexer::getCharSourceRangeFromSourceRange(SM, ReplaceRange);
+  EditConsumer.accept(SM, ReplaceCharSourceRange, DeclBuffer.str());
+  return false; // success
+}
+
+namespace asyncrefactorings {
+
+// TODO: Should probably split the refactorings into separate files
+
+/// Whether the given type is (or conforms to) the stdlib Error type
+bool isErrorType(Type Ty, ModuleDecl *MD) {
+  if (!Ty)
+    return false;
+  return !MD->conformsToProtocol(Ty, Ty->getASTContext().getErrorDecl())
+              .isInvalid();
+}
+
+// The single Decl* subject of a switch statement, or nullptr if none
+Decl *singleSwitchSubject(const SwitchStmt *Switch) {
+  if (auto *DRE = dyn_cast<DeclRefExpr>(Switch->getSubjectExpr()))
+    return DRE->getDecl();
+  return nullptr;
+}
+
+// Wrapper to make dealing with single elements easier (ie. for Paren|TupleExpr
+// arguments)
+template <typename T>
+class PtrArrayRef {
+  bool IsSingle = false;
+  union Storage {
+    ArrayRef<T> ManyElements;
+    T SingleElement;
+  } Storage = {ArrayRef<T>()};
+
+public:
+  PtrArrayRef() {}
+  PtrArrayRef(T Element) : IsSingle(true) { Storage.SingleElement = Element; }
+  PtrArrayRef(ArrayRef<T> Ref) : IsSingle(Ref.size() == 1), Storage({Ref}) {
+    if (IsSingle)
+      Storage.SingleElement = Ref[0];
+  }
+
+  ArrayRef<T> ref() {
+    if (IsSingle)
+      return ArrayRef<T>(Storage.SingleElement);
+    return Storage.ManyElements;
+  }
+};
+
+PtrArrayRef<Expr *> callArgs(const ApplyExpr *AE) {
+  if (auto *PE = dyn_cast<ParenExpr>(AE->getArg())) {
+    return PtrArrayRef<Expr *>(PE->getSubExpr());
+  } else if (auto *TE = dyn_cast<TupleExpr>(AE->getArg())) {
+    return PtrArrayRef<Expr *>(TE->getElements());
+  }
+  return PtrArrayRef<Expr *>();
+}
+
+/// A more aggressive variant of \c Expr::getReferencedDecl that also looks
+/// through autoclosures created to pass the \c self parameter to a member funcs
+ValueDecl *getReferencedDecl(const Expr *Fn) {
+  Fn = Fn->getSemanticsProvidingExpr();
+  if (auto *DRE = dyn_cast<DeclRefExpr>(Fn))
+    return DRE->getDecl();
+  if (auto ApplyE = dyn_cast<SelfApplyExpr>(Fn))
+    return getReferencedDecl(ApplyE->getFn());
+  if (auto *ACE = dyn_cast<AutoClosureExpr>(Fn)) {
+    if (auto *Unwrapped = ACE->getUnwrappedCurryThunkExpr())
+      return getReferencedDecl(Unwrapped);
+  }
+  return nullptr;
+}
+
+FuncDecl *getUnderlyingFunc(const Expr *Fn) {
+  return dyn_cast_or_null<FuncDecl>(getReferencedDecl(Fn));
+}
+
+/// Find the outermost call of the given location
+CallExpr *findOuterCall(const ResolvedCursorInfo &CursorInfo) {
+  auto IncludeInContext = [](ASTNode N) {
+    if (auto *E = N.dyn_cast<Expr *>())
+      return !E->isImplicit();
+    return false;
+  };
+
+  // TODO: Bit pointless using the "ContextFinder" here. Ideally we would have
+  //       already generated a slice of the AST for anything that contains
+  //       the cursor location
+  ContextFinder Finder(*CursorInfo.SF, CursorInfo.Loc, IncludeInContext);
+  Finder.resolve();
+  auto Contexts = Finder.getContexts();
+  if (Contexts.empty())
+    return nullptr;
+
+  CallExpr *CE = dyn_cast<CallExpr>(Contexts[0].get<Expr *>());
+  if (!CE)
+    return nullptr;
+
+  SourceManager &SM = CursorInfo.SF->getASTContext().SourceMgr;
+  if (!SM.rangeContains(CE->getFn()->getSourceRange(), CursorInfo.Loc))
+    return nullptr;
+  return CE;
+}
+
+/// Find the function matching the given location if it is not an accessor and
+/// either has a body or is a member of a protocol
+FuncDecl *findFunction(const ResolvedCursorInfo &CursorInfo) {
+  auto IncludeInContext = [](ASTNode N) {
+    if (auto *D = N.dyn_cast<Decl *>())
+      return !D->isImplicit();
+    return false;
+  };
+
+  ContextFinder Finder(*CursorInfo.SF, CursorInfo.Loc, IncludeInContext);
+  Finder.resolve();
+
+  auto Contexts = Finder.getContexts();
+  if (Contexts.empty())
+    return nullptr;
+
+  if (Contexts.back().isDecl(DeclKind::Param))
+    Contexts = Contexts.drop_back();
+
+  auto *FD = dyn_cast_or_null<FuncDecl>(Contexts.back().get<Decl *>());
+  if (!FD || isa<AccessorDecl>(FD))
+    return nullptr;
+
+  auto *Body = FD->getBody();
+  if (!Body && !isa<ProtocolDecl>(FD->getDeclContext()))
+    return nullptr;
+
+  SourceManager &SM = CursorInfo.SF->getASTContext().SourceMgr;
+  SourceLoc DeclEnd = Body ? Body->getLBraceLoc() : FD->getEndLoc();
+  if (!SM.rangeContains(SourceRange(FD->getStartLoc(), DeclEnd),
+                        CursorInfo.Loc))
+    return nullptr;
+
+  return FD;
+}
+
+FuncDecl *isOperator(const BinaryExpr *BE) {
+  auto *AE = dyn_cast<ApplyExpr>(BE->getFn());
+  if (AE) {
+    auto *Callee = AE->getCalledValue();
+    if (Callee && Callee->isOperator() && isa<FuncDecl>(Callee))
+      return cast<FuncDecl>(Callee);
+  }
+  return nullptr;
+}
+
+/// Describes the expressions to be kept from a call to the handler in a
+/// function that has (or will have ) and async alternative. Eg.
+/// ```
+/// func toBeAsync(completion: (String?, Error?) -> Void) {
+///   ...
+///   completion("something", nil) // Result = ["something"], IsError = false
+///   ...
+///   completion(nil, MyError.Bad) // Result = [MyError.Bad], IsError = true
+/// }
+class HandlerResult {
+  PtrArrayRef<Expr *> Results;
+  bool IsError = false;
+
+public:
+  HandlerResult() {}
+
+  HandlerResult(ArrayRef<Expr *> Results)
+      : Results(PtrArrayRef<Expr *>(Results)) {}
+
+  HandlerResult(Expr *Result, bool IsError)
+      : Results(PtrArrayRef<Expr *>(Result)), IsError(IsError) {}
+
+  bool isError() { return IsError; }
+
+  ArrayRef<Expr *> args() { return Results.ref(); }
+};
+
+/// The type of the handler, ie. whether it takes regular parameters or a
+/// single parameter of `Result` type.
+enum class HandlerType { INVALID, PARAMS, RESULT };
+
+/// Given a function with an async alternative (or one that *could* have an
+/// async alternative), stores information about the completion handler.
+/// The completion handler can be either a variable (which includes a parameter)
+/// or a function
+struct AsyncHandlerDesc {
+  PointerUnion<const VarDecl *, const AbstractFunctionDecl *> Handler = nullptr;
+  HandlerType Type = HandlerType::INVALID;
+  bool HasError = false;
+
+  static AsyncHandlerDesc get(const ValueDecl *Handler, bool RequireName) {
+    AsyncHandlerDesc HandlerDesc;
+    if (auto Var = dyn_cast<VarDecl>(Handler)) {
+      HandlerDesc.Handler = Var;
+    } else if (auto Func = dyn_cast<AbstractFunctionDecl>(Handler)) {
+      HandlerDesc.Handler = Func;
+    } else {
+      // The handler must be a variable or function
+      return AsyncHandlerDesc();
+    }
+
+    // Callback must have a completion-like name
+    if (RequireName && !isCompletionHandlerParamName(HandlerDesc.getNameStr()))
+      return AsyncHandlerDesc();
+
+    // Callback must be a function type and return void. Doesn't need to have
+    // any parameters - may just be a "I'm done" callback
+    auto *HandlerTy = HandlerDesc.getType()->getAs<AnyFunctionType>();
+    if (!HandlerTy || !HandlerTy->getResult()->isVoid())
+      return AsyncHandlerDesc();
+
+    // Find the type of result in the handler (eg. whether it's a Result<...>,
+    // just parameters, or nothing).
+    auto HandlerParams = HandlerTy->getParams();
+    if (HandlerParams.size() == 1) {
+      auto ParamTy =
+          HandlerParams.back().getPlainType()->getAs<BoundGenericType>();
+      if (ParamTy && ParamTy->isResult()) {
+        auto GenericArgs = ParamTy->getGenericArgs();
+        assert(GenericArgs.size() == 2 && "Result should have two params");
+        HandlerDesc.Type = HandlerType::RESULT;
+        HandlerDesc.HasError = !GenericArgs.back()->isUninhabited();
+      }
+    }
+
+    if (HandlerDesc.Type != HandlerType::RESULT) {
+      // Only handle non-result parameters
+      for (auto &Param : HandlerParams) {
+        if (Param.getPlainType() && Param.getPlainType()->isResult())
+          return AsyncHandlerDesc();
+      }
+
+      HandlerDesc.Type = HandlerType::PARAMS;
+      if (!HandlerParams.empty()) {
+        auto LastParamTy = HandlerParams.back().getParameterType();
+        HandlerDesc.HasError = isErrorType(LastParamTy->getOptionalObjectType(),
+                                           Handler->getModuleContext());
+      }
+    }
+
+    return HandlerDesc;
+  }
+
+  bool isValid() const { return Type != HandlerType::INVALID; }
+
+  /// Return the declaration of the completion handler as a \c ValueDecl.
+  /// In practice, the handler will always be a \c VarDecl or \c
+  /// AbstractFunctionDecl.
+  /// \c getNameStr and \c getType provide access functions that are available
+  /// for both variables and functions, but not on \c ValueDecls.
+  const ValueDecl *getHandler() const {
+    if (!Handler) {
+      return nullptr;
+    }
+    if (auto Var = Handler.dyn_cast<const VarDecl *>()) {
+      return Var;
+    } else if (auto Func = Handler.dyn_cast<const AbstractFunctionDecl *>()) {
+      return Func;
+    } else {
+      llvm_unreachable("Unknown handler type");
+    }
+  }
+
+  /// Return the name of the completion handler. If it is a variable, the
+  /// variable name, if it's a function, the function base name.
+  StringRef getNameStr() const {
+    if (auto Var = Handler.dyn_cast<const VarDecl *>()) {
+      return Var->getNameStr();
+    } else if (auto Func = Handler.dyn_cast<const AbstractFunctionDecl *>()) {
+      return Func->getNameStr();
+    } else {
+      llvm_unreachable("Unknown handler type");
+    }
+  }
+
+  /// Get the type of the completion handler.
+  swift::Type getType() const {
+    if (auto Var = Handler.dyn_cast<const VarDecl *>()) {
+      return Var->getType();
+    } else if (auto Func = Handler.dyn_cast<const AbstractFunctionDecl *>()) {
+      auto Type = Func->getInterfaceType();
+      // Undo the self curry thunk if we are referencing a member function.
+      if (Func->hasImplicitSelfDecl()) {
+        assert(Type->is<AnyFunctionType>());
+        Type = Type->getAs<AnyFunctionType>()->getResult();
+      }
+      return Type;
+    } else {
+      llvm_unreachable("Unknown handler type");
+    }
+  }
+
+  ArrayRef<AnyFunctionType::Param> params() const {
+    auto Ty = getType()->getAs<AnyFunctionType>();
+    assert(Ty && "Type must be a function type");
+    return Ty->getParams();
+  }
+
+  /// Retrieve the parameters relevant to a successful return from the
+  /// completion handler. This drops the Error parameter if present.
+  ArrayRef<AnyFunctionType::Param> getSuccessParams() const {
+    if (HasError && Type == HandlerType::PARAMS)
+      return params().drop_back();
+    return params();
+  }
+
+  /// If the completion handler has an Error parameter, return it.
+  Optional<AnyFunctionType::Param> getErrorParam() const {
+    if (HasError && Type == HandlerType::PARAMS)
+      return params().back();
+    return None;
+  }
+
+  /// Get the type of the error that will be thrown by the \c async method or \c
+  /// None if the completion handler doesn't accept an error parameter.
+  /// This may be more specialized than the generic 'Error' type if the
+  /// completion handler of the converted function takes a more specialized
+  /// error type.
+  Optional<swift::Type> getErrorType() const {
+    if (HasError) {
+      switch (Type) {
+      case HandlerType::INVALID:
+        return None;
+      case HandlerType::PARAMS:
+        // The last parameter of the completion handler is the error param
+        return params().back().getPlainType()->lookThroughSingleOptionalType();
+      case HandlerType::RESULT:
+        assert(
+            params().size() == 1 &&
+            "Result handler should have the Result type as the only parameter");
+        auto ResultType =
+            params().back().getPlainType()->getAs<BoundGenericType>();
+        auto GenericArgs = ResultType->getGenericArgs();
+        assert(GenericArgs.size() == 2 && "Result should have two params");
+        // The second (last) generic parameter of the Result type is the error
+        // type.
+        return GenericArgs.back();
+      }
+    } else {
+      return None;
+    }
+  }
+
+  /// The `CallExpr` if the given node is a call to the `Handler`
+  CallExpr *getAsHandlerCall(ASTNode Node) const {
+    if (!isValid())
+      return nullptr;
+
+    if (Node.isExpr(swift::ExprKind::Call)) {
+      CallExpr *CE = cast<CallExpr>(Node.dyn_cast<Expr *>());
+      if (CE->getFn()->getReferencedDecl().getDecl() == getHandler())
+        return CE;
+    }
+    return nullptr;
+  }
+
+  /// Given a call to the `Handler`, extract the expressions to be returned or
+  /// thrown, taking care to remove the `.success`/`.failure` if it's a
+  /// `RESULT` handler type.
+  HandlerResult extractResultArgs(const CallExpr *CE) const {
+    auto ArgList = callArgs(CE);
+    auto Args = ArgList.ref();
+
+    if (Type == HandlerType::PARAMS) {
+      // If there's an error parameter and the user isn't passing nil to it,
+      // assume this is the error path.
+      if (HasError && !isa<NilLiteralExpr>(Args.back()))
+        return HandlerResult(Args.back(), true);
+
+      // We can drop the args altogether if they're just Void.
+      if (willAsyncReturnVoid())
+        return HandlerResult();
+
+      return HandlerResult(HasError ? Args.drop_back() : Args);
+    } else if (Type == HandlerType::RESULT) {
+      if (Args.size() != 1)
+        return HandlerResult(Args);
+
+      auto *ResultCE = dyn_cast<CallExpr>(Args[0]);
+      if (!ResultCE)
+        return HandlerResult(Args);
+
+      auto *DSC = dyn_cast<DotSyntaxCallExpr>(ResultCE->getFn());
+      if (!DSC)
+        return HandlerResult(Args);
+
+      auto *D = dyn_cast<EnumElementDecl>(
+          DSC->getFn()->getReferencedDecl().getDecl());
+      if (!D)
+        return HandlerResult(Args);
+
+      auto ResultArgList = callArgs(ResultCE);
+      auto isFailure = D->getNameStr() == StringRef("failure");
+
+      // We can drop the arg altogether if it's just Void.
+      if (!isFailure && willAsyncReturnVoid())
+        return HandlerResult();
+
+      // Otherwise the arg gets the .success() or .failure() call dropped.
+      return HandlerResult(ResultArgList.ref()[0], isFailure);
+    }
+
+    llvm_unreachable("Unhandled result type");
+  }
+
+  // Convert the type of a success parameter in the completion handler function
+  // to a return type suitable for an async function. If there is an error
+  // parameter present e.g (T?, Error?) -> Void, this unwraps a level of
+  // optionality from T?. If this is a Result<T, U> type, returns the success
+  // type T.
+  swift::Type getSuccessParamAsyncReturnType(swift::Type Ty) const {
+    switch (Type) {
+    case HandlerType::PARAMS: {
+      // If there's an Error parameter in the handler, the success branch can
+      // be unwrapped.
+      if (HasError)
+        Ty = Ty->lookThroughSingleOptionalType();
+
+      return Ty;
+    }
+    case HandlerType::RESULT: {
+      // Result<T, U> maps to T.
+      return Ty->castTo<BoundGenericType>()->getGenericArgs()[0];
+    }
+    case HandlerType::INVALID:
+      llvm_unreachable("Invalid handler type");
+    }
+  }
+
+  /// Gets the return value types for the async equivalent of this handler.
+  ArrayRef<swift::Type>
+  getAsyncReturnTypes(SmallVectorImpl<swift::Type> &Scratch) const {
+    for (auto &Param : getSuccessParams()) {
+      auto Ty = Param.getParameterType();
+      Scratch.push_back(getSuccessParamAsyncReturnType(Ty));
+    }
+    return Scratch;
+  }
+
+  /// Whether the async equivalent of this handler returns Void.
+  bool willAsyncReturnVoid() const {
+    // If all of the success params will be converted to Void return types,
+    // this will be a Void async function.
+    return llvm::all_of(getSuccessParams(), [&](auto &param) {
+      auto Ty = param.getParameterType();
+      return getSuccessParamAsyncReturnType(Ty)->isVoid();
+    });
+  }
+
+  bool shouldUnwrap(swift::Type Ty) const {
+    return HasError && Ty->isOptional();
+  }
+};
+
+/// Given a completion handler that is part of a function signature, stores
+/// information about that completion handler and its index within the function
+/// declaration.
+struct AsyncHandlerParamDesc : public AsyncHandlerDesc {
+  /// The function the completion handler is a parameter of.
+  const FuncDecl *Func = nullptr;
+  /// The index of the completion handler in the function that declares it.
+  int Index = -1;
+
+  AsyncHandlerParamDesc() : AsyncHandlerDesc() {}
+  AsyncHandlerParamDesc(const AsyncHandlerDesc &Handler, const FuncDecl *Func,
+                        int Index)
+      : AsyncHandlerDesc(Handler), Func(Func), Index(Index) {}
+
+  static AsyncHandlerParamDesc find(const FuncDecl *FD,
+                                    bool RequireAttributeOrName) {
+    if (!FD || FD->hasAsync() || FD->hasThrows())
+      return AsyncHandlerParamDesc();
+
+    bool RequireName = RequireAttributeOrName;
+    if (RequireAttributeOrName &&
+        FD->getAttrs().hasAttribute<CompletionHandlerAsyncAttr>())
+      RequireName = false;
+
+    // Require at least one parameter and void return type
+    auto *Params = FD->getParameters();
+    if (Params->size() == 0 || !FD->getResultInterfaceType()->isVoid())
+      return AsyncHandlerParamDesc();
+
+    // Assume the handler is the last parameter for now
+    int Index = Params->size() - 1;
+    const ParamDecl *Param = Params->get(Index);
+
+    // Callback must not be attributed with @autoclosure
+    if (Param->isAutoClosure())
+      return AsyncHandlerParamDesc();
+
+    return AsyncHandlerParamDesc(AsyncHandlerDesc::get(Param, RequireName), FD,
+                                 Index);
+  }
+
+  /// Print the name of the function with the completion handler, without
+  /// the completion handler parameter, to \p OS. That is, the name of the
+  /// async alternative function.
+  void printAsyncFunctionName(llvm::raw_ostream &OS) const {
+    if (!Func || Index < 0)
+      return;
+
+    DeclName Name = Func->getName();
+    OS << Name.getBaseName();
+
+    OS << tok::l_paren;
+    ArrayRef<Identifier> ArgNames = Name.getArgumentNames();
+    for (size_t I = 0; I < ArgNames.size(); ++I) {
+      if (I != (size_t)Index) {
+        OS << ArgNames[I] << tok::colon;
+      }
+    }
+    OS << tok::r_paren;
+  }
+
+  bool operator==(const AsyncHandlerParamDesc &Other) const {
+    return Handler == Other.Handler && Type == Other.Type &&
+           HasError == Other.HasError && Index == Other.Index;
+  }
+};
+
+enum class ConditionType { INVALID, NIL, NOT_NIL };
+
+/// Finds the `Subject` being compared to in various conditions. Also finds any
+/// pattern that may have a bound name.
+struct CallbackCondition {
+  ConditionType Type = ConditionType::INVALID;
+  const Decl *Subject = nullptr;
+  const Pattern *BindPattern = nullptr;
+  // Bit of a hack. When the `Subject` is a `Result` type we use this to
+  // distinguish between the `.success` and `.failure` case (as opposed to just
+  // checking whether `Subject` == `TheErrDecl`)
+  bool ErrorCase = false;
+
+  CallbackCondition() = default;
+
+  /// Initializes a `CallbackCondition` with a `!=` or `==` comparison of
+  /// an `Optional` typed `Subject` to `nil`, ie.
+  ///   - `<Subject> != nil`
+  ///   - `<Subject> == nil`
+  CallbackCondition(const BinaryExpr *BE, const FuncDecl *Operator) {
+    bool FoundNil = false;
+    for (auto *Operand : {BE->getLHS(), BE->getRHS()}) {
+      if (isa<NilLiteralExpr>(Operand)) {
+        FoundNil = true;
+      } else if (auto *DRE = dyn_cast<DeclRefExpr>(Operand)) {
+        Subject = DRE->getDecl();
+      }
+    }
+
+    if (Subject && FoundNil) {
+      if (Operator->getBaseName() == "==") {
+        Type = ConditionType::NIL;
+      } else if (Operator->getBaseName() == "!=") {
+        Type = ConditionType::NOT_NIL;
+      }
+    }
+  }
+
+  /// Initializes a `CallbackCondition` with binding of an `Optional` or
+  /// `Result` typed `Subject`, ie.
+  ///   - `let bind = <Subject>`
+  ///   - `case .success(let bind) = <Subject>`
+  ///   - `case .failure(let bind) = <Subject>`
+  ///   - `let bind = try? <Subject>.get()`
+  CallbackCondition(const Pattern *P, const Expr *Init) {
+    if (auto *DRE = dyn_cast<DeclRefExpr>(Init)) {
+      if (auto *OSP = dyn_cast<OptionalSomePattern>(P)) {
+        // `let bind = <Subject>`
+        Type = ConditionType::NOT_NIL;
+        Subject = DRE->getDecl();
+        BindPattern = OSP->getSubPattern();
+      } else if (auto *EEP = dyn_cast<EnumElementPattern>(P)) {
+        // `case .<func>(let <bind>) = <Subject>`
+        initFromEnumPattern(DRE->getDecl(), EEP);
+      }
+    } else if (auto *OTE = dyn_cast<OptionalTryExpr>(Init)) {
+      // `let bind = try? <Subject>.get()`
+      if (auto *OSP = dyn_cast<OptionalSomePattern>(P))
+        initFromOptionalTry(OSP->getSubPattern(), OTE);
+    }
+  }
+
+  /// Initializes a `CallbackCondtion` from a case statement inside a switch
+  /// on `Subject` with `Result` type, ie.
+  /// ```
+  /// switch <Subject> {
+  /// case .success(let bind):
+  /// case .failure(let bind):
+  /// }
+  /// ```
+  CallbackCondition(const Decl *Subject, const CaseLabelItem *CaseItem) {
+    if (auto *EEP = dyn_cast<EnumElementPattern>(CaseItem->getPattern())) {
+      // `case .<func>(let <bind>)`
+      initFromEnumPattern(Subject, EEP);
+    }
+  }
+
+  bool isValid() const { return Type != ConditionType::INVALID; }
+
+  /// Given an `if` condition `Cond` and a set of `Decls`, find any
+  /// `CallbackCondition`s in `Cond` that use one of those `Decls` and add them
+  /// to the map `AddTo`. Return `true` if all elements in the condition are
+  /// "handled", ie. every condition can be mapped to a single `Decl` in
+  /// `Decls`.
+  static bool all(StmtCondition Cond, llvm::DenseSet<const Decl *> Decls,
+                  llvm::DenseMap<const Decl *, CallbackCondition> &AddTo) {
+    bool Handled = true;
+    for (auto &CondElement : Cond) {
+      if (auto *BoolExpr = CondElement.getBooleanOrNull()) {
+        SmallVector<Expr *, 1> Exprs;
+        Exprs.push_back(BoolExpr);
+
+        while (!Exprs.empty()) {
+          auto *Next = Exprs.pop_back_val();
+          if (auto *ACE = dyn_cast<AutoClosureExpr>(Next))
+            Next = ACE->getSingleExpressionBody();
+
+          if (auto *BE = dyn_cast_or_null<BinaryExpr>(Next)) {
+            auto *Operator = isOperator(BE);
+            if (Operator) {
+              if (Operator->getBaseName() == "&&") {
+                Exprs.push_back(BE->getLHS());
+                Exprs.push_back(BE->getRHS());
+              } else {
+                addCond(CallbackCondition(BE, Operator), Decls, AddTo, Handled);
+              }
+              continue;
+            }
+          }
+
+          Handled = false;
+        }
+      } else if (auto *P = CondElement.getPatternOrNull()) {
+        addCond(CallbackCondition(P, CondElement.getInitializer()), Decls,
+                AddTo, Handled);
+      }
+    }
+    return Handled && !AddTo.empty();
+  }
+
+private:
+  static void addCond(const CallbackCondition &CC,
+                      llvm::DenseSet<const Decl *> Decls,
+                      llvm::DenseMap<const Decl *, CallbackCondition> &AddTo,
+                      bool &Handled) {
+    if (!CC.isValid() || !Decls.count(CC.Subject) ||
+        !AddTo.try_emplace(CC.Subject, CC).second)
+      Handled = false;
+  }
+
+  void initFromEnumPattern(const Decl *D, const EnumElementPattern *EEP) {
+    if (auto *EED = EEP->getElementDecl()) {
+      auto eedTy = EED->getParentEnum()->getDeclaredType();
+      if (!eedTy || !eedTy->isResult())
+        return;
+      if (EED->getNameStr() == StringRef("failure"))
+        ErrorCase = true;
+      Type = ConditionType::NOT_NIL;
+      Subject = D;
+      BindPattern = EEP->getSubPattern();
+    }
+  }
+
+  void initFromOptionalTry(const class Pattern *P, const OptionalTryExpr *OTE) {
+    auto *ICE = dyn_cast<ImplicitConversionExpr>(OTE->getSubExpr());
+    if (!ICE)
+      return;
+    auto *CE = dyn_cast<CallExpr>(ICE->getSyntacticSubExpr());
+    if (!CE)
+      return;
+    auto *DSC = dyn_cast<DotSyntaxCallExpr>(CE->getFn());
+    if (!DSC)
+      return;
+
+    auto *BaseDRE = dyn_cast<DeclRefExpr>(DSC->getBase());
+    if (!BaseDRE->getType() || !BaseDRE->getType()->isResult())
+      return;
+
+    auto *FnDRE = dyn_cast<DeclRefExpr>(DSC->getFn());
+    if (!FnDRE)
+      return;
+    auto *FD = dyn_cast<FuncDecl>(FnDRE->getDecl());
+    if (!FD || FD->getNameStr() != StringRef("get"))
+      return;
+
+    Type = ConditionType::NOT_NIL;
+    Subject = BaseDRE->getDecl();
+    BindPattern = P;
+  }
+};
+
+/// A list of nodes to print, along with a list of locations that may have
+/// preceding comments attached, which also need printing. For example:
+///
+/// \code
+/// if .random() {
+///   // a
+///   print("hello")
+///   // b
+/// }
+/// \endcode
+///
+/// To print out the contents of the if statement body, we'll include the AST
+/// node for the \c print call. This will also include the preceding comment
+/// \c a, but won't include the comment \c b. To ensure the comment \c b gets
+/// printed, the SourceLoc for the closing brace \c } is added as a possible
+/// comment loc.
+class NodesToPrint {
+  SmallVector<ASTNode, 0> Nodes;
+  SmallVector<SourceLoc, 2> PossibleCommentLocs;
+
+public:
+  NodesToPrint() {}
+  NodesToPrint(ArrayRef<ASTNode> Nodes, ArrayRef<SourceLoc> PossibleCommentLocs)
+      : Nodes(Nodes.begin(), Nodes.end()),
+        PossibleCommentLocs(PossibleCommentLocs.begin(),
+                            PossibleCommentLocs.end()) {}
+
+  ArrayRef<ASTNode> getNodes() const { return Nodes; }
+  ArrayRef<SourceLoc> getPossibleCommentLocs() const {
+    return PossibleCommentLocs;
+  }
+
+  /// Add an AST node to print.
+  void addNode(ASTNode Node) {
+    // Note we skip vars as they'll be printed as a part of their
+    // PatternBindingDecl.
+    if (!Node.isDecl(DeclKind::Var))
+      Nodes.push_back(Node);
+  }
+
+  /// Add a SourceLoc which may have a preceding comment attached. If so, the
+  /// comment will be printed out at the appropriate location.
+  void addPossibleCommentLoc(SourceLoc Loc) {
+    if (Loc.isValid())
+      PossibleCommentLocs.push_back(Loc);
+  }
+
+  /// Add all the nodes in the brace statement to the list of nodes to print.
+  /// This should be preferred over adding the nodes manually as it picks up the
+  /// end location of the brace statement as a possible comment loc, ensuring
+  /// that we print any trailing comments in the brace statement.
+  void addNodesInBraceStmt(BraceStmt *Brace) {
+    for (auto Node : Brace->getElements())
+      addNode(Node);
+
+    // Ignore the end locations of implicit braces, as they're likely bogus.
+    // e.g for a case statement, the r-brace loc points to the last token of the
+    // last node in the body.
+    if (!Brace->isImplicit())
+      addPossibleCommentLoc(Brace->getRBraceLoc());
+  }
+
+  /// Add the nodes and comment locs from another NodesToPrint.
+  void addNodes(NodesToPrint OtherNodes) {
+    Nodes.append(OtherNodes.Nodes.begin(), OtherNodes.Nodes.end());
+    PossibleCommentLocs.append(OtherNodes.PossibleCommentLocs.begin(),
+                               OtherNodes.PossibleCommentLocs.end());
+  }
+
+  /// Whether the last recorded node is an explicit return or break statement.
+  bool hasTrailingReturnOrBreak() const {
+    if (Nodes.empty())
+      return false;
+    return (Nodes.back().isStmt(StmtKind::Return) ||
+            Nodes.back().isStmt(StmtKind::Break)) &&
+           !Nodes.back().isImplicit();
+  }
+
+  /// If the last recorded node is an explicit return or break statement that
+  /// can be safely dropped, drop it from the list.
+  void dropTrailingReturnOrBreakIfPossible() {
+    if (!hasTrailingReturnOrBreak())
+      return;
+
+    auto *Node = Nodes.back().get<Stmt *>();
+
+    // If this is a return statement with return expression, let's preserve it.
+    if (auto *RS = dyn_cast<ReturnStmt>(Node)) {
+      if (RS->hasResult())
+        return;
+    }
+
+    // Remove the node from the list, but make sure to add it as a possible
+    // comment loc to preserve any of its attached comments.
+    Nodes.pop_back();
+    addPossibleCommentLoc(Node->getStartLoc());
+  }
+
+  /// Returns a list of nodes to print in a brace statement. This picks up the
+  /// end location of the brace statement as a possible comment loc, ensuring
+  /// that we print any trailing comments in the brace statement.
+  static NodesToPrint inBraceStmt(BraceStmt *stmt) {
+    NodesToPrint Nodes;
+    Nodes.addNodesInBraceStmt(stmt);
+    return Nodes;
+  }
+};
+
+/// The statements within the closure of call to a function taking a callback
+/// are split into a `SuccessBlock` and `ErrorBlock` (`ClassifiedBlocks`).
+/// This class stores the nodes for each block, as well as a mapping of
+/// decls to any patterns they are used in.
+class ClassifiedBlock {
+  NodesToPrint Nodes;
+  // closure param -> name
+  llvm::DenseMap<const Decl *, StringRef> BoundNames;
+  // var (ie. from a let binding) -> closure param
+  llvm::DenseMap<const Decl *, const Decl *> Aliases;
+  bool AllLet = true;
+
+public:
+  const NodesToPrint &nodesToPrint() const { return Nodes; }
+
+  StringRef boundName(const Decl *D) const { return BoundNames.lookup(D); }
+
+  const llvm::DenseMap<const Decl *, const Decl *> &aliases() const {
+    return Aliases;
+  }
+
+  bool allLet() const { return AllLet; }
+
+  void addNodesInBraceStmt(BraceStmt *Brace) {
+    Nodes.addNodesInBraceStmt(Brace);
+  }
+  void addPossibleCommentLoc(SourceLoc Loc) {
+    Nodes.addPossibleCommentLoc(Loc);
+  }
+  void addAllNodes(NodesToPrint OtherNodes) {
+    Nodes.addNodes(std::move(OtherNodes));
+  }
+
+  void addNode(ASTNode Node) {
+    Nodes.addNode(Node);
+  }
+
+  void addBinding(const CallbackCondition &FromCondition,
+                  DiagnosticEngine &DiagEngine) {
+    if (!FromCondition.BindPattern)
+      return;
+
+    if (auto *BP =
+            dyn_cast_or_null<BindingPattern>(FromCondition.BindPattern)) {
+      if (!BP->isLet())
+        AllLet = false;
+    }
+
+    StringRef Name = FromCondition.BindPattern->getBoundName().str();
+    VarDecl *SingleVar = FromCondition.BindPattern->getSingleVar();
+    if (Name.empty() || !SingleVar)
+      return;
+
+    auto Res = Aliases.try_emplace(SingleVar, FromCondition.Subject);
+    assert(Res.second && "Should not have seen this var before");
+    (void)Res;
+
+    // Use whichever name comes first
+    BoundNames.try_emplace(FromCondition.Subject, Name);
+  }
+
+  void addAllBindings(
+      const llvm::DenseMap<const Decl *, CallbackCondition> &FromConditions,
+      DiagnosticEngine &DiagEngine) {
+    for (auto &Entry : FromConditions) {
+      addBinding(Entry.second, DiagEngine);
+      if (DiagEngine.hadAnyError())
+        return;
+    }
+  }
+};
+
+struct ClassifiedBlocks {
+  ClassifiedBlock SuccessBlock;
+  ClassifiedBlock ErrorBlock;
+};
+
+/// Classifer of callback closure statements that that have either multiple
+/// non-Result parameters or a single Result parameter and return Void.
+///
+/// It performs a (possibly incorrect) best effort and may give up in certain
+/// cases. Aims to cover the idiomatic cases of either having no error
+/// parameter at all, or having success/error code wrapped in ifs/guards/switch
+/// using either pattern binding or nil checks.
+///
+/// Code outside any clear conditions is assumed to be solely part of the
+/// success block for now, though some heuristics could be added to classify
+/// these better in the future.
+struct CallbackClassifier {
+  /// Updates the success and error block of `Blocks` with nodes and bound
+  /// names from `Body`. Errors are added through `DiagEngine`, possibly
+  /// resulting in partially filled out blocks.
+  static void classifyInto(ClassifiedBlocks &Blocks,
+                           llvm::DenseSet<SwitchStmt *> &HandledSwitches,
+                           DiagnosticEngine &DiagEngine,
+                           llvm::DenseSet<const Decl *> UnwrapParams,
+                           const ParamDecl *ErrParam, HandlerType ResultType,
+                           BraceStmt *Body) {
+    assert(!Body->getElements().empty() && "Cannot classify empty body");
+    CallbackClassifier Classifier(Blocks, HandledSwitches, DiagEngine,
+                                  UnwrapParams, ErrParam,
+                                  ResultType == HandlerType::RESULT);
+    Classifier.classifyNodes(Body->getElements(), Body->getRBraceLoc());
+  }
+
+private:
+  ClassifiedBlocks &Blocks;
+  llvm::DenseSet<SwitchStmt *> &HandledSwitches;
+  DiagnosticEngine &DiagEngine;
+  ClassifiedBlock *CurrentBlock;
+  llvm::DenseSet<const Decl *> UnwrapParams;
+  const ParamDecl *ErrParam;
+  bool IsResultParam;
+
+  CallbackClassifier(ClassifiedBlocks &Blocks,
+                     llvm::DenseSet<SwitchStmt *> &HandledSwitches,
+                     DiagnosticEngine &DiagEngine,
+                     llvm::DenseSet<const Decl *> UnwrapParams,
+                     const ParamDecl *ErrParam, bool IsResultParam)
+      : Blocks(Blocks), HandledSwitches(HandledSwitches),
+        DiagEngine(DiagEngine), CurrentBlock(&Blocks.SuccessBlock),
+        UnwrapParams(UnwrapParams), ErrParam(ErrParam),
+        IsResultParam(IsResultParam) {}
+
+  void classifyNodes(ArrayRef<ASTNode> Nodes, SourceLoc endCommentLoc) {
+    for (auto I = Nodes.begin(), E = Nodes.end(); I < E; ++I) {
+      auto *Statement = I->dyn_cast<Stmt *>();
+      if (auto *IS = dyn_cast_or_null<IfStmt>(Statement)) {
+        NodesToPrint TempNodes;
+        if (auto *BS = dyn_cast<BraceStmt>(IS->getThenStmt())) {
+          TempNodes = NodesToPrint::inBraceStmt(BS);
+        } else {
+          TempNodes = NodesToPrint({IS->getThenStmt()}, /*commentLocs*/ {});
+        }
+
+        classifyConditional(IS, IS->getCond(), std::move(TempNodes),
+                            IS->getElseStmt());
+      } else if (auto *GS = dyn_cast_or_null<GuardStmt>(Statement)) {
+        classifyConditional(GS, GS->getCond(), NodesToPrint(), GS->getBody());
+      } else if (auto *SS = dyn_cast_or_null<SwitchStmt>(Statement)) {
+        classifySwitch(SS);
+      } else {
+        CurrentBlock->addNode(*I);
+      }
+
+      if (DiagEngine.hadAnyError())
+        return;
+    }
+    // Make sure to pick up any trailing comments.
+    CurrentBlock->addPossibleCommentLoc(endCommentLoc);
+  }
+
+  void classifyConditional(Stmt *Statement, StmtCondition Condition,
+                           NodesToPrint ThenNodesToPrint, Stmt *ElseStmt) {
+    llvm::DenseMap<const Decl *, CallbackCondition> CallbackConditions;
+    bool UnhandledConditions =
+        !CallbackCondition::all(Condition, UnwrapParams, CallbackConditions);
+    CallbackCondition ErrCondition = CallbackConditions.lookup(ErrParam);
+
+    if (UnhandledConditions) {
+      // Some unknown conditions. If there's an else, assume we can't handle
+      // and use the fallback case. Otherwise add to either the success or
+      // error block depending on some heuristics, known conditions will have
+      // placeholders added (ideally we'd remove them)
+      // TODO: Remove known conditions and split the `if` statement
+
+      if (CallbackConditions.empty()) {
+        // Technically this has a similar problem, ie. the else could have
+        // conditions that should be in either success/error
+        CurrentBlock->addNode(Statement);
+      } else if (ElseStmt) {
+        DiagEngine.diagnose(Statement->getStartLoc(),
+                            diag::unknown_callback_conditions);
+      } else if (ErrCondition.isValid() &&
+                 ErrCondition.Type == ConditionType::NOT_NIL) {
+        Blocks.ErrorBlock.addNode(Statement);
+      } else {
+        for (auto &Entry : CallbackConditions) {
+          if (Entry.second.Type == ConditionType::NIL) {
+            Blocks.ErrorBlock.addNode(Statement);
+            return;
+          }
+        }
+        Blocks.SuccessBlock.addNode(Statement);
+      }
+      return;
+    }
+
+    ClassifiedBlock *ThenBlock = &Blocks.SuccessBlock;
+    ClassifiedBlock *ElseBlock = &Blocks.ErrorBlock;
+
+    if (ErrCondition.isValid() && (!IsResultParam || ErrCondition.ErrorCase) &&
+        ErrCondition.Type == ConditionType::NOT_NIL) {
+      ClassifiedBlock *TempBlock = ThenBlock;
+      ThenBlock = ElseBlock;
+      ElseBlock = TempBlock;
+    } else {
+      ConditionType CondType = ConditionType::INVALID;
+      for (auto &Entry : CallbackConditions) {
+        if (IsResultParam || Entry.second.Subject != ErrParam) {
+          if (CondType == ConditionType::INVALID) {
+            CondType = Entry.second.Type;
+          } else if (CondType != Entry.second.Type) {
+            // Similar to the unknown conditions case. Add the whole if unless
+            // there's an else, in which case use the fallback instead.
+            // TODO: Split the `if` statement
+
+            if (ElseStmt) {
+              DiagEngine.diagnose(Statement->getStartLoc(),
+                                  diag::mixed_callback_conditions);
+            } else {
+              CurrentBlock->addNode(Statement);
+            }
+            return;
+          }
+        }
+      }
+
+      if (CondType == ConditionType::NIL) {
+        ClassifiedBlock *TempBlock = ThenBlock;
+        ThenBlock = ElseBlock;
+        ElseBlock = TempBlock;
+      }
+    }
+
+    // We'll be dropping the statement, but make sure to keep any attached
+    // comments.
+    CurrentBlock->addPossibleCommentLoc(Statement->getStartLoc());
+
+    ThenBlock->addAllBindings(CallbackConditions, DiagEngine);
+    if (DiagEngine.hadAnyError())
+      return;
+
+    // TODO: Handle nested ifs
+    setNodes(ThenBlock, ElseBlock, std::move(ThenNodesToPrint));
+
+    if (ElseStmt) {
+      if (auto *BS = dyn_cast<BraceStmt>(ElseStmt)) {
+        setNodes(ElseBlock, ThenBlock, NodesToPrint::inBraceStmt(BS));
+      } else {
+        classifyNodes(ArrayRef<ASTNode>(ElseStmt),
+                      /*endCommentLoc*/ SourceLoc());
+      }
+    }
+  }
+
+  void setNodes(ClassifiedBlock *Block, ClassifiedBlock *OtherBlock,
+                NodesToPrint Nodes) {
+    if (Nodes.hasTrailingReturnOrBreak()) {
+      CurrentBlock = OtherBlock;
+      Nodes.dropTrailingReturnOrBreakIfPossible();
+      Block->addAllNodes(std::move(Nodes));
+    } else {
+      Block->addAllNodes(std::move(Nodes));
+    }
+  }
+
+  void classifySwitch(SwitchStmt *SS) {
+    if (!IsResultParam || singleSwitchSubject(SS) != ErrParam) {
+      CurrentBlock->addNode(SS);
+      return;
+    }
+
+    // We'll be dropping the switch, but make sure to keep any attached
+    // comments.
+    CurrentBlock->addPossibleCommentLoc(SS->getStartLoc());
+
+    // Push the cases into a vector. This is only done to eagerly evaluate the
+    // AsCaseStmtRange sequence so we can know what the last case is.
+    SmallVector<CaseStmt *, 2> Cases;
+    Cases.append(SS->getCases().begin(), SS->getCases().end());
+
+    for (auto *CS : Cases) {
+      if (CS->hasFallthroughDest()) {
+        DiagEngine.diagnose(CS->getLoc(), diag::callback_with_fallthrough);
+        return;
+      }
+
+      if (CS->isDefault()) {
+        DiagEngine.diagnose(CS->getLoc(), diag::callback_with_default);
+        return;
+      }
+
+      auto Items = CS->getCaseLabelItems();
+      if (Items.size() > 1) {
+        DiagEngine.diagnose(CS->getLoc(), diag::callback_multiple_case_items);
+        return;
+      }
+
+      if (Items[0].getWhereLoc().isValid()) {
+        DiagEngine.diagnose(CS->getLoc(), diag::callback_where_case_item);
+        return;
+      }
+
+      CallbackCondition CC(ErrParam, &Items[0]);
+      ClassifiedBlock *Block = &Blocks.SuccessBlock;
+      ClassifiedBlock *OtherBlock = &Blocks.ErrorBlock;
+      if (CC.ErrorCase) {
+        Block = &Blocks.ErrorBlock;
+        OtherBlock = &Blocks.SuccessBlock;
+      }
+
+      // We'll be dropping the case, but make sure to keep any attached
+      // comments. Because these comments will effectively be part of the
+      // previous case, add them to CurrentBlock.
+      CurrentBlock->addPossibleCommentLoc(CS->getStartLoc());
+
+      // Make sure to grab trailing comments in the last case stmt.
+      if (CS == Cases.back())
+        Block->addPossibleCommentLoc(SS->getRBraceLoc());
+
+      setNodes(Block, OtherBlock, NodesToPrint::inBraceStmt(CS->getBody()));
+      Block->addBinding(CC, DiagEngine);
+      if (DiagEngine.hadAnyError())
+        return;
+    }
+    // Mark this switch statement as having been transformed.
+    HandledSwitches.insert(SS);
+  }
+};
+
+/// Whether or not the given statement starts a new scope. Note that most
+/// statements are handled by the \c BraceStmt check. The others listed are
+/// a somewhat special case since they can also declare variables in their
+/// condition.
+static bool startsNewScope(Stmt *S) {
+  switch (S->getKind()) {
+  case StmtKind::Brace:
+  case StmtKind::If:
+  case StmtKind::While:
+  case StmtKind::ForEach:
+  case StmtKind::Case:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Name of a decl if it has one, an empty \c Identifier otherwise.
+static Identifier getDeclName(const Decl *D) {
+  if (auto *VD = dyn_cast<ValueDecl>(D)) {
+    if (VD->hasName())
+      return VD->getBaseIdentifier();
+  }
+  return Identifier();
+}
+
+class DeclCollector : private SourceEntityWalker {
+  llvm::DenseSet<const Decl *> &Decls;
+
+public:
+  /// Collect all explicit declarations declared in \p Scope (or \p SF if
+  /// \p Scope is a nullptr) that are not within their own scope.
+  static void collect(BraceStmt *Scope, SourceFile &SF,
+                      llvm::DenseSet<const Decl *> &Decls) {
+    DeclCollector Collector(Decls);
+    if (Scope) {
+      for (auto Node : Scope->getElements()) {
+        Collector.walk(Node);
+      }
+    } else {
+      Collector.walk(SF);
+    }
+  }
+
+private:
+  DeclCollector(llvm::DenseSet<const Decl *> &Decls)
+      : Decls(Decls) {}
+
+  bool walkToDeclPre(Decl *D, CharSourceRange Range) override {
+    // Want to walk through top level code decls (which are implicitly added
+    // for top level non-decl code) and pattern binding decls (which contain
+    // the var decls that we care about).
+    if (isa<TopLevelCodeDecl>(D) || isa<PatternBindingDecl>(D))
+      return true;
+
+    if (!D->isImplicit())
+      Decls.insert(D);
+    return false;
+  }
+
+  bool walkToExprPre(Expr *E) override {
+    return !isa<ClosureExpr>(E);
+  }
+
+  bool walkToStmtPre(Stmt *S) override {
+    return S->isImplicit() || !startsNewScope(S);
+  }
+};
+
+class ReferenceCollector : private SourceEntityWalker {
+  SourceManager *SM;
+  llvm::DenseSet<const Decl *> DeclaredDecls;
+  llvm::DenseSet<const Decl *> &ReferencedDecls;
+
+  ASTNode Target;
+  bool AfterTarget;
+
+public:
+  /// Collect all explicit references in \p Scope (or \p SF if \p Scope is
+  /// a nullptr) that are after \p Target and not first declared. That is,
+  /// references that we don't want to shadow with hoisted declarations.
+  ///
+  /// Also collect all declarations that are \c DeclContexts, which is an
+  /// over-appoximation but let's us ignore them elsewhere.
+  static void collect(ASTNode Target, BraceStmt *Scope, SourceFile &SF,
+                      llvm::DenseSet<const Decl *> &Decls) {
+    ReferenceCollector Collector(Target, &SF.getASTContext().SourceMgr,
+                                 Decls);
+    if (Scope)
+      Collector.walk(Scope);
+    else
+      Collector.walk(SF);
+  }
+
+private:
+  ReferenceCollector(ASTNode Target, SourceManager *SM,
+                     llvm::DenseSet<const Decl *> &Decls)
+      : SM(SM), DeclaredDecls(), ReferencedDecls(Decls), Target(Target),
+        AfterTarget(false) {}
+
+  bool walkToDeclPre(Decl *D, CharSourceRange Range) override {
+    // Bit of a hack, include all contexts so they're never renamed (seems worse
+    // to rename a class/function than it does a variable). Again, an
+    // over-approximation, but hopefully doesn't come up too often.
+    if (isa<DeclContext>(D) && !D->isImplicit()) {
+      ReferencedDecls.insert(D);
+    }
+
+    if (AfterTarget && !D->isImplicit()) {
+      DeclaredDecls.insert(D);
+    } else if (D == Target.dyn_cast<Decl *>()) {
+      AfterTarget = true;
+    }
+    return shouldWalkInto(D->getSourceRange());
+  }
+
+  bool walkToExprPre(Expr *E) override {
+    if (AfterTarget && !E->isImplicit()) {
+      if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+        if (auto *D = DRE->getDecl()) {
+          // Only care about references that aren't declared as seen decls will
+          // be renamed (if necessary) during the refactoring.
+          if (!D->isImplicit() && !DeclaredDecls.count(D))
+            ReferencedDecls.insert(D);
+        }
+      }
+    } else if (E == Target.dyn_cast<Expr *>()) {
+      AfterTarget = true;
+    }
+    return shouldWalkInto(E->getSourceRange());
+  }
+
+  bool walkToStmtPre(Stmt *S) override {
+    if (S == Target.dyn_cast<Stmt *>())
+      AfterTarget = true;
+    return shouldWalkInto(S->getSourceRange());
+  }
+
+  std::pair<bool, Pattern *> walkToPatternPre(Pattern *P) {
+    if (P == Target.dyn_cast<Pattern *>())
+      AfterTarget = true;
+    return { shouldWalkInto(P->getSourceRange()), P };
+  }
+
+  bool shouldWalkInto(SourceRange Range) {
+    return AfterTarget || (SM &&
+        SM->rangeContainsTokenLoc(Range, Target.getStartLoc()));
+  }
+};
+
+/// Similar to the \c ReferenceCollector but collects references in all scopes
+/// without any starting point in each scope.
+class ScopedDeclCollector : private SourceEntityWalker {
+public:
+  using DeclsTy = llvm::DenseSet<const Decl *>;
+
+private:
+  using ScopedDeclsTy = llvm::DenseMap<const Stmt *, DeclsTy>;
+
+  struct Scope {
+    DeclsTy DeclaredDecls;
+    DeclsTy *ReferencedDecls;
+    Scope(DeclsTy *ReferencedDecls) : DeclaredDecls(),
+        ReferencedDecls(ReferencedDecls) {}
+  };
+
+  ScopedDeclsTy ReferencedDecls;
+  llvm::SmallVector<Scope, 4> ScopeStack;
+
+public:
+  /// Starting at \c Scope, collect all explicit references in every scope
+  /// within (including the initial) that are not first declared, ie. those that
+  /// could end up shadowed. Also include all \c DeclContext declarations as
+  /// we'd like to avoid renaming functions and types completely.
+  void collect(ASTNode Node) {
+    walk(Node);
+  }
+
+  DeclsTy *getReferencedDecls(Stmt *Scope) {
+    auto Res = ReferencedDecls.find(Scope);
+    if (Res == ReferencedDecls.end())
+      return nullptr;
+    return &Res->second;
+  }
+
+private:
+  bool walkToDeclPre(Decl *D, CharSourceRange Range) override {
+    if (ScopeStack.empty() || D->isImplicit())
+      return true;
+
+    ScopeStack.back().DeclaredDecls.insert(D);
+    if (isa<DeclContext>(D))
+      ScopeStack.back().ReferencedDecls->insert(D);
+    return true;
+  }
+
+  bool walkToExprPre(Expr *E) override {
+    if (ScopeStack.empty())
+      return true;
+
+    if (!E->isImplicit()) {
+      if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+        if (auto *D = DRE->getDecl()) {
+          if (!D->isImplicit() && !ScopeStack.back().DeclaredDecls.count(D))
+            ScopeStack.back().ReferencedDecls->insert(D);
+        }
+      }
+    }
+    return true;
+  }
+
+  bool walkToStmtPre(Stmt *S) override {
+    // Purposely check \c BraceStmt here rather than \c startsNewScope.
+    // References in the condition should be applied to the previous scope, not
+    // the scope of that statement.
+    if (isa<BraceStmt>(S))
+      ScopeStack.emplace_back(&ReferencedDecls[S]);
+    return true;
+  }
+
+  bool walkToStmtPost(Stmt *S) override {
+    if (isa<BraceStmt>(S)) {
+      size_t NumScopes = ScopeStack.size();
+      if (NumScopes >= 2) {
+        // Add any referenced decls to the parent scope that weren't declared
+        // there.
+        auto &ParentStack = ScopeStack[NumScopes - 2];
+        for (auto *D : *ScopeStack.back().ReferencedDecls) {
+          if (!ParentStack.DeclaredDecls.count(D))
+            ParentStack.ReferencedDecls->insert(D);
+        }
+      }
+      ScopeStack.pop_back();
+    }
+    return true;
+  }
+};
+
+/// Builds up async-converted code for an AST node.
+///
+/// If it is a function, its declaration will have `async` added. If a
+/// completion handler is present, it will be removed and the return type of
+/// the function will reflect the parameters of the handler, including an
+/// added `throws` if necessary.
+///
+/// Calls to the completion handler are replaced with either a `return` or
+/// `throws` depending on the arguments.
+///
+/// Calls to functions with an async alternative will be replaced with a call
+/// to the alternative, possibly wrapped in a do/catch. The do/catch is skipped
+/// if the the closure either:
+///   1. Has no error
+///   2. Has an error but no error handling (eg. just ignores)
+///   3. Has error handling that only calls the containing function's handler
+///      with an error matching the error argument
+///
+/// (2) is technically not the correct translation, but in practice it's likely
+/// the code a user would actually want.
+///
+/// If the success vs error handling split inside the closure cannot be
+/// determined and the closure takes regular parameters (ie. not a Result), a
+/// fallback translation is used that keeps all the same variable names and
+/// simply moves the code within the closure out.
+///
+/// The fallback is generally avoided, however, since it's quite unlikely to be
+/// the code the user intended. In most cases the refactoring will continue,
+/// with any unhandled decls wrapped in placeholders instead.
+class AsyncConverter : private SourceEntityWalker {
+  SourceFile *SF;
+  SourceManager &SM;
+  DiagnosticEngine &DiagEngine;
+
+  // Node to convert
+  ASTNode StartNode;
+
+  // Completion handler of `StartNode` (if it's a function with an async
+  // alternative)
+  AsyncHandlerParamDesc TopHandler;
+
+  SmallString<0> Buffer;
+  llvm::raw_svector_ostream OS;
+
+  // Decls where any force unwrap or optional chain of that decl should be
+  // elided, e.g for a previously optional closure parameter that has become a
+  // non-optional local.
+  llvm::DenseSet<const Decl *> Unwraps;
+
+  // Decls whose references should be replaced with, either because they no
+  // longer exist or are a different type. Any replaced code should ideally be
+  // handled by the refactoring properly, but that's not possible in all cases
+  llvm::DenseSet<const Decl *> Placeholders;
+
+  // Mapping from decl -> name, used as the name of possible new local
+  // declarations of old completion handler parametes, as well as the
+  // replacement for other hoisted declarations and their references
+  llvm::DenseMap<const Decl *, Identifier> Names;
+  // Names of decls in each scope, where the first element is the initial scope
+  // and the last is the current scope.
+  llvm::SmallVector<llvm::DenseSet<Identifier>, 4> ScopedNames;
+  // Mapping of \c BraceStmt -> declarations referenced in that statement
+  // without first being declared. These are used to fill the \c ScopeNames
+  // map on entering that scope.
+  ScopedDeclCollector ScopedDecls;
+
+  /// The switch statements that have been re-written by this transform.
+  llvm::DenseSet<SwitchStmt *> HandledSwitches;
+
+  // The last source location that has been output. Used to output the source
+  // between handled nodes
+  SourceLoc LastAddedLoc;
+
+  // Number of expressions (or pattern binding decl) currently nested in, taking
+  // into account hoisting and the possible removal of ifs/switches
+  int NestedExprCount = 0;
+
+  // Whether a completion handler body is currently being hoisted out of its
+  // call
+  bool Hoisting = false;
+
+public:
+  /// Convert a function
+  AsyncConverter(SourceFile *SF, SourceManager &SM,
+                 DiagnosticEngine &DiagEngine, AbstractFunctionDecl *FD,
+                 const AsyncHandlerParamDesc &TopHandler)
+      : SF(SF), SM(SM), DiagEngine(DiagEngine), StartNode(FD),
+        TopHandler(TopHandler), OS(Buffer) {
+    Placeholders.insert(TopHandler.getHandler());
+    ScopedDecls.collect(FD);
+
+    // Shouldn't strictly be necessary, but prefer possible shadowing over
+    // crashes caused by a missing scope
+    addNewScope({});
+  }
+
+  /// Convert a call
+  AsyncConverter(SourceFile *SF, SourceManager &SM,
+                 DiagnosticEngine &DiagEngine, CallExpr *CE, BraceStmt *Scope)
+      : SF(SF), SM(SM), DiagEngine(DiagEngine), StartNode(CE), OS(Buffer) {
+    ScopedDecls.collect(CE);
+
+    // Create the initial scope, can be more accurate than the general
+    // \c ScopedDeclCollector as there is a starting point.
+    llvm::DenseSet<const Decl *> UsedDecls;
+    DeclCollector::collect(Scope, *SF, UsedDecls);
+    ReferenceCollector::collect(StartNode, Scope, *SF, UsedDecls);
+    addNewScope(UsedDecls);
+  }
+
+  ASTContext &getASTContext() const { return SF->getASTContext(); }
+
+  bool convert() {
+    assert(Buffer.empty() && "AsyncConverter can only be used once");
+
+    if (auto *FD = dyn_cast_or_null<FuncDecl>(StartNode.dyn_cast<Decl *>())) {
+      addFuncDecl(FD);
+      if (FD->getBody()) {
+        convertNode(FD->getBody());
+      }
+    } else {
+      convertNode(StartNode);
+    }
+    return !DiagEngine.hadAnyError();
+  }
+
+  /// When adding an async alternative method for the function declaration \c
+  /// FD, this function tries to create a function body for the legacy function
+  /// (the one with a completion handler), which calls the newly converted async
+  /// function. There are certain situations in which we fail to create such a
+  /// body, e.g. if the completion handler has the signature `(String, Error?)
+  /// -> Void` in which case we can't synthesize the result of type \c String in
+  /// the error case.
+  bool createLegacyBody() {
+    assert(Buffer.empty() &&
+           "AsyncConverter can only be used once");
+    if (!canCreateLegacyBody()) {
+      return false;
+    }
+    FuncDecl *FD = cast<FuncDecl>(StartNode.get<Decl *>());
+
+    OS << tok::l_brace << "\n"; // start function body
+    OS << "async " << tok::l_brace << "\n";
+    addHoistedNamedCallback(FD, TopHandler, TopHandler.getNameStr(), [&]() {
+      if (TopHandler.HasError) {
+        OS << tok::kw_try << " ";
+      }
+      OS << "await ";
+      addCallToAsyncMethod(FD, TopHandler);
+    });
+    OS << "\n";
+    OS << tok::r_brace << "\n"; // end 'async'
+    OS << tok::r_brace << "\n"; // end function body
+    return true;
+  }
+
+  /// Creates an async alternative function that forwards onto the completion
+  /// handler function through
+  /// withCheckedContinuation/withCheckedThrowingContinuation.
+  bool createAsyncWrapper() {
+    assert(Buffer.empty() && "AsyncConverter can only be used once");
+    auto *FD = cast<FuncDecl>(StartNode.get<Decl *>());
+
+    // First add the new async function declaration.
+    addFuncDecl(FD);
+    OS << tok::l_brace << "\n";
+
+    // Then add the body.
+    OS << tok::kw_return << " ";
+    if (TopHandler.HasError)
+      OS << tok::kw_try << " ";
+
+    OS << "await ";
+
+    // withChecked[Throwing]Continuation { cont in
+    if (TopHandler.HasError) {
+      OS << "withCheckedThrowingContinuation";
+    } else {
+      OS << "withCheckedContinuation";
+    }
+    OS << " " << tok::l_brace << " cont " << tok::kw_in << "\n";
+
+    // fnWithHandler(args...) { ... }
+    auto ClosureStr = getAsyncWrapperCompletionClosure("cont", TopHandler);
+    addForwardingCallTo(FD, TopHandler, /*HandlerReplacement*/ ClosureStr);
+
+    OS << tok::r_brace << "\n"; // end continuation closure
+    OS << tok::r_brace << "\n"; // end function body
+    return true;
+  }
+
+  void replace(ASTNode Node, SourceEditConsumer &EditConsumer,
+               SourceLoc StartOverride = SourceLoc()) {
+    SourceRange Range = Node.getSourceRange();
+    if (StartOverride.isValid()) {
+      Range = SourceRange(StartOverride, Range.End);
+    }
+    CharSourceRange CharRange =
+        Lexer::getCharSourceRangeFromSourceRange(SM, Range);
+    EditConsumer.accept(SM, CharRange, Buffer.str());
+    Buffer.clear();
+  }
+
+  void insertAfter(ASTNode Node, SourceEditConsumer &EditConsumer) {
+    EditConsumer.insertAfter(SM, Node.getEndLoc(), "\n\n");
+    EditConsumer.insertAfter(SM, Node.getEndLoc(), Buffer.str());
+    Buffer.clear();
+  }
+
+private:
+  bool canCreateLegacyBody() {
+    FuncDecl *FD = dyn_cast<FuncDecl>(StartNode.dyn_cast<Decl *>());
+    if (!FD) {
+      return false;
+    }
+    if (FD == nullptr || FD->getBody() == nullptr) {
+      return false;
+    }
+    if (FD->hasThrows()) {
+      assert(!TopHandler.isValid() && "We shouldn't have found a handler desc "
+                                       "if the original function throws");
+      return false;
+    }
+    return TopHandler.isValid();
+  }
+
+  /// Prints a tuple of elements, or a lone single element if only one is
+  /// present, using the provided printing function.
+  template <typename T, typename PrintFn>
+  void addTupleOf(ArrayRef<T> Elements, llvm::raw_ostream &OS,
+                  PrintFn PrintElt) {
+    if (Elements.size() == 1) {
+      PrintElt(Elements[0]);
+      return;
+    }
+    OS << tok::l_paren;
+    llvm::interleave(Elements, PrintElt, [&]() { OS << tok::comma << " "; });
+    OS << tok::r_paren;
+  }
+
+  /// Retrieve the completion handler closure argument for an async wrapper
+  /// function.
+  std::string
+  getAsyncWrapperCompletionClosure(StringRef ContName,
+                                   const AsyncHandlerParamDesc &HandlerDesc) {
+    std::string OutputStr;
+    llvm::raw_string_ostream OS(OutputStr);
+
+    OS << " " << tok::l_brace; // start closure
+
+    // Prepare parameter names for the closure.
+    auto SuccessParams = HandlerDesc.getSuccessParams();
+    SmallVector<SmallString<4>, 2> SuccessParamNames;
+    for (auto idx : indices(SuccessParams)) {
+      SuccessParamNames.emplace_back("res");
+
+      // If we have multiple success params, number them e.g res1, res2...
+      if (SuccessParams.size() > 1)
+        SuccessParamNames.back().append(std::to_string(idx + 1));
+    }
+    Optional<SmallString<4>> ErrName;
+    if (HandlerDesc.getErrorParam())
+      ErrName.emplace("err");
+
+    auto HasAnyParams = !SuccessParamNames.empty() || ErrName;
+    if (HasAnyParams)
+      OS << " ";
+
+    // res1, res2
+    llvm::interleave(
+        SuccessParamNames, [&](auto Name) { OS << Name; },
+        [&]() { OS << tok::comma << " "; });
+
+    // , err
+    if (ErrName) {
+      if (!SuccessParamNames.empty())
+        OS << tok::comma << " ";
+
+      OS << *ErrName;
+    }
+    if (HasAnyParams)
+      OS << " " << tok::kw_in;
+
+    OS << "\n";
+
+    // The closure body.
+    switch (HandlerDesc.Type) {
+    case HandlerType::PARAMS: {
+      // For a (Success?, Error?) -> Void handler, we do an if let on the error.
+      if (ErrName) {
+        // if let err = err {
+        OS << tok::kw_if << " " << tok::kw_let << " ";
+        OS << *ErrName << " " << tok::equal << " " << *ErrName << " ";
+        OS << tok::l_brace << "\n";
+
+        // cont.resume(throwing: err)
+        OS << ContName << tok::period << "resume" << tok::l_paren;
+        OS << "throwing" << tok::colon << " " << *ErrName;
+        OS << tok::r_paren << "\n";
+
+        // return }
+        OS << tok::kw_return << "\n";
+        OS << tok::r_brace << "\n";
+      }
+
+      // If we have any success params that we need to unwrap, insert a guard.
+      for (auto Idx : indices(SuccessParamNames)) {
+        auto &Name = SuccessParamNames[Idx];
+        auto ParamTy = SuccessParams[Idx].getParameterType();
+        if (!HandlerDesc.shouldUnwrap(ParamTy))
+          continue;
+
+        // guard let res = res else {
+        OS << tok::kw_guard << " " << tok::kw_let << " ";
+        OS << Name << " " << tok::equal << " " << Name << " " << tok::kw_else;
+        OS << " " << tok::l_brace << "\n";
+
+        // fatalError(...)
+        OS << "fatalError" << tok::l_paren;
+        OS << "\"Expected non-nil success param '" << Name;
+        OS << "' for nil error\"";
+        OS << tok::r_paren << "\n";
+
+        // End guard.
+        OS << tok::r_brace << "\n";
+      }
+
+      // cont.resume(returning: (res1, res2, ...))
+      OS << ContName << tok::period << "resume" << tok::l_paren;
+      OS << "returning" << tok::colon << " ";
+      addTupleOf(llvm::makeArrayRef(SuccessParamNames), OS,
+                 [&](auto Ref) { OS << Ref; });
+      OS << tok::r_paren << "\n";
+      break;
+    }
+    case HandlerType::RESULT: {
+      // cont.resume(with: res)
+      assert(SuccessParamNames.size() == 1);
+      OS << ContName << tok::period << "resume" << tok::l_paren;
+      OS << "with" << tok::colon << " " << SuccessParamNames[0];
+      OS << tok::r_paren << "\n";
+      break;
+    }
+    case HandlerType::INVALID:
+      llvm_unreachable("Should not have an invalid handler here");
+    }
+
+    OS << tok::r_brace << "\n"; // end closure
+    return OutputStr;
+  }
+
+  /// Retrieves the location for the start of a comment attached to the token
+  /// at the provided location, or the location itself if there is no comment.
+  SourceLoc getLocIncludingPrecedingComment(SourceLoc loc) {
+    auto tokens = SF->getAllTokens();
+    auto tokenIter = token_lower_bound(tokens, loc);
+    if (tokenIter != tokens.end() && tokenIter->hasComment())
+      return tokenIter->getCommentStart();
+    return loc;
+  }
+
+  /// If the provided SourceLoc has a preceding comment, print it out. Returns
+  /// true if a comment was printed, false otherwise.
+  bool printCommentIfNeeded(SourceLoc Loc, bool AddNewline = false) {
+    auto PrecedingLoc = getLocIncludingPrecedingComment(Loc);
+    if (Loc == PrecedingLoc)
+      return false;
+    if (AddNewline)
+      OS << "\n";
+    OS << CharSourceRange(SM, PrecedingLoc, Loc).str();
+    return true;
+  }
+
+  void convertNodes(const NodesToPrint &ToPrint) {
+    // Sort the possible comment locs in reverse order so we can pop them as we
+    // go.
+    SmallVector<SourceLoc, 2> CommentLocs;
+    CommentLocs.append(ToPrint.getPossibleCommentLocs().begin(),
+                       ToPrint.getPossibleCommentLocs().end());
+    llvm::sort(CommentLocs.begin(), CommentLocs.end(), [](auto lhs, auto rhs) {
+      return lhs.getOpaquePointerValue() > rhs.getOpaquePointerValue();
+    });
+
+    // First print the nodes we've been asked to print.
+    for (auto Node : ToPrint.getNodes()) {
+      OS << "\n";
+
+      // If we need to print comments, do so now.
+      while (!CommentLocs.empty()) {
+        auto CommentLoc = CommentLocs.back().getOpaquePointerValue();
+        auto NodeLoc = Node.getStartLoc().getOpaquePointerValue();
+        assert(CommentLoc != NodeLoc &&
+               "Added node to both comment locs and nodes to print?");
+
+        // If the comment occurs after the node, don't print now. Wait until
+        // the right node comes along.
+        if (CommentLoc > NodeLoc)
+          break;
+
+        printCommentIfNeeded(CommentLocs.pop_back_val());
+      }
+      convertNode(Node);
+    }
+
+    // We're done printing nodes. Make sure to output the remaining comments.
+    bool HasPrintedComment = false;
+    while (!CommentLocs.empty()) {
+      HasPrintedComment |=
+          printCommentIfNeeded(CommentLocs.pop_back_val(),
+                               /*AddNewline*/ !HasPrintedComment);
+    }
+  }
+
+  void convertNode(ASTNode Node, SourceLoc StartOverride = {},
+                   bool ConvertCalls = true) {
+    if (!StartOverride.isValid())
+      StartOverride = Node.getStartLoc();
+
+    // Unless this is the start node, make sure to include any preceding
+    // comments attached to the loc. If it's the start node, the attached
+    // comment is outside the range of the transform.
+    if (Node != StartNode)
+      StartOverride = getLocIncludingPrecedingComment(StartOverride);
+
+    llvm::SaveAndRestore<SourceLoc> RestoreLoc(LastAddedLoc, StartOverride);
+    llvm::SaveAndRestore<int> RestoreCount(NestedExprCount,
+                                           ConvertCalls ? 0 : 1);
+
+    walk(Node);
+    addRange(LastAddedLoc, Node.getEndLoc(), /*ToEndOfToken=*/true);
+  }
+
+  bool walkToDeclPre(Decl *D, CharSourceRange Range) override {
+    if (isa<PatternBindingDecl>(D)) {
+      NestedExprCount++;
+      return true;
+    }
+
+    // Functions and types already have their names in \c ScopedNames, only
+    // variables should need to be renamed.
+    if (isa<VarDecl>(D) && Names.find(D) == Names.end()) {
+      Identifier Ident = assignUniqueName(D, StringRef());
+      if (!Ident.empty()) {
+        ScopedNames.back().insert(Ident);
+        addCustom(D->getSourceRange(), [&]() {
+          OS << Ident.str();
+        });
+      }
+    }
+
+    // Note we don't walk into any nested local function decls. If we start
+    // doing so in the future, be sure to update the logic that deals with
+    // converting unhandled returns into placeholders in walkToStmtPre.
+    return false;
+  }
+
+  bool walkToDeclPost(Decl *D) override {
+    NestedExprCount--;
+    return true;
+  }
+
+#define PLACEHOLDER_START "<#"
+#define PLACEHOLDER_END "#>"
+  bool walkToExprPre(Expr *E) override {
+    // TODO: Handle Result.get as well
+    if (auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      if (auto *D = DRE->getDecl()) {
+        bool AddPlaceholder = Placeholders.count(D);
+        StringRef Name = newNameFor(D, false);
+        if (AddPlaceholder || !Name.empty())
+          return addCustom(DRE->getSourceRange(), [&]() {
+            if (AddPlaceholder)
+              OS << PLACEHOLDER_START;
+            if (!Name.empty())
+              OS << Name;
+            else
+              D->getName().print(OS);
+            if (AddPlaceholder)
+              OS << PLACEHOLDER_END;
+          });
+      }
+    } else if (isa<ForceValueExpr>(E) || isa<BindOptionalExpr>(E)) {
+      // Remove a force unwrap or optional chain of a returned success value,
+      // as it will no longer be optional. For force unwraps, this is always a
+      // valid transform. For optional chains, it is a locally valid transform
+      // within the optional chain e.g foo?.x -> foo.x, but may change the type
+      // of the overall chain, which could cause errors elsewhere in the code.
+      // However this is generally more useful to the user than just leaving
+      // 'foo' as a placeholder. Note this is only the case when no other
+      // optionals are involved in the chain, e.g foo?.x?.y -> foo.x?.y is
+      // completely valid.
+      if (auto *D = E->getReferencedDecl().getDecl()) {
+        if (Unwraps.count(D))
+          return addCustom(E->getSourceRange(),
+                           [&]() { OS << newNameFor(D, true); });
+      }
+    } else if (NestedExprCount == 0) {
+      if (CallExpr *CE = TopHandler.getAsHandlerCall(E))
+        return addCustom(CE->getSourceRange(), [&]() { addHandlerCall(CE); });
+
+      if (auto *CE = dyn_cast<CallExpr>(E)) {
+        // If the refactoring is on the call itself, do not require the callee
+        // to have the @completionHandlerAsync attribute or a completion-like
+        // name.
+        auto HandlerDesc = AsyncHandlerParamDesc::find(
+            getUnderlyingFunc(CE->getFn()),
+            /*RequireAttributeOrName=*/StartNode.dyn_cast<Expr *>() != CE);
+        if (HandlerDesc.isValid())
+          return addCustom(CE->getSourceRange(),
+                           [&]() { addHoistedCallback(CE, HandlerDesc); });
+      }
+    }
+
+    NestedExprCount++;
+    return true;
+  }
+
+  bool replaceRangeWithPlaceholder(SourceRange range) {
+    return addCustom(range, [&]() {
+      OS << PLACEHOLDER_START;
+      addRange(range, /*toEndOfToken*/ true);
+      OS << PLACEHOLDER_END;
+    });
+  }
+
+  bool walkToExprPost(Expr *E) override {
+    NestedExprCount--;
+    return true;
+  }
+
+#undef PLACEHOLDER_START
+#undef PLACEHOLDER_END
+
+  bool walkToStmtPre(Stmt *S) override {
+    // CaseStmt has an implicit BraceStmt inside it, which *should* start a new
+    // scope, so don't check isImplicit here.
+    if (startsNewScope(S)) {
+      // Add all names of decls referenced within this statement that aren't
+      // also declared first, plus any contexts. Note that \c getReferencedDecl
+      // will only return a value for a \c BraceStmt. This means that \c IfStmt
+      // (and other statements with conditions) will have their own empty scope,
+      // which is fine for our purposes - their existing names are always valid.
+      // The body of those statements will include the decls if they've been
+      // referenced, so shadowing is still avoided there.
+      if (auto *ReferencedDecls = ScopedDecls.getReferencedDecls(S)) {
+        addNewScope(*ReferencedDecls);
+      } else {
+        addNewScope({});
+      }
+    } else if (Hoisting && !S->isImplicit()) {
+      // Some break and return statements need to be turned into placeholders,
+      // as they may no longer perform the control flow that the user is
+      // expecting.
+      if (auto *BS = dyn_cast<BreakStmt>(S)) {
+        // For a break, if it's jumping out of a switch statement that we've
+        // re-written as a part of the transform, turn it into a placeholder, as
+        // it would have been lifted out of the switch statement.
+        if (auto *SS = dyn_cast<SwitchStmt>(BS->getTarget())) {
+          if (HandledSwitches.contains(SS))
+            return replaceRangeWithPlaceholder(S->getSourceRange());
+        }
+      } else if (isa<ReturnStmt>(S) && NestedExprCount == 0) {
+        // For a return, if it's not nested inside another closure or function,
+        // turn it into a placeholder, as it will be lifted out of the callback.
+        // Note that we only turn the 'return' token into a placeholder as we
+        // still want to be able to apply transforms to the argument.
+        replaceRangeWithPlaceholder(S->getStartLoc());
+      }
+    }
+    return true;
+  }
+
+  bool walkToStmtPost(Stmt *S) override {
+    if (startsNewScope(S))
+      ScopedNames.pop_back();
+    return true;
+  }
+
+  bool addCustom(SourceRange Range, std::function<void()> Custom = {}) {
+    addRange(LastAddedLoc, Range.Start);
+    Custom();
+    LastAddedLoc = Lexer::getLocForEndOfToken(SM, Range.End);
+    return false;
+  }
+
+  void addRange(SourceLoc Start, SourceLoc End, bool ToEndOfToken = false) {
+    if (ToEndOfToken) {
+      OS << Lexer::getCharSourceRangeFromSourceRange(SM,
+                                                     SourceRange(Start, End))
+                .str();
+    } else {
+      OS << CharSourceRange(SM, Start, End).str();
+    }
+  }
+
+  void addRange(SourceRange Range, bool ToEndOfToken = false) {
+    addRange(Range.Start, Range.End, ToEndOfToken);
+  }
+
+  void addFuncDecl(const FuncDecl *FD) {
+    auto *Params = FD->getParameters();
+
+    // First chunk: start -> the parameter to remove (if any)
+    SourceLoc LeftEndLoc = Params->getLParenLoc().getAdvancedLoc(1);
+    if (TopHandler.Index - 1 >= 0) {
+      LeftEndLoc = Lexer::getLocForEndOfToken(
+          SM, Params->get(TopHandler.Index - 1)->getEndLoc());
+    }
+    addRange(FD->getSourceRangeIncludingAttrs().Start, LeftEndLoc);
+
+    // Second chunk: end of the parameter to remove -> right parenthesis
+    SourceLoc MidStartLoc = LeftEndLoc;
+    SourceLoc MidEndLoc = Params->getRParenLoc().getAdvancedLoc(1);
+    if (TopHandler.isValid()) {
+      if ((size_t)(TopHandler.Index + 1) < Params->size()) {
+        MidStartLoc = Params->get(TopHandler.Index + 1)->getStartLoc();
+      } else {
+        MidStartLoc = Params->getRParenLoc();
+      }
+    }
+    addRange(MidStartLoc, MidEndLoc);
+
+    // Third chunk: add in async and throws if necessary
+    OS << " async";
+    if (FD->hasThrows() || TopHandler.HasError)
+      // TODO: Add throws if converting a function and it has a converted call
+      //       without a do/catch
+      OS << " " << tok::kw_throws;
+
+    // Fourth chunk: if no parent handler (ie. not adding an async
+    // alternative), the rest of the decl. Otherwise, add in the new return
+    // type
+    if (!TopHandler.isValid()) {
+      SourceLoc RightStartLoc = MidEndLoc;
+      if (FD->hasThrows()) {
+        RightStartLoc = Lexer::getLocForEndOfToken(SM, FD->getThrowsLoc());
+      }
+      SourceLoc RightEndLoc =
+          FD->getBody() ? FD->getBody()->getLBraceLoc() : RightStartLoc;
+      addRange(RightStartLoc, RightEndLoc);
+      return;
+    }
+
+    SmallVector<Type, 2> Scratch;
+    auto ReturnTypes = TopHandler.getAsyncReturnTypes(Scratch);
+    if (ReturnTypes.empty()) {
+      OS << " ";
+      return;
+    }
+
+    // Print the function result type, making sure to omit a '-> Void' return.
+    if (!TopHandler.willAsyncReturnVoid()) {
+      OS << " -> ";
+      if (ReturnTypes.size() > 1)
+        OS << "(";
+
+      llvm::interleave(
+          ReturnTypes, [&](Type Ty) { Ty->print(OS); }, [&]() { OS << ", "; });
+
+      if (ReturnTypes.size() > 1)
+        OS << ")";
+    }
+
+    if (FD->hasBody())
+      OS << " ";
+
+    // TODO: Should remove the generic param and where clause for the error
+    //       param if it exists (and no other parameter uses that type)
+    TrailingWhereClause *TWC = FD->getTrailingWhereClause();
+    if (TWC && TWC->getWhereLoc().isValid()) {
+      auto Range = TWC->getSourceRange();
+      OS << Lexer::getCharSourceRangeFromSourceRange(SM, Range).str();
+      if (FD->hasBody())
+        OS << " ";
+    }
+  }
+
+  void addFallbackVars(ArrayRef<const ParamDecl *> FallbackParams,
+                       ClassifiedBlocks &Blocks) {
+    for (auto Param : FallbackParams) {
+      OS << tok::kw_var << " " << newNameFor(Param) << ": ";
+      auto Ty = Param->getType();
+      Ty->print(OS);
+      if (!Ty->getOptionalObjectType())
+        OS << "?";
+
+      OS << " = " << tok::kw_nil << "\n";
+    }
+  }
+
+  void addDo() { OS << tok::kw_do << " " << tok::l_brace << "\n"; }
+
+  void addHandlerCall(const CallExpr *CE) {
+    auto Exprs = TopHandler.extractResultArgs(CE);
+
+    bool AddedReturnOrThrow = true;
+    if (!Exprs.isError()) {
+      // It's possible the user has already written an explicit return statement
+      // for the completion handler call, e.g 'return completion(args...)'. In
+      // that case, be sure not to add another return.
+      auto *parent = getWalker().Parent.getAsStmt();
+      AddedReturnOrThrow = !(parent && isa<ReturnStmt>(parent));
+      if (AddedReturnOrThrow)
+        OS << tok::kw_return;
+    } else {
+      OS << tok::kw_throw;
+    }
+
+    ArrayRef<Expr *> Args = Exprs.args();
+    if (!Args.empty()) {
+      if (AddedReturnOrThrow)
+        OS << " ";
+      if (Args.size() > 1)
+        OS << tok::l_paren;
+      for (size_t I = 0, E = Args.size(); I < E; ++I) {
+        if (I > 0)
+          OS << tok::comma << " ";
+        // Can't just add the range as we need to perform replacements
+        convertNode(Args[I], /*StartOverride=*/CE->getArgumentLabelLoc(I),
+                    /*ConvertCalls=*/false);
+      }
+      if (Args.size() > 1)
+        OS << tok::r_paren;
+    }
+  }
+
+  /// From the given expression \p E, which is an argument to a function call,
+  /// extract the passed closure if there is one. Otherwise return \c nullptr.
+  ClosureExpr *extractCallback(Expr *E) {
+    E = lookThroughFunctionConversionExpr(E);
+    if (auto Closure = dyn_cast<ClosureExpr>(E)) {
+      return Closure;
+    } else if (auto CaptureList = dyn_cast<CaptureListExpr>(E)) {
+      return CaptureList->getClosureBody();
+    } else {
+      return nullptr;
+    }
+  }
+
+  /// Callback arguments marked as e.g. `@convention(block)` produce arguments
+  /// that are `FunctionConversionExpr`.
+  /// We don't care about the conversions and want to shave them off.
+  Expr *lookThroughFunctionConversionExpr(Expr *E) {
+    if (auto FunctionConversion = dyn_cast<FunctionConversionExpr>(E)) {
+      return lookThroughFunctionConversionExpr(
+          FunctionConversion->getSubExpr());
+    } else {
+      return E;
+    }
+  }
+
+  void addHoistedCallback(const CallExpr *CE,
+                          const AsyncHandlerParamDesc &HandlerDesc) {
+    llvm::SaveAndRestore<bool> RestoreHoisting(Hoisting, true);
+
+    auto ArgList = callArgs(CE);
+    if ((size_t)HandlerDesc.Index >= ArgList.ref().size()) {
+      DiagEngine.diagnose(CE->getStartLoc(), diag::missing_callback_arg);
+      return;
+    }
+
+    Expr *CallbackArg =
+        lookThroughFunctionConversionExpr(ArgList.ref()[HandlerDesc.Index]);
+    if (ClosureExpr *Callback = extractCallback(CallbackArg)) {
+      // The user is using a closure for the completion handler
+      addHoistedClosureCallback(CE, HandlerDesc, Callback, ArgList);
+      return;
+    }
+    if (auto CallbackDecl = getReferencedDecl(CallbackArg)) {
+      if (CallbackDecl == TopHandler.getHandler()) {
+        // We are refactoring the function that declared the completion handler
+        // that would be called here. We can't call the completion handler
+        // anymore because it will be removed. But since the function that
+        // declared it is being refactored to async, we can just return the
+        // values.
+        if (!HandlerDesc.willAsyncReturnVoid()) {
+          OS << tok::kw_return << " ";
+        }
+        addAwaitCall(CE, ArgList.ref(), ClassifiedBlock(), {}, HandlerDesc,
+                     /*AddDeclarations=*/false);
+        return;
+      }
+      // We are not removing the completion handler, so we can call it once the
+      // async function returns.
+
+      // The completion handler that is called as part of the \p CE call.
+      // This will be called once the async function returns.
+      auto CompletionHandler =
+          AsyncHandlerDesc::get(CallbackDecl, /*RequireAttributeOrName=*/false);
+      if (CompletionHandler.isValid()) {
+        if (auto CalledFunc = getUnderlyingFunc(CE->getFn())) {
+          StringRef HandlerName = Lexer::getCharSourceRangeFromSourceRange(
+                                      SM, CallbackArg->getSourceRange())
+                                      .str();
+          addHoistedNamedCallback(
+              CalledFunc, CompletionHandler, HandlerName, [&] {
+                addAwaitCall(CE, ArgList.ref(), ClassifiedBlock(), {},
+                             HandlerDesc, /*AddDeclarations=*/false);
+              });
+          return;
+        }
+      }
+    }
+    DiagEngine.diagnose(CE->getStartLoc(), diag::missing_callback_arg);
+  }
+
+  /// Add a call to the async alternative of \p CE and convert the \p Callback
+  /// to be executed after the async call. \p HandlerDesc describes the
+  /// completion handler in the function that's called by \p CE and \p ArgList
+  /// are the arguments being passed in \p CE.
+  void addHoistedClosureCallback(const CallExpr *CE,
+                                 const AsyncHandlerDesc &HandlerDesc,
+                                 const ClosureExpr *Callback,
+                                 PtrArrayRef<Expr *> ArgList) {
+    ArrayRef<const ParamDecl *> CallbackParams =
+        Callback->getParameters()->getArray();
+    auto CallbackBody = Callback->getBody();
+    if (HandlerDesc.params().size() != CallbackParams.size()) {
+      DiagEngine.diagnose(CE->getStartLoc(), diag::mismatched_callback_args);
+      return;
+    }
+
+    // Note that the `ErrParam` may be a Result (in which case it's also the
+    // only element in `SuccessParams`)
+    ArrayRef<const ParamDecl *> SuccessParams = CallbackParams;
+    const ParamDecl *ErrParam = nullptr;
+    if (HandlerDesc.Type == HandlerType::RESULT) {
+      ErrParam = SuccessParams.back();
+    } else if (HandlerDesc.HasError) {
+      assert(HandlerDesc.Type == HandlerType::PARAMS);
+      ErrParam = SuccessParams.back();
+      SuccessParams = SuccessParams.drop_back();
+    }
+
+    ClassifiedBlocks Blocks;
+    if (!HandlerDesc.HasError) {
+      Blocks.SuccessBlock.addNodesInBraceStmt(CallbackBody);
+    } else if (!CallbackBody->getElements().empty()) {
+      llvm::DenseSet<const Decl *> UnwrapParams;
+      for (auto *Param : SuccessParams) {
+        if (HandlerDesc.shouldUnwrap(Param->getType()))
+          UnwrapParams.insert(Param);
+      }
+      if (ErrParam)
+        UnwrapParams.insert(ErrParam);
+      CallbackClassifier::classifyInto(Blocks, HandledSwitches, DiagEngine,
+                                       UnwrapParams, ErrParam, HandlerDesc.Type,
+                                       CallbackBody);
+    }
+
+    if (DiagEngine.hadAnyError()) {
+      // Can only fallback when the results are params, in which case only
+      // the names are used (defaulted to the names of the params if none)
+      if (HandlerDesc.Type != HandlerType::PARAMS)
+        return;
+      DiagEngine.resetHadAnyError();
+
+      // Don't do any unwrapping or placeholder replacement since all params
+      // are still valid in the fallback case
+      prepareNames(ClassifiedBlock(), CallbackParams);
+
+      addFallbackVars(CallbackParams, Blocks);
+      addDo();
+      addAwaitCall(CE, ArgList.ref(), Blocks.SuccessBlock, SuccessParams,
+                   HandlerDesc, /*AddDeclarations=*/!HandlerDesc.HasError);
+      addFallbackCatch(ErrParam);
+      OS << "\n";
+      convertNodes(NodesToPrint::inBraceStmt(CallbackBody));
+
+      clearNames(CallbackParams);
+      return;
+    }
+
+    auto ErrorNodes = Blocks.ErrorBlock.nodesToPrint().getNodes();
+    bool RequireDo = !ErrorNodes.empty();
+    // Check if we *actually* need a do/catch (see class comment)
+    if (ErrorNodes.size() == 1) {
+      auto Node = ErrorNodes[0];
+      if (auto *HandlerCall = TopHandler.getAsHandlerCall(Node)) {
+        auto Res = TopHandler.extractResultArgs(HandlerCall);
+        if (Res.args().size() == 1) {
+          // Skip if we have the param itself or the name it's bound to
+          auto *SingleDecl = Res.args()[0]->getReferencedDecl().getDecl();
+          auto ErrName = Blocks.ErrorBlock.boundName(ErrParam);
+          RequireDo = SingleDecl != ErrParam &&
+                      !(Res.isError() && SingleDecl &&
+                        SingleDecl->getName().isSimpleName(ErrName));
+        }
+      }
+    }
+
+    // If we're not requiring a 'do', we'll be dropping the error block. But
+    // let's make sure we at least preserve the comments in the error block by
+    // transplanting them into the success block. This should make sure they
+    // maintain a sensible ordering.
+    if (!RequireDo) {
+      auto ErrorNodes = Blocks.ErrorBlock.nodesToPrint();
+      for (auto CommentLoc : ErrorNodes.getPossibleCommentLocs())
+        Blocks.SuccessBlock.addPossibleCommentLoc(CommentLoc);
+    }
+
+    if (RequireDo) {
+      addDo();
+    }
+
+    prepareNames(Blocks.SuccessBlock, SuccessParams);
+    preparePlaceholdersAndUnwraps(HandlerDesc, SuccessParams, ErrParam,
+                                  /*Success=*/true);
+
+    addAwaitCall(CE, ArgList.ref(), Blocks.SuccessBlock, SuccessParams,
+                 HandlerDesc, /*AddDeclarations=*/true);
+    convertNodes(Blocks.SuccessBlock.nodesToPrint());
+    clearNames(SuccessParams);
+
+    if (RequireDo) {
+      // Always use the ErrParam name if none is bound
+      prepareNames(Blocks.ErrorBlock, llvm::makeArrayRef(ErrParam),
+                   HandlerDesc.Type != HandlerType::RESULT);
+      preparePlaceholdersAndUnwraps(HandlerDesc, SuccessParams, ErrParam,
+                                    /*Success=*/false);
+
+      addCatch(ErrParam);
+      convertNodes(Blocks.ErrorBlock.nodesToPrint());
+      OS << "\n" << tok::r_brace;
+      clearNames(llvm::makeArrayRef(ErrParam));
+    }
+  }
+
+  /// Add a call to the async alternative of \p FD. Afterwards, pass the results
+  /// of the async call to the completion handler, named \p HandlerName and
+  /// described by \p HandlerDesc.
+  /// \p AddAwaitCall adds the call to the refactored async method to the output
+  /// stream without storing the result to any variables.
+  /// This is used when the user didn't use a closure for the callback, but
+  /// passed in a variable or function name for the completion handler.
+  void addHoistedNamedCallback(const FuncDecl *FD,
+                               const AsyncHandlerDesc &HandlerDesc,
+                               StringRef HandlerName,
+                               std::function<void(void)> AddAwaitCall) {
+    if (HandlerDesc.HasError) {
+      // "result" and "error" always okay to use here since they're added
+      // in their own scope, which only contains new code.
+      addDo();
+      if (!HandlerDesc.willAsyncReturnVoid()) {
+        OS << tok::kw_let << " result";
+        addResultTypeAnnotationIfNecessary(FD, HandlerDesc);
+        OS << " " << tok::equal << " ";
+      }
+      AddAwaitCall();
+      OS << "\n";
+      addCallToCompletionHandler("result", HandlerDesc, HandlerName);
+      OS << "\n";
+      OS << tok::r_brace << " " << tok::kw_catch << " " << tok::l_brace << "\n";
+      addCallToCompletionHandler(StringRef(), HandlerDesc, HandlerName);
+      OS << "\n" << tok::r_brace; // end catch
+    } else {
+      // This code may be placed into an existing scope, in that case create
+      // a unique "result" name so that it doesn't cause shadowing or redecls.
+      StringRef ResultName;
+      if (!HandlerDesc.willAsyncReturnVoid()) {
+        Identifier Unique = createUniqueName("result");
+        ScopedNames.back().insert(Unique);
+        ResultName = Unique.str();
+
+        OS << tok::kw_let << " " << ResultName;
+        addResultTypeAnnotationIfNecessary(FD, HandlerDesc);
+        OS << " " << tok::equal << " ";
+      } else {
+        // The name won't end up being used, just give it a bogus one so that
+        // the result path is taken (versus the error path).
+        ResultName = "result";
+      }
+      AddAwaitCall();
+      OS << "\n";
+      addCallToCompletionHandler(ResultName, HandlerDesc, HandlerName);
+    }
+  }
+
+  void addAwaitCall(const CallExpr *CE, ArrayRef<Expr *> Args,
+                    const ClassifiedBlock &SuccessBlock,
+                    ArrayRef<const ParamDecl *> SuccessParams,
+                    const AsyncHandlerDesc &HandlerDesc, bool AddDeclarations) {
+    // Print the bindings to match the completion handler success parameters,
+    // making sure to omit in the case of a Void return.
+    if (!SuccessParams.empty() && !HandlerDesc.willAsyncReturnVoid()) {
+      if (AddDeclarations) {
+        if (SuccessBlock.allLet()) {
+          OS << tok::kw_let;
+        } else {
+          OS << tok::kw_var;
+        }
+        OS << " ";
+      }
+      // 'res =' or '(res1, res2, ...) ='
+      addTupleOf(SuccessParams, OS,
+                 [&](auto &Param) { OS << newNameFor(Param); });
+      OS << " " << tok::equal << " ";
+    }
+
+    if (HandlerDesc.HasError) {
+      OS << tok::kw_try << " ";
+    }
+    OS << "await ";
+    addRange(CE->getStartLoc(), CE->getFn()->getEndLoc(),
+             /*ToEndOfToken=*/true);
+
+    OS << tok::l_paren;
+    size_t realArgCount = 0;
+    for (size_t I = 0, E = Args.size() - 1; I < E; ++I) {
+      if (isa<DefaultArgumentExpr>(Args[I]))
+        continue;
+
+      if (realArgCount > 0)
+        OS << tok::comma << " ";
+      // Can't just add the range as we need to perform replacements
+      convertNode(Args[I], /*StartOverride=*/CE->getArgumentLabelLoc(I),
+                  /*ConvertCalls=*/false);
+      realArgCount++;
+    }
+    OS << tok::r_paren;
+  }
+
+  void addFallbackCatch(const ParamDecl *ErrParam) {
+    auto ErrName = newNameFor(ErrParam);
+    OS << "\n"
+       << tok::r_brace << " " << tok::kw_catch << " " << tok::l_brace << "\n"
+       << ErrName << " = error\n"
+       << tok::r_brace;
+  }
+
+  void addCatch(const ParamDecl *ErrParam) {
+    OS << "\n" << tok::r_brace << " " << tok::kw_catch << " ";
+    auto ErrName = newNameFor(ErrParam, false);
+    if (!ErrName.empty()) {
+      OS << tok::kw_let << " " << ErrName << " ";
+    }
+    OS << tok::l_brace;
+  }
+
+  void preparePlaceholdersAndUnwraps(AsyncHandlerDesc HandlerDesc,
+                                     ArrayRef<const ParamDecl *> SuccessParams,
+                                     const ParamDecl *ErrParam, bool Success) {
+    switch (HandlerDesc.Type) {
+    case HandlerType::PARAMS:
+      if (!Success) {
+        if (ErrParam) {
+          if (HandlerDesc.shouldUnwrap(ErrParam->getType())) {
+            Placeholders.insert(ErrParam);
+            Unwraps.insert(ErrParam);
+          }
+          // Can't use success params in the error body
+          Placeholders.insert(SuccessParams.begin(), SuccessParams.end());
+        }
+      } else {
+        for (auto *SuccessParam : SuccessParams) {
+          auto Ty = SuccessParam->getType();
+          if (HandlerDesc.shouldUnwrap(Ty)) {
+            // Either unwrap or replace with a placeholder if there's some other
+            // reference
+            Unwraps.insert(SuccessParam);
+            Placeholders.insert(SuccessParam);
+          }
+
+          // Void parameters get omitted where possible, so turn any reference
+          // into a placeholder, as its usage is unlikely what the user wants.
+          if (HandlerDesc.getSuccessParamAsyncReturnType(Ty)->isVoid())
+            Placeholders.insert(SuccessParam);
+        }
+        // Can't use the error param in the success body
+        if (ErrParam)
+          Placeholders.insert(ErrParam);
+      }
+      break;
+    case HandlerType::RESULT:
+      // Any uses of the result parameter in the current body (that aren't
+      // replaced) are invalid, so replace them with a placeholder.
+      assert(SuccessParams.size() == 1 && SuccessParams[0] == ErrParam);
+      Placeholders.insert(ErrParam);
+      break;
+    default:
+      llvm_unreachable("Unhandled handler type");
+    }
+  }
+
+  /// Add a mapping from each passed parameter to a new name, possibly
+  /// synthesizing a new one if hoisting it would cause a redeclaration or
+  /// shadowing. If there's no bound name and \c AddIfMissing is false, no
+  /// name will be added.
+  void prepareNames(const ClassifiedBlock &Block,
+                    ArrayRef<const ParamDecl *> Params,
+                    bool AddIfMissing = true) {
+    for (auto *PD : Params) {
+      StringRef Name = Block.boundName(PD);
+      if (!Name.empty() || AddIfMissing)
+        assignUniqueName(PD, Name);
+    }
+
+    for (auto &Entry : Block.aliases()) {
+      auto It = Names.find(Entry.second);
+      assert(It != Names.end() && "Param should already have an entry");
+      Names[Entry.first] = It->second;
+    }
+  }
+
+  /// Returns a unique name using \c Name as base that doesn't clash with any
+  /// other names in the current scope.
+  Identifier createUniqueName(StringRef Name) {
+    Identifier Ident = getASTContext().getIdentifier(Name);
+
+    auto &CurrentNames = ScopedNames.back();
+    if (CurrentNames.count(Ident)) {
+      // Add a number to the end of the name until it's unique given the current
+      // names in scope.
+      llvm::SmallString<32> UniquedName;
+      unsigned UniqueId = 1;
+      do {
+        UniquedName = Name;
+        UniquedName.append(std::to_string(UniqueId));
+        Ident = getASTContext().getIdentifier(UniquedName);
+        UniqueId++;
+      } while (CurrentNames.count(Ident));
+    }
+    return Ident;
+  }
+
+  /// Create a unique name for the variable declared by \p D that doesn't
+  /// clash with any other names in scope, using \p BoundName as the base name
+  /// if not empty and the name of \p D otherwise. Adds this name to both
+  /// \c Names and the current scope's names (\c ScopedNames).
+  Identifier assignUniqueName(const Decl *D, StringRef BoundName) {
+    Identifier Ident;
+    if (BoundName.empty()) {
+      BoundName = getDeclName(D).str();
+      if (BoundName.empty())
+        return Ident;
+    }
+
+    if (BoundName.startswith("$")) {
+      llvm::SmallString<8> NewName;
+      NewName.append("val");
+      NewName.append(BoundName.drop_front());
+      Ident = createUniqueName(NewName);
+    } else {
+      Ident = createUniqueName(BoundName);
+    }
+
+    Names.try_emplace(D, Ident);
+    ScopedNames.back().insert(Ident);
+    return Ident;
+  }
+
+  StringRef newNameFor(const Decl *D, bool Required = true) {
+    auto Res = Names.find(D);
+    if (Res == Names.end()) {
+      assert(!Required && "Missing name for decl when one was required");
+      return StringRef();
+    }
+    return Res->second.str();
+  }
+
+  void addNewScope(const llvm::DenseSet<const Decl *> &Decls) {
+    ScopedNames.push_back({});
+    for (auto *D : Decls) {
+      auto Name = getDeclName(D);
+      if (!Name.empty())
+        ScopedNames.back().insert(Name);
+    }
+  }
+
+  void clearNames(ArrayRef<const ParamDecl *> Params) {
+    for (auto *Param : Params) {
+      Unwraps.erase(Param);
+      Placeholders.erase(Param);
+      Names.erase(Param);
+    }
+  }
+
+  /// Adds the call to an 'async' version of \p FD, where \p HanderDesc
+  /// describes the async completion handler of \p FD. This does not add an
+  /// 'await' keyword.
+  void addCallToAsyncMethod(const FuncDecl *FD,
+                            const AsyncHandlerDesc &HandlerDesc) {
+    // The call to the async function is the same as the call to the old
+    // completion handler function, minus the completion handler arg.
+    addForwardingCallTo(FD, HandlerDesc, /*HandlerReplacement*/ "");
+  }
+
+  /// Adds a forwarding call to the old completion handler function, with
+  /// \p HandlerReplacement that allows for a custom replacement or, if empty,
+  /// removal of the completion handler closure.
+  void addForwardingCallTo(
+      const FuncDecl *FD, const AsyncHandlerDesc &HandlerDesc,
+      StringRef HandlerReplacement, bool CanUseTrailingClosure = true) {
+    OS << FD->getBaseName() << tok::l_paren;
+
+    auto *Params = FD->getParameters();
+    for (auto Param : *Params) {
+      if (Param == HandlerDesc.getHandler()) {
+        /// If we're not replacing the handler with anything, drop it.
+        if (HandlerReplacement.empty())
+          continue;
+
+        // If this is the last param, and we can use a trailing closure, do so.
+        if (CanUseTrailingClosure && Param == Params->back()) {
+          OS << tok::r_paren << " ";
+          OS << HandlerReplacement;
+          return;
+        }
+        // Otherwise fall through to do the replacement.
+      }
+
+      if (Param != Params->front())
+        OS << tok::comma << " ";
+
+      if (!Param->getArgumentName().empty())
+        OS << Param->getArgumentName() << tok::colon << " ";
+
+      if (Param == HandlerDesc.getHandler()) {
+        OS << HandlerReplacement;
+      } else {
+        OS << Param->getParameterName();
+      }
+    }
+    OS << tok::r_paren;
+  }
+
+  /// If the error type of \p HandlerDesc is more specialized than \c Error,
+  /// adds an 'as! CustomError' cast to the more specialized error type to the
+  /// output stream.
+  void
+  addCastToCustomErrorTypeIfNecessary(const AsyncHandlerDesc &HandlerDesc) {
+    const ASTContext &Ctx = HandlerDesc.getHandler()->getASTContext();
+    auto ErrorType = *HandlerDesc.getErrorType();
+    if (ErrorType->getCanonicalType() != Ctx.getExceptionType()) {
+      OS << " " << tok::kw_as << tok::exclaim_postfix << " ";
+      ErrorType->lookThroughSingleOptionalType()->print(OS);
+    }
+  }
+
+  /// If \p T has a natural default value like \c nil for \c Optional or \c ()
+  /// for \c Void, add that default value to the output. Otherwise, add a
+  /// placeholder that contains \p T's name as the hint.
+  void addDefaultValueOrPlaceholder(Type T) {
+    if (T->isOptional()) {
+      OS << tok::kw_nil;
+    } else if (T->isVoid()) {
+      OS << "()";
+    } else {
+      OS << "<#";
+      T.print(OS);
+      OS << "#>";
+    }
+  }
+
+  /// Adds the \c Index -th parameter to the completion handler described by \p
+  /// HanderDesc.
+  /// If \p ResultName is not empty, it is assumed that a variable with that
+  /// name contains the result returned from the async alternative. If the
+  /// callback also takes an error parameter, \c nil passed to the completion
+  /// handler for the error. If \p ResultName is empty, it is a assumed that a
+  /// variable named 'error' contains the error thrown from the async method and
+  /// 'nil' will be passed to the completion handler for all result parameters.
+  void addCompletionHandlerArgument(size_t Index, StringRef ResultName,
+                                    const AsyncHandlerDesc &HandlerDesc) {
+    if (HandlerDesc.HasError && Index == HandlerDesc.params().size() - 1) {
+      // The error parameter is the last argument of the completion handler.
+      if (ResultName.empty()) {
+        OS << "error";
+        addCastToCustomErrorTypeIfNecessary(HandlerDesc);
+      } else {
+        addDefaultValueOrPlaceholder(HandlerDesc.params()[Index].getPlainType());
+      }
+    } else {
+      if (ResultName.empty()) {
+        addDefaultValueOrPlaceholder(HandlerDesc.params()[Index].getPlainType());
+      } else if (HandlerDesc
+                     .getSuccessParamAsyncReturnType(
+                         HandlerDesc.params()[Index].getPlainType())
+                     ->isVoid()) {
+        // Void return types are not returned by the async function, synthesize
+        // a Void instance.
+        OS << tok::l_paren << tok::r_paren;
+      } else if (HandlerDesc.getSuccessParams().size() > 1) {
+        // If the async method returns a tuple, we need to pass its elements to
+        // the completion handler separately. For example:
+        //
+        // func foo() async -> (String, Int) {}
+        //
+        // causes the following legacy body to be created:
+        //
+        // func foo(completion: (String, Int) -> Void) {
+        //   async {
+        //     let result = await foo()
+        //     completion(result.0, result.1)
+        //   }
+        // }
+        OS << ResultName << tok::period << Index;
+      } else {
+        OS << ResultName;
+      }
+    }
+  }
+
+  /// Add a call to the completion handler named \p HandlerName and described by
+  /// \p HandlerDesc, passing all the required arguments. See \c
+  /// getCompletionHandlerArgument for how the arguments are synthesized.
+  void addCallToCompletionHandler(StringRef ResultName,
+                                  const AsyncHandlerDesc &HandlerDesc,
+                                  StringRef HandlerName) {
+    OS << HandlerName << tok::l_paren;
+
+    // Construct arguments to pass to the completion handler
+    switch (HandlerDesc.Type) {
+    case HandlerType::INVALID:
+      llvm_unreachable("Cannot be rewritten");
+      break;
+    case HandlerType::PARAMS: {
+      for (size_t I = 0; I < HandlerDesc.params().size(); ++I) {
+        if (I > 0) {
+          OS << tok::comma << " ";
+        }
+        addCompletionHandlerArgument(I, ResultName, HandlerDesc);
+      }
+      break;
+    }
+    case HandlerType::RESULT: {
+      if (!ResultName.empty()) {
+        OS << tok::period_prefix << "success" << tok::l_paren << ResultName
+           << tok::r_paren;
+      } else {
+        OS << tok::period_prefix << "failure" << tok::l_paren << "error";
+        addCastToCustomErrorTypeIfNecessary(HandlerDesc);
+        OS << tok::r_paren;
+      }
+      break;
+    }
+    }
+    OS << tok::r_paren; // Close the call to the completion handler
+  }
+
+  /// Adds the result type of a refactored async function that previously
+  /// returned results via a completion handler described by \p HandlerDesc.
+  void addAsyncFuncReturnType(const AsyncHandlerDesc &HandlerDesc) {
+    // Type or (Type1, Type2, ...)
+    SmallVector<Type, 2> Scratch;
+    addTupleOf(HandlerDesc.getAsyncReturnTypes(Scratch), OS,
+               [&](auto Ty) { Ty->print(OS); });
+  }
+
+  /// If \p FD is generic, adds a type annotation with the return type of the
+  /// converted async function. This is used when creating a legacy function,
+  /// calling the converted 'async' function so that the generic parameters of
+  /// the legacy function are passed to the generic function. For example for
+  /// \code
+  /// func foo<GenericParam>() async -> GenericParam {}
+  /// \endcode
+  /// we generate
+  /// \code
+  /// func foo<GenericParam>(completion: (GenericParam) -> Void) {
+  ///   async {
+  ///     let result: GenericParam = await foo()
+  ///               <------------>
+  ///     completion(result)
+  ///   }
+  /// }
+  /// \endcode
+  /// This function adds the range marked by \c <----->
+  void addResultTypeAnnotationIfNecessary(const FuncDecl *FD,
+                                          const AsyncHandlerDesc &HandlerDesc) {
+    if (FD->isGeneric()) {
+      OS << tok::colon << " ";
+      addAsyncFuncReturnType(HandlerDesc);
+    }
+  }
+};
+
+/// Adds an attribute to describe a completion handler function's async
+/// alternative if necessary.
+void addCompletionHandlerAsyncAttrIfNeccessary(
+    ASTContext &Ctx, const FuncDecl *FD,
+    const AsyncHandlerParamDesc &HandlerDesc,
+    SourceEditConsumer &EditConsumer) {
+  if (!Ctx.LangOpts.EnableExperimentalConcurrency)
+    return;
+
+  llvm::SmallString<0> HandlerAttribute;
+  llvm::raw_svector_ostream OS(HandlerAttribute);
+  OS << "@completionHandlerAsync(\"";
+  HandlerDesc.printAsyncFunctionName(OS);
+  OS << "\", completionHandlerIndex: " << HandlerDesc.Index << ")\n";
+  EditConsumer.accept(Ctx.SourceMgr, FD->getAttributeInsertionLoc(false),
+                      HandlerAttribute);
+}
+
+} // namespace asyncrefactorings
+
+bool RefactoringActionConvertCallToAsyncAlternative::isApplicable(
+    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+  using namespace asyncrefactorings;
+
+  // Currently doesn't check that the call is in an async context. This seems
+  // possibly useful in some situations, so we'll see what the feedback is.
+  // May need to change in the future
+  auto *CE = findOuterCall(CursorInfo);
+  if (!CE)
+    return false;
+
+  auto HandlerDesc = AsyncHandlerParamDesc::find(
+      getUnderlyingFunc(CE->getFn()), /*RequireAttributeOrName=*/false);
+  return HandlerDesc.isValid();
+}
+
+/// Converts a call of a function with a possible async alternative, to use it
+/// instead. Currently this is any function that
+///   1. has a void return type,
+///   2. has a void returning closure as its last parameter, and
+///   3. is not already async
+///
+/// For now the call need not be in an async context, though this may change
+/// depending on feedback.
+bool RefactoringActionConvertCallToAsyncAlternative::performChange() {
+  using namespace asyncrefactorings;
+
+  auto *CE = findOuterCall(CursorInfo);
+  assert(CE &&
+         "Should not run performChange when refactoring is not applicable");
+
+  // Find the scope this call is in
+  ContextFinder Finder(*CursorInfo.SF, CursorInfo.Loc,
+                      [](ASTNode N) {
+    return N.isStmt(StmtKind::Brace) && !N.isImplicit();
+  });
+  Finder.resolve();
+  auto Scopes = Finder.getContexts();
+  BraceStmt *Scope = nullptr;
+  if (!Scopes.empty())
+    Scope = cast<BraceStmt>(Scopes.back().get<Stmt *>());
+
+  AsyncConverter Converter(TheFile, SM, DiagEngine, CE, Scope);
+  if (!Converter.convert())
+    return true;
+
+  Converter.replace(CE, EditConsumer);
+  return false;
+}
+
+bool RefactoringActionConvertToAsync::isApplicable(
+    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+  using namespace asyncrefactorings;
+
+  // As with the call refactoring, should possibly only apply if there's
+  // actually calls to async alternatives. At the moment this will just add
+  // `async` if there are no calls, which is probably fine.
+  return findFunction(CursorInfo);
+}
+
+/// Converts a whole function to async, converting any calls to functions with
+/// async alternatives as above.
+bool RefactoringActionConvertToAsync::performChange() {
+  using namespace asyncrefactorings;
+
+  auto *FD = findFunction(CursorInfo);
+  assert(FD &&
+         "Should not run performChange when refactoring is not applicable");
+
+  auto HandlerDesc =
+      AsyncHandlerParamDesc::find(FD, /*RequireAttributeOrName=*/false);
+  AsyncConverter Converter(TheFile, SM, DiagEngine, FD, HandlerDesc);
+  if (!Converter.convert())
+    return true;
+
+  Converter.replace(FD, EditConsumer, FD->getSourceRangeIncludingAttrs().Start);
+  return false;
+}
+
+bool RefactoringActionAddAsyncAlternative::isApplicable(
+    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+  using namespace asyncrefactorings;
+
+  auto *FD = findFunction(CursorInfo);
+  if (!FD)
+    return false;
+
+  auto HandlerDesc =
+      AsyncHandlerParamDesc::find(FD, /*RequireAttributeOrName=*/false);
+  return HandlerDesc.isValid();
+}
+
+/// Adds an async alternative and marks the current function as deprecated.
+/// Equivalent to the conversion but
+///   1. only works on functions that themselves are a possible async
+///      alternative, and
+///   2. has extra handling to convert the completion/handler/callback closure
+///      parameter to either `return`/`throws`
+bool RefactoringActionAddAsyncAlternative::performChange() {
+  using namespace asyncrefactorings;
+
+  auto *FD = findFunction(CursorInfo);
+  assert(FD &&
+         "Should not run performChange when refactoring is not applicable");
+
+  auto HandlerDesc =
+      AsyncHandlerParamDesc::find(FD, /*RequireAttributeOrName=*/false);
+  assert(HandlerDesc.isValid() &&
+         "Should not run performChange when refactoring is not applicable");
+
+  AsyncConverter Converter(TheFile, SM, DiagEngine, FD, HandlerDesc);
+  if (!Converter.convert())
+    return true;
+
+  // Deprecate the synchronous function
+  EditConsumer.accept(SM, FD->getAttributeInsertionLoc(false),
+                      "@available(*, deprecated, message: \"Prefer async "
+                      "alternative instead\")\n");
+
+  addCompletionHandlerAsyncAttrIfNeccessary(Ctx, FD, HandlerDesc, EditConsumer);
+
+  AsyncConverter LegacyBodyCreator(TheFile, SM, DiagEngine, FD, HandlerDesc);
+  if (LegacyBodyCreator.createLegacyBody()) {
+    LegacyBodyCreator.replace(FD->getBody(), EditConsumer);
+  }
+
+  // Add the async alternative
+  Converter.insertAfter(FD, EditConsumer);
+
+  return false;
+}
+
+bool RefactoringActionAddAsyncWrapper::isApplicable(
+    const ResolvedCursorInfo &CursorInfo, DiagnosticEngine &Diag) {
+  using namespace asyncrefactorings;
+
+  auto *FD = findFunction(CursorInfo);
+  if (!FD)
+    return false;
+
+  auto HandlerDesc =
+      AsyncHandlerParamDesc::find(FD, /*RequireAttributeOrName=*/false);
+  return HandlerDesc.isValid();
+}
+
+bool RefactoringActionAddAsyncWrapper::performChange() {
+  using namespace asyncrefactorings;
+
+  auto *FD = findFunction(CursorInfo);
+  assert(FD &&
+         "Should not run performChange when refactoring is not applicable");
+
+  auto HandlerDesc =
+      AsyncHandlerParamDesc::find(FD, /*RequireAttributeOrName=*/false);
+  assert(HandlerDesc.isValid() &&
+         "Should not run performChange when refactoring is not applicable");
+
+  AsyncConverter Converter(TheFile, SM, DiagEngine, FD, HandlerDesc);
+  if (!Converter.createAsyncWrapper())
+    return true;
+
+  addCompletionHandlerAsyncAttrIfNeccessary(Ctx, FD, HandlerDesc, EditConsumer);
+
+  // Add the async wrapper.
+  Converter.insertAfter(FD, EditConsumer);
+  return false;
+}
+
+} // end of anonymous namespace
 
 StringRef swift::ide::
 getDescriptiveRefactoringKindName(RefactoringKind Kind) {
@@ -3017,7 +6854,7 @@ SourceLoc swift::ide::RangeConfig::getEnd(SourceManager &SM) {
 
 struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
   std::unique_ptr<SourceEditConsumer> pRewriter;
-  Implementation(SourceManager &SM, unsigned BufferId, llvm::raw_ostream &OS)
+  Implementation(SourceManager &SM, unsigned BufferId, raw_ostream &OS)
   : pRewriter(new SourceEditOutputConsumer(SM, BufferId, OS)) {}
   static StringRef tag(RefactoringRangeKind Kind) {
     switch (Kind) {
@@ -3056,7 +6893,8 @@ struct swift::ide::FindRenameRangesAnnotatingConsumer::Implementation {
 
 swift::ide::FindRenameRangesAnnotatingConsumer::
 FindRenameRangesAnnotatingConsumer(SourceManager &SM, unsigned BufferId,
-   llvm::raw_ostream &OS): Impl(*new Implementation(SM, BufferId, OS)) {}
+                                   raw_ostream &OS) :
+    Impl(*new Implementation(SM, BufferId, OS)) {}
 
 swift::ide::FindRenameRangesAnnotatingConsumer::~FindRenameRangesAnnotatingConsumer() {
   delete &Impl;
@@ -3071,9 +6909,10 @@ accept(SourceManager &SM, RegionType RegionType,
     Impl.accept(SM, Range);
   }
 }
-ArrayRef<RenameAvailabiliyInfo>
-swift::ide::collectRenameAvailabilityInfo(const ValueDecl *VD,
-                                std::vector<RenameAvailabiliyInfo> &Scratch) {
+
+void swift::ide::collectRenameAvailabilityInfo(
+    const ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
+    SmallVectorImpl<RenameAvailabilityInfo> &Infos) {
   RenameAvailableKind AvailKind = RenameAvailableKind::Available;
   if (getRelatedSystemDecl(VD)){
     AvailKind = RenameAvailableKind::Unavailable_system_symbol;
@@ -3088,87 +6927,98 @@ swift::ide::collectRenameAvailabilityInfo(const ValueDecl *VD,
   if (isa<AbstractFunctionDecl>(VD)) {
     // Disallow renaming accessors.
     if (isa<AccessorDecl>(VD))
-      return Scratch;
+      return;
 
     // Disallow renaming deinit.
     if (isa<DestructorDecl>(VD))
-      return Scratch;
-    
+      return;
+
     // Disallow renaming init with no arguments.
     if (auto CD = dyn_cast<ConstructorDecl>(VD)) {
       if (!CD->getParameters()->size())
-        return Scratch;
+        return;
+
+      if (RefInfo && !RefInfo->IsArgLabel) {
+        NameMatcher Matcher(*(RefInfo->SF));
+        auto Resolved = Matcher.resolve({RefInfo->Loc, /*ResolveArgs*/true});
+        if (Resolved.LabelRanges.empty())
+          return;
+      }
+    }
+
+    // Disallow renaming 'callAsFunction' method with no arguments.
+    if (auto FD = dyn_cast<FuncDecl>(VD)) {
+      // FIXME: syntactic rename can only decide by checking the spelling, not
+      // whether it's an instance method, so we do the same here for now.
+      if (FD->getBaseIdentifier() == FD->getASTContext().Id_callAsFunction) {
+        if (!FD->getParameters()->size())
+          return;
+
+        if (RefInfo && !RefInfo->IsArgLabel) {
+          NameMatcher Matcher(*(RefInfo->SF));
+          auto Resolved = Matcher.resolve({RefInfo->Loc, /*ResolveArgs*/true});
+          if (Resolved.LabelRanges.empty())
+            return;
+        }
+      }
     }
   }
 
   // Always return local rename for parameters.
   // FIXME: if the cursor is on the argument, we should return global rename.
   if (isa<ParamDecl>(VD)) {
-    Scratch.emplace_back(RefactoringKind::LocalRename, AvailKind);
-    return Scratch;
+    Infos.emplace_back(RefactoringKind::LocalRename, AvailKind);
+    return;
   }
 
   // If the indexer considers VD a global symbol, then we apply global rename.
   if (index::isLocalSymbol(VD))
-    Scratch.emplace_back(RefactoringKind::LocalRename, AvailKind);
+    Infos.emplace_back(RefactoringKind::LocalRename, AvailKind);
   else
-    Scratch.emplace_back(RefactoringKind::GlobalRename, AvailKind);
-
-  return llvm::makeArrayRef(Scratch);
+    Infos.emplace_back(RefactoringKind::GlobalRename, AvailKind);
 }
 
-ArrayRef<RefactoringKind> swift::ide::
-collectAvailableRefactorings(SourceFile *SF,
-                             ResolvedCursorInfo CursorInfo,
-                             std::vector<RefactoringKind> &Scratch,
-                             bool ExcludeRename) {
-  llvm::SmallVector<RefactoringKind, 2> AllKinds;
-  switch(CursorInfo.Kind) {
-  case CursorInfoKind::ModuleRef:
-  case CursorInfoKind::Invalid:
-  case CursorInfoKind::StmtStart:
-  case CursorInfoKind::ExprStart:
-    break;
-  case CursorInfoKind::ValueRef: {
-    auto RenameOp = getAvailableRenameForDecl(CursorInfo.ValueD);
-    if (RenameOp.hasValue() &&
-        RenameOp.getValue() == RefactoringKind::GlobalRename)
-      AllKinds.push_back(RenameOp.getValue());
+void swift::ide::collectAvailableRefactorings(
+    const ResolvedCursorInfo &CursorInfo,
+    SmallVectorImpl<RefactoringKind> &Kinds, bool ExcludeRename) {
+  DiagnosticEngine DiagEngine(CursorInfo.SF->getASTContext().SourceMgr);
+
+  if (!ExcludeRename) {
+    if (RefactoringActionLocalRename::isApplicable(CursorInfo, DiagEngine))
+      Kinds.push_back(RefactoringKind::LocalRename);
+
+    switch (CursorInfo.Kind) {
+    case CursorInfoKind::ModuleRef:
+    case CursorInfoKind::Invalid:
+    case CursorInfoKind::StmtStart:
+    case CursorInfoKind::ExprStart:
+      break;
+    case CursorInfoKind::ValueRef: {
+      Optional<RenameRefInfo> RefInfo;
+      if (CursorInfo.IsRef)
+        RefInfo = {CursorInfo.SF, CursorInfo.Loc, CursorInfo.IsKeywordArgument};
+      auto RenameOp = getAvailableRenameForDecl(CursorInfo.ValueD, RefInfo);
+      if (RenameOp.hasValue() &&
+          RenameOp.getValue() == RefactoringKind::GlobalRename)
+        Kinds.push_back(RenameOp.getValue());
+    }
     }
   }
-  DiagnosticEngine DiagEngine(SF->getASTContext().SourceMgr);
+
 #define CURSOR_REFACTORING(KIND, NAME, ID)                                     \
-  if (RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine))           \
-    AllKinds.push_back(RefactoringKind::KIND);
+  if (RefactoringKind::KIND != RefactoringKind::LocalRename &&                 \
+      RefactoringAction##KIND::isApplicable(CursorInfo, DiagEngine))           \
+    Kinds.push_back(RefactoringKind::KIND);
 #include "swift/IDE/RefactoringKinds.def"
-
-  // Exclude renames.
-  for(auto Kind: AllKinds) {
-    switch (Kind) {
-    case RefactoringKind::LocalRename:
-    case RefactoringKind::GlobalRename:
-      if (ExcludeRename)
-        break;
-      LLVM_FALLTHROUGH;
-    default:
-      Scratch.push_back(Kind);
-    }
-  }
-
-  return llvm::makeArrayRef(Scratch);
 }
 
-
-
-ArrayRef<RefactoringKind> swift::ide::
-collectAvailableRefactorings(SourceFile *SF, RangeConfig Range,
-                             bool &RangeStartMayNeedRename,
-                             std::vector<RefactoringKind> &Scratch,
-                             llvm::ArrayRef<DiagnosticConsumer*> DiagConsumers) {
-
+void swift::ide::collectAvailableRefactorings(
+    SourceFile *SF, RangeConfig Range, bool &RangeStartMayNeedRename,
+    SmallVectorImpl<RefactoringKind> &Kinds,
+    ArrayRef<DiagnosticConsumer *> DiagConsumers) {
   if (Range.Length == 0) {
     return collectAvailableRefactoringsAtCursor(SF, Range.Line, Range.Column,
-                                                Scratch, DiagConsumers);
+                                                Kinds, DiagConsumers);
   }
   // Prepare the tool box.
   ASTContext &Ctx = SF->getASTContext();
@@ -3176,23 +7026,23 @@ collectAvailableRefactorings(SourceFile *SF, RangeConfig Range,
   DiagnosticEngine DiagEngine(SM);
   std::for_each(DiagConsumers.begin(), DiagConsumers.end(),
     [&](DiagnosticConsumer *Con) { DiagEngine.addConsumer(*Con); });
-
-  RangeResolver Resolver(*SF, Range.getStart(SF->getASTContext().SourceMgr),
-                         Range.getEnd(SF->getASTContext().SourceMgr));
-  ResolvedRangeInfo Result = Resolver.resolve();
+  ResolvedRangeInfo Result = evaluateOrDefault(SF->getASTContext().evaluator,
+    RangeInfoRequest(RangeInfoOwner({SF,
+                      Range.getStart(SF->getASTContext().SourceMgr),
+                      Range.getEnd(SF->getASTContext().SourceMgr)})),
+                                               ResolvedRangeInfo());
 
   bool enableInternalRefactoring = getenv("SWIFT_ENABLE_INTERNAL_REFACTORING_ACTIONS");
 
-#define RANGE_REFACTORING(KIND, NAME, ID)                                     \
-  if (RefactoringAction##KIND::isApplicable(Result, DiagEngine))              \
-    Scratch.push_back(RefactoringKind::KIND);
+#define RANGE_REFACTORING(KIND, NAME, ID)                                      \
+  if (RefactoringAction##KIND::isApplicable(Result, DiagEngine))               \
+    Kinds.push_back(RefactoringKind::KIND);
 #define INTERNAL_RANGE_REFACTORING(KIND, NAME, ID)                            \
   if (enableInternalRefactoring)                                              \
     RANGE_REFACTORING(KIND, NAME, ID)
 #include "swift/IDE/RefactoringKinds.def"
 
   RangeStartMayNeedRename = rangeStartMayNeedRename(Result);
-  return Scratch;
 }
 
 bool swift::ide::
@@ -3203,7 +7053,7 @@ refactorSwiftModule(ModuleDecl *M, RefactoringOptions Opts,
 
   // Use the default name if not specified.
   if (Opts.PreferredName.empty()) {
-    Opts.PreferredName = getDefaultPreferredName(Opts.Kind);
+    Opts.PreferredName = getDefaultPreferredName(Opts.Kind).str();
   }
 
   switch (Opts.Kind) {
@@ -3316,7 +7166,7 @@ int swift::ide::syntacticRename(SourceFile *SF, ArrayRef<RenameLoc> RenameLocs,
 }
 
 int swift::ide::findSyntacticRenameRanges(
-    SourceFile *SF, llvm::ArrayRef<RenameLoc> RenameLocs,
+    SourceFile *SF, ArrayRef<RenameLoc> RenameLocs,
     FindRenameRangesConsumer &RenameConsumer,
     DiagnosticConsumer &DiagConsumer) {
   assert(SF && "null source file");
@@ -3357,16 +7207,21 @@ int swift::ide::findLocalRenameRanges(
   Diags.addConsumer(DiagConsumer);
 
   auto StartLoc = Lexer::getLocForStartOfToken(SM, Range.getStart(SM));
-
-  CursorInfoResolver Resolver(*SF);
-  ResolvedCursorInfo CursorInfo = Resolver.resolve(StartLoc);
+  ResolvedCursorInfo CursorInfo =
+    evaluateOrDefault(SF->getASTContext().evaluator,
+                      CursorInfoRequest{CursorInfoOwner(SF, StartLoc)},
+                      ResolvedCursorInfo());
   if (!CursorInfo.isValid() || !CursorInfo.ValueD) {
     Diags.diagnose(StartLoc, diag::unresolved_location);
     return true;
   }
-  ValueDecl *VD = CursorInfo.ValueD;
+  ValueDecl *VD = CursorInfo.typeOrValue();
+  Optional<RenameRefInfo> RefInfo;
+  if (CursorInfo.IsRef)
+    RefInfo = {CursorInfo.SF, CursorInfo.Loc, CursorInfo.IsKeywordArgument};
+
   llvm::SmallVector<DeclContext *, 8> Scopes;
-  analyzeRenameScope(VD, Diags, Scopes);
+  analyzeRenameScope(VD, RefInfo, Diags, Scopes);
   if (Scopes.empty())
     return true;
   RenameRangeCollector RangeCollector(VD, StringRef());

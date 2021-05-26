@@ -14,8 +14,10 @@
 #define SWIFT_IDE_CODECOMPLETION_H
 
 #include "swift/AST/Identifier.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/TrailingObjects.h"
@@ -28,6 +30,7 @@ namespace swift {
 class CodeCompletionCallbacksFactory;
 class Decl;
 class DeclContext;
+class FrontendOptions;
 class ModuleDecl;
 
 namespace ide {
@@ -37,7 +40,7 @@ class CodeCompletionContext;
 class CodeCompletionResultBuilder;
 struct RequestedCachedModule;
 
-/// \brief A routine to remove code completion tokens from code completion
+/// A routine to remove code completion tokens from code completion
 /// tests.
 ///
 /// \code
@@ -56,6 +59,20 @@ std::string removeCodeCompletionTokens(StringRef Input,
                                        StringRef TokenName,
                                        unsigned *CompletionOffset);
 
+StringRef copyString(llvm::BumpPtrAllocator &Allocator,
+                     StringRef Str);
+
+const char *copyCString(llvm::BumpPtrAllocator &Allocator,
+                        StringRef Str);
+
+template <typename T>
+ArrayRef<T> copyArray(llvm::BumpPtrAllocator &Allocator,
+                            ArrayRef<T> Arr) {
+  T *Buffer = Allocator.Allocate<T>(Arr.size());
+  std::copy(Arr.begin(), Arr.end(), Buffer);
+  return llvm::makeArrayRef(Buffer, Arr.size());
+}
+
 namespace detail {
 class CodeCompletionStringChunk {
   friend class swift::ide::CodeCompletionResultBuilder;
@@ -65,7 +82,7 @@ public:
     /// "open", "public", "internal", "fileprivate", or "private".
     AccessControlKeyword,
 
-    /// such as @"availability".
+    /// such as @"available".
     DeclAttrKeyword,
 
     /// such as "unavailable" etc. for @available.
@@ -74,17 +91,23 @@ public:
     /// The "override" keyword.
     OverrideKeyword,
 
-    /// The "throws" keyword.
-    ThrowsKeyword,
-
-    /// The "rethrows" keyword.
-    RethrowsKeyword,
+    /// The "throws", "rethrows" and "async" keyword.
+    EffectsSpecifierKeyword,
 
     /// The keyword part of a declaration before the name, like "func".
     DeclIntroducer,
 
+    /// Other generic keyword.
+    Keyword,
+
+    /// Other generic attributes.
+    Attribute,
+
     /// Normal text chunk.
     Text,
+
+    /// Base name of the result.
+    BaseName,
 
     /// The first chunk of an optional substring that continues until
     /// \c NestingLevel decreases.
@@ -132,9 +155,25 @@ public:
 
     /// Required parameter type.
     CallParameterType,
+
+    /// Parameter type tag for annotated results.
+    CallParameterTypeBegin,
+
+    /// System type name.
+    TypeIdSystem,
+
+    /// Non-system type name.
+    TypeIdUser,
+
     /// Desugared closure parameter type. This can be used to get the
-    /// closure type if CallParameterType is a NameAliasType.
+    /// closure type if CallParameterType is a TypeAliasType.
     CallParameterClosureType,
+
+    /// An expanded closure expression for the value of a parameter, including
+    /// the left and right braces and possible signature. The preferred
+    /// position to put the cursor after the completion result is inserted
+    /// into the editor buffer is between the braces.
+    CallParameterClosureExpr,
 
     /// A placeholder for \c ! or \c ? in a call to a method found by dynamic
     /// lookup.
@@ -156,6 +195,10 @@ public:
     /// This chunk should not be inserted into the editor buffer.
     TypeAnnotation,
 
+    /// Structured group version of 'TypeAnnotation'.
+    /// This grouped chunks should not be inserted into the editor buffer.
+    TypeAnnotationBegin,
+
     /// A brace statement -- left brace and right brace.  The preferred
     /// position to put the cursor after the completion result is inserted
     /// into the editor buffer is between the braces.
@@ -168,16 +211,20 @@ public:
   static bool chunkStartsNestedGroup(ChunkKind Kind) {
     return Kind == ChunkKind::CallParameterBegin ||
            Kind == ChunkKind::GenericParameterBegin ||
-           Kind == ChunkKind::OptionalBegin;
+           Kind == ChunkKind::OptionalBegin ||
+           Kind == ChunkKind::CallParameterTypeBegin ||
+           Kind == ChunkKind::TypeAnnotationBegin;
   }
 
   static bool chunkHasText(ChunkKind Kind) {
     return Kind == ChunkKind::AccessControlKeyword ||
            Kind == ChunkKind::OverrideKeyword ||
-           Kind == ChunkKind::ThrowsKeyword ||
-           Kind == ChunkKind::RethrowsKeyword ||
+           Kind == ChunkKind::EffectsSpecifierKeyword ||
            Kind == ChunkKind::DeclAttrKeyword ||
            Kind == ChunkKind::DeclIntroducer ||
+           Kind == ChunkKind::Keyword ||
+           Kind == ChunkKind::Attribute ||
+           Kind == ChunkKind::BaseName ||
            Kind == ChunkKind::Text ||
            Kind == ChunkKind::LeftParen ||
            Kind == ChunkKind::RightParen ||
@@ -200,18 +247,21 @@ public:
            Kind == ChunkKind::DeclAttrParamKeyword ||
            Kind == ChunkKind::CallParameterType ||
            Kind == ChunkKind::CallParameterClosureType ||
+           Kind == ChunkKind::CallParameterClosureExpr ||
            Kind == ChunkKind::GenericParameterName ||
            Kind == ChunkKind::DynamicLookupMethodCallTail ||
            Kind == ChunkKind::OptionalMethodCallTail ||
            Kind == ChunkKind::TypeAnnotation ||
-           Kind == ChunkKind::BraceStmtWithCursor;
+           Kind == ChunkKind::BraceStmtWithCursor ||
+           Kind == ChunkKind::TypeIdSystem ||
+           Kind == ChunkKind::TypeIdUser;
   }
 
 private:
   unsigned Kind : 8;
   unsigned NestingLevel : 8;
 
-  /// \brief If true, then this chunk is an annotation that is included only
+  /// If true, then this chunk is an annotation that is included only
   /// for exposition and may not be inserted in the editor buffer.
   unsigned IsAnnotation : 1;
 
@@ -278,7 +328,7 @@ public:
 
 } // end namespace detail
 
-/// \brief A structured representation of a code completion string.
+/// A structured representation of a code completion string.
 class alignas(detail::CodeCompletionStringChunk) CodeCompletionString final :
     private llvm::TrailingObjects<CodeCompletionString,
                                   detail::CodeCompletionStringChunk> {
@@ -314,10 +364,10 @@ public:
 
   /// Print a debug representation of the code completion string to \p OS.
   void print(raw_ostream &OS) const;
-  void dump() const;
+  SWIFT_DEBUG_DUMP;
 };
 
-/// \brief Describes the origin of the code completion result.
+/// Describes the origin of the code completion result.
 ///
 /// This enum is ordered from the contexts that are "nearest" to the code
 /// completion point to "outside" contexts.
@@ -325,7 +375,7 @@ enum class SemanticContextKind {
   /// Used in cases when the concept of semantic context is not applicable.
   None,
 
-  /// \brief This is a highly-likely expression-context-specific completion
+  /// This is a highly-likely expression-context-specific completion
   /// result.  This description is intentionally vague: this is a catch-all
   /// category for all heuristics for highly-likely results.
   ///
@@ -485,22 +535,22 @@ enum class CompletionKind {
   PostfixExprBeginning,
   PostfixExpr,
   PostfixExprParen,
-  SuperExpr,
-  SuperExprDot,
   KeyPathExprObjC,
   KeyPathExprSwift,
+  TypeDeclResultBeginning,
   TypeSimpleBeginning,
   TypeIdentifierWithDot,
   TypeIdentifierWithoutDot,
+  CaseStmtKeyword,
   CaseStmtBeginning,
-  CaseStmtDotPrefix,
   NominalMemberBeginning,
   AccessorBeginning,
   AttributeBegin,
   AttributeDeclParen,
+  EffectsSpecifier,
   PoundAvailablePlatform,
-  AssignmentRHS,
   CallArg,
+  LabeledTrailingClosure,
   ReturnStmtExpr,
   YieldStmtExpr,
   ForEachSequence,
@@ -508,11 +558,14 @@ enum class CompletionKind {
   AfterPoundDirective,
   PlatformConditon,
   AfterIfStmtElse,
-  GenericParams,
+  GenericRequirement,
   PrecedenceGroup,
+  StmtLabel,
+  ForEachPatternBeginning,
+  TypeAttrBeginning,
 };
 
-/// \brief A single code completion result.
+/// A single code completion result.
 class CodeCompletionResult {
   friend class CodeCompletionResultBuilder;
 
@@ -528,6 +581,11 @@ public:
   /// Describes the relationship between the type of the completion results and
   /// the expected type at the code completion position.
   enum ExpectedTypeRelation {
+    /// The result does not have a type (e.g. keyword).
+    NotApplicable,
+
+    /// The type relation have not been calculated.
+    Unknown,
 
     /// The relationship of the result's type to the expected type is not
     /// invalid, not convertible, and not identical.
@@ -543,11 +601,13 @@ public:
     Identical,
   };
 
-  enum NotRecommendedReason {
-    Redundant,
-    TypeMismatch,
+  enum class NotRecommendedReason {
+    None = 0,
+    RedundantImport,
     Deprecated,
-    NoReason,
+    InvalidAsyncContext,
+    CrossActorReference,
+    VariableUsedInOwnDefinition,
   };
 
 private:
@@ -555,8 +615,9 @@ private:
   unsigned AssociatedKind : 8;
   unsigned KnownOperatorKind : 6;
   unsigned SemanticContext : 3;
-  unsigned NotRecommended : 1;
-  unsigned NotRecReason : 3;
+  unsigned IsArgumentLabels : 1;
+  unsigned NotRecommended : 4;
+  unsigned IsSystem : 1;
 
   /// The number of bytes to the left of the code completion point that
   /// should be erased first if this completion string is inserted in the
@@ -579,16 +640,18 @@ public:
   ///
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(ResultKind Kind, SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
-                       ExpectedTypeRelation TypeDistance = Unrelated,
+                       ExpectedTypeRelation TypeDistance,
                        CodeCompletionOperatorKind KnownOperatorKind =
-                           CodeCompletionOperatorKind::None)
+                           CodeCompletionOperatorKind::None,
+                       StringRef BriefDocComment = StringRef())
       : Kind(Kind), KnownOperatorKind(unsigned(KnownOperatorKind)),
-        SemanticContext(unsigned(SemanticContext)), NotRecommended(false),
-        NotRecReason(NotRecommendedReason::NoReason),
+        SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
+        NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
-        TypeDistance(TypeDistance) {
+        BriefDocComment(BriefDocComment), TypeDistance(TypeDistance) {
     assert(Kind != Declaration && "use the other constructor");
     assert(CompletionString);
     if (isOperator() && KnownOperatorKind == CodeCompletionOperatorKind::None)
@@ -597,6 +660,7 @@ public:
     assert(!isOperator() ||
            getOperatorKind() != CodeCompletionOperatorKind::None);
     AssociatedKind = 0;
+    IsSystem = 0;
   }
 
   /// Constructs a \c Keyword result.
@@ -604,16 +668,19 @@ public:
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(CodeCompletionKeywordKind Kind,
                        SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
-                       ExpectedTypeRelation TypeDistance = Unrelated)
+                       ExpectedTypeRelation TypeDistance,
+                       StringRef BriefDocComment = StringRef())
       : Kind(Keyword), KnownOperatorKind(0),
-        SemanticContext(unsigned(SemanticContext)), NotRecommended(false),
-        NotRecReason(NotRecommendedReason::NoReason),
+        SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
+        NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
-        TypeDistance(TypeDistance) {
+        BriefDocComment(BriefDocComment), TypeDistance(TypeDistance) {
     assert(CompletionString);
     AssociatedKind = static_cast<unsigned>(Kind);
+    IsSystem = 0;
   }
 
   /// Constructs a \c Literal result.
@@ -621,15 +688,17 @@ public:
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(CodeCompletionLiteralKind LiteralKind,
                        SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        ExpectedTypeRelation TypeDistance)
       : Kind(Literal), KnownOperatorKind(0),
-        SemanticContext(unsigned(SemanticContext)), NotRecommended(false),
-        NotRecReason(NotRecommendedReason::NoReason),
+        SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
+        NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         TypeDistance(TypeDistance) {
     AssociatedKind = static_cast<unsigned>(LiteralKind);
+    IsSystem = 0;
     assert(CompletionString);
   }
 
@@ -639,10 +708,9 @@ public:
   /// arguments outlive this result, typically by storing them in the same
   /// \c CodeCompletionResultSink as the result itself.
   CodeCompletionResult(SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        const Decl *AssociatedDecl, StringRef ModuleName,
-                       bool NotRecommended,
                        CodeCompletionResult::NotRecommendedReason NotRecReason,
                        StringRef BriefDocComment,
                        ArrayRef<StringRef> AssociatedUSRs,
@@ -650,13 +718,15 @@ public:
                        enum ExpectedTypeRelation TypeDistance)
       : Kind(ResultKind::Declaration), KnownOperatorKind(0),
         SemanticContext(unsigned(SemanticContext)),
-        NotRecommended(NotRecommended), NotRecReason(NotRecReason),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
+        NotRecommended(unsigned(NotRecReason)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         ModuleName(ModuleName), BriefDocComment(BriefDocComment),
         AssociatedUSRs(AssociatedUSRs), DocWords(DocWords),
         TypeDistance(TypeDistance) {
     assert(AssociatedDecl && "should have a decl");
     AssociatedKind = unsigned(getCodeCompletionDeclKind(AssociatedDecl));
+    IsSystem = getDeclIsSystem(AssociatedDecl);
     assert(CompletionString);
     if (isOperator())
       KnownOperatorKind =
@@ -665,27 +735,29 @@ public:
            getOperatorKind() != CodeCompletionOperatorKind::None);
   }
 
-  // FIXME:
+  // Used by deserialization.
   CodeCompletionResult(SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
-                       CodeCompletionDeclKind DeclKind, StringRef ModuleName,
-                       bool NotRecommended,
+                       CodeCompletionDeclKind DeclKind, bool IsSystem,
+                       StringRef ModuleName,
                        CodeCompletionResult::NotRecommendedReason NotRecReason,
                        StringRef BriefDocComment,
                        ArrayRef<StringRef> AssociatedUSRs,
                        ArrayRef<std::pair<StringRef, StringRef>> DocWords,
+                       ExpectedTypeRelation TypeDistance,
                        CodeCompletionOperatorKind KnownOperatorKind)
       : Kind(ResultKind::Declaration),
         KnownOperatorKind(unsigned(KnownOperatorKind)),
         SemanticContext(unsigned(SemanticContext)),
-        NotRecommended(NotRecommended), NotRecReason(NotRecReason),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
+        NotRecommended(unsigned(NotRecReason)), IsSystem(IsSystem),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         ModuleName(ModuleName), BriefDocComment(BriefDocComment),
-        AssociatedUSRs(AssociatedUSRs), DocWords(DocWords) {
+        AssociatedUSRs(AssociatedUSRs), DocWords(DocWords),
+        TypeDistance(TypeDistance) {
     AssociatedKind = static_cast<unsigned>(DeclKind);
     assert(CompletionString);
-    TypeDistance = ExpectedTypeRelation::Unrelated;
     assert(!isOperator() ||
            getOperatorKind() != CodeCompletionOperatorKind::None);
   }
@@ -725,20 +797,28 @@ public:
     return static_cast<CodeCompletionOperatorKind>(KnownOperatorKind);
   }
 
+  bool isSystem() const {
+    return static_cast<bool>(IsSystem);
+  }
+
   ExpectedTypeRelation getExpectedTypeRelation() const {
     return static_cast<ExpectedTypeRelation>(TypeDistance);
   }
 
   NotRecommendedReason getNotRecommendedReason() const {
-    return static_cast<NotRecommendedReason>(NotRecReason);
+    return static_cast<NotRecommendedReason>(NotRecommended);
   }
 
   SemanticContextKind getSemanticContext() const {
     return static_cast<SemanticContextKind>(SemanticContext);
   }
 
+  bool isArgumentLabels() const {
+    return static_cast<bool>(IsArgumentLabels);
+  }
+
   bool isNotRecommended() const {
-    return NotRecommended;
+    return getNotRecommendedReason() != NotRecommendedReason::None;
   }
 
   unsigned getNumBytesToErase() const {
@@ -764,14 +844,15 @@ public:
   }
 
   /// Print a debug representation of the code completion result to \p OS.
-  void print(raw_ostream &OS) const;
-  void dump() const;
+  void printPrefix(raw_ostream &OS) const;
+  SWIFT_DEBUG_DUMP;
 
   static CodeCompletionDeclKind getCodeCompletionDeclKind(const Decl *D);
   static CodeCompletionOperatorKind
   getCodeCompletionOperatorKind(StringRef name);
   static CodeCompletionOperatorKind
   getCodeCompletionOperatorKind(CodeCompletionString *str);
+  static bool getDeclIsSystem(const Decl *D);
 };
 
 struct CodeCompletionResultSink {
@@ -784,6 +865,12 @@ struct CodeCompletionResultSink {
   /// other sinks.
   std::vector<AllocatorPtr> ForeignAllocators;
 
+  /// Whether to annotate the results with XML.
+  bool annotateResult = false;
+
+  /// Whether to emit object literals if desired.
+  bool includeObjectLiterals = true;
+
   std::vector<CodeCompletionResult *> Results;
 
   /// A single-element cache for module names stored in Allocator, keyed by a
@@ -794,32 +881,79 @@ struct CodeCompletionResultSink {
       : Allocator(std::make_shared<llvm::BumpPtrAllocator>()) {}
 };
 
+/// A utility for calculating the import depth of a given module. Direct imports
+/// have depth 1, imports of those modules have depth 2, etc.
+///
+/// Special modules such as Playground auxiliary sources are considered depth
+/// 0.
+class ImportDepth {
+  llvm::StringMap<uint8_t> depths;
+
+public:
+  ImportDepth() = default;
+  ImportDepth(ASTContext &context, const FrontendOptions &frontendOptions);
+
+  Optional<uint8_t> lookup(StringRef module) {
+    auto I = depths.find(module);
+    if (I == depths.end())
+      return None;
+    return I->getValue();
+  }
+};
+
 class CodeCompletionContext {
   friend class CodeCompletionResultBuilder;
 
-  /// \brief A set of current completion results, not yet delivered to the
+  /// A set of current completion results, not yet delivered to the
   /// consumer.
   CodeCompletionResultSink CurrentResults;
 
 public:
   CodeCompletionCache &Cache;
   CompletionKind CodeCompletionKind = CompletionKind::None;
-  bool HasExpectedTypeRelation = false;
+
+  enum class TypeContextKind {
+    /// There is no known contextual type. All types are equally good.
+    None,
+
+    /// There is a contextual type from a single-expression closure/function
+    /// body. The context is a hint, and enables unresolved member completion,
+    /// but should not hide any results.
+    SingleExpressionBody,
+
+    /// There are known contextual types, or there aren't but a nonvoid type is expected.
+    Required,
+  };
+
+  TypeContextKind typeContextKind = TypeContextKind::None;
 
   /// Whether there may be members that can use implicit member syntax,
   /// e.g. `x = .foo`.
   bool MayUseImplicitMemberExpr = false;
 
+  /// Flag to indicate that the completion is happening reusing ASTContext
+  /// from the previous completion.
+  /// NOTE: Do not use this to change the behavior. This is only for debugging.
+  bool ReusingASTContext = false;
+
   CodeCompletionContext(CodeCompletionCache &Cache)
       : Cache(Cache) {}
 
-  /// \brief Allocate a string owned by the code completion context.
+  void setAnnotateResult(bool flag) { CurrentResults.annotateResult = flag; }
+  bool getAnnotateResult() { return CurrentResults.annotateResult; }
+
+  void setIncludeObjectLiterals(bool flag) {
+    CurrentResults.includeObjectLiterals = flag;
+  }
+  bool includeObjectLiterals() { return CurrentResults.includeObjectLiterals; }
+
+  /// Allocate a string owned by the code completion context.
   StringRef copyString(StringRef Str);
 
-  /// \brief Return current code completion results.
+  /// Return current code completion results.
   MutableArrayRef<CodeCompletionResult *> takeResults();
 
-  /// \brief Sort code completion results in an implementation-defined order
+  /// Sort code completion results in an implementation-defined order
   /// in place.
   static void sortCompletionResults(
       MutableArrayRef<CodeCompletionResult *> Results);
@@ -829,7 +963,7 @@ public:
   }
 };
 
-/// \brief An abstract base class for consumers of code completion results.
+/// An abstract base class for consumers of code completion results.
 /// \see \c SimpleCachingCodeCompletionConsumer.
 class CodeCompletionConsumer {
 public:
@@ -855,26 +989,29 @@ struct SimpleCachingCodeCompletionConsumer : public CodeCompletionConsumer {
       MutableArrayRef<CodeCompletionResult *> Results) = 0;
 };
 
-/// \brief A code completion result consumer that prints the results to a
+/// A code completion result consumer that prints the results to a
 /// \c raw_ostream.
 class PrintingCodeCompletionConsumer
     : public SimpleCachingCodeCompletionConsumer {
   llvm::raw_ostream &OS;
   bool IncludeKeywords;
   bool IncludeComments;
+  bool PrintAnnotatedDescription;
 
 public:
  PrintingCodeCompletionConsumer(llvm::raw_ostream &OS,
                                 bool IncludeKeywords = true,
-                                bool IncludeComments = true)
+                                bool IncludeComments = true,
+                                bool PrintAnnotatedDescription = false)
      : OS(OS),
        IncludeKeywords(IncludeKeywords),
-       IncludeComments(IncludeComments) {}
+       IncludeComments(IncludeComments),
+       PrintAnnotatedDescription(PrintAnnotatedDescription) {}
 
  void handleResults(MutableArrayRef<CodeCompletionResult *> Results) override;
 };
 
-/// \brief Create a factory for code completion callbacks.
+/// Create a factory for code completion callbacks.
 CodeCompletionCallbacksFactory *
 makeCodeCompletionCallbacksFactory(CodeCompletionContext &CompletionContext,
                                    CodeCompletionConsumer &Consumer);

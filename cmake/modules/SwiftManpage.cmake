@@ -27,7 +27,7 @@ function(manpage)
       "${CMAKE_CURRENT_BINARY_DIR}/${MP_MAN_FILE_BASENAME}.${MP_MAN_SECTION}")
 
   add_custom_command_target(
-      unused_var
+      manpage_target
       COMMAND
         "${POD2MAN}" "--section" "${MP_MAN_SECTION}"
         "--center" "${MP_PAGE_HEADER}" "--release=\"swift ${SWIFT_VERSION}\""
@@ -38,8 +38,13 @@ function(manpage)
       DEPENDS "${MP_SOURCE}"
       ALL)
 
-  swift_install_in_component("${MP_INSTALL_IN_COMPONENT}"
-      FILES "${output_file_name}"
-      DESTINATION "share/man/man${MP_MAN_SECTION}")
+  add_dependencies(${MP_INSTALL_IN_COMPONENT} ${manpage_target})
+  set(MANPAGE_DEST "share/")
+  if("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "OPENBSD")
+    set(MANPAGE_DEST "")
+  endif()
+  swift_install_in_component(FILES "${output_file_name}"
+                             DESTINATION "${MANPAGE_DEST}man/man${MP_MAN_SECTION}"
+                             COMPONENT "${MP_INSTALL_IN_COMPONENT}")
 endfunction()
 

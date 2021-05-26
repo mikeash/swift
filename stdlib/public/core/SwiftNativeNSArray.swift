@@ -41,41 +41,56 @@ internal func _isValidArraySubscript(_ index: Int, count: Int) -> Bool {
 /// NOTE: older runtimes called this
 /// _SwiftNativeNSArrayWithContiguousStorage. The two must coexist, so
 /// it was renamed. The old name must not be used in the new runtime.
-@_fixed_layout // FIXME(sil-serialize-all)
+@_fixed_layout
 @usableFromInline
 internal class __SwiftNativeNSArrayWithContiguousStorage
   : __SwiftNativeNSArray { // Provides NSArray inheritance and native refcounting
 
-  @inlinable // FIXME(sil-serialize-all)
-  @nonobjc internal override init() {}
+  @inlinable
+  @nonobjc internal override init() { super.init() }
 
-  @inlinable // FIXME(sil-serialize-all)
+  @inlinable
   deinit {}
 
   // Operate on our contiguous storage
   internal func withUnsafeBufferOfObjects<R>(
     _ body: (UnsafeBufferPointer<AnyObject>) throws -> R
   ) rethrows -> R {
-    _sanityCheckFailure(
+    _internalInvariantFailure(
       "Must override withUnsafeBufferOfObjects in derived classes")
   }
 }
 
+private let NSNotFound: Int = .max
+
 // Implement the APIs required by NSArray 
-extension __SwiftNativeNSArrayWithContiguousStorage : _NSArrayCore {
+extension __SwiftNativeNSArrayWithContiguousStorage {
   @objc internal var count: Int {
     return withUnsafeBufferOfObjects { $0.count }
   }
 
-  @objc(objectAtIndex:)
-  internal func objectAt(_ index: Int) -> AnyObject {
+  @inline(__always)
+  @_effects(readonly)
+  @nonobjc private func _objectAt(_ index: Int) -> Unmanaged<AnyObject> {
     return withUnsafeBufferOfObjects {
       objects in
       _precondition(
         _isValidArraySubscript(index, count: objects.count),
         "Array index out of range")
-      return objects[index]
+      return Unmanaged.passUnretained(objects[index])
     }
+  }
+  
+  @objc(objectAtIndexedSubscript:)
+  @_effects(readonly)
+  dynamic internal func objectAtSubscript(_ index: Int) -> Unmanaged<AnyObject> {
+    return _objectAt(index)
+  }
+  
+  @objc(objectAtIndex:)
+  @_effects(readonly)
+  dynamic internal func objectAt(_ index: Int) -> Unmanaged<AnyObject> {
+    return _objectAt(index)
   }
 
   @objc internal func getObjects(
@@ -131,6 +146,182 @@ extension __SwiftNativeNSArrayWithContiguousStorage : _NSArrayCore {
   }
 }
 
+@_fixed_layout
+@usableFromInline
+@objc internal final class _SwiftNSMutableArray :
+  _SwiftNativeNSMutableArray
+{
+  internal var contents: [AnyObject]
+
+  internal init(_ array: [AnyObject]) {
+    contents = array
+    super.init()
+  }
+  
+  @objc internal var count: Int {
+    return contents.count
+  }
+  
+  @objc(objectAtIndexedSubscript:)
+  @_effects(readonly)
+  dynamic internal func objectAtSubscript(_ index: Int) -> Unmanaged<AnyObject> {
+    //TODO: exception instead of precondition, once that's possible
+    return Unmanaged.passUnretained(contents[index])
+  }
+
+  @objc(objectAtIndex:)
+  @_effects(readonly)
+  dynamic internal func objectAt(_ index: Int) -> Unmanaged<AnyObject> {
+    //TODO: exception instead of precondition, once that's possible
+    return Unmanaged.passUnretained(contents[index])
+  }
+
+  @objc internal func getObjects(
+    _ aBuffer: UnsafeMutablePointer<AnyObject>, range: _SwiftNSRange
+  ) {
+    return contents.withContiguousStorageIfAvailable { objects in
+      //TODO: exceptions instead of preconditions, once that's possible
+
+      _precondition(
+        _isValidArrayIndex(range.location, count: objects.count),
+        "Array index out of range")
+
+      _precondition(
+        _isValidArrayIndex(
+          range.location + range.length, count: objects.count),
+        "Array index out of range")
+
+      if objects.isEmpty { return }
+
+      // These objects are "returned" at +0, so treat them as pointer values to
+      // avoid retains. Copy bytes via a raw pointer to circumvent reference
+      // counting while correctly aliasing with all other pointer types.
+      UnsafeMutableRawPointer(aBuffer).copyMemory(
+        from: objects.baseAddress! + range.location,
+        byteCount: range.length * MemoryLayout<AnyObject>.stride)
+    }!
+  }
+
+  @objc(countByEnumeratingWithState:objects:count:)
+  internal func countByEnumerating(
+    with state: UnsafeMutablePointer<_SwiftNSFastEnumerationState>,
+    objects: UnsafeMutablePointer<AnyObject>?, count: Int
+  ) -> Int {
+    var enumerationState = state.pointee
+
+    if enumerationState.state != 0 {
+      return 0
+    }
+
+    return contents.withContiguousStorageIfAvailable {
+      objects in
+      enumerationState.mutationsPtr = _fastEnumerationStorageMutationsPtr
+      enumerationState.itemsPtr =
+        AutoreleasingUnsafeMutablePointer(objects.baseAddress)
+      enumerationState.state = 1
+      state.pointee = enumerationState
+      return objects.count
+    }!
+  }
+
+  @objc(copyWithZone:)
+  dynamic internal func copy(with _: _SwiftNSZone?) -> AnyObject {
+    return contents._bridgeToObjectiveCImpl()
+  }
+  
+  @objc(insertObject:atIndex:)
+  dynamic internal func insert(_ anObject: AnyObject, at index: Int) {
+    contents.insert(anObject, at: index)
+  }
+  
+  @objc(removeObjectAtIndex:)
+  dynamic internal func removeObject(at index: Int) {
+    contents.remove(at: index)
+  }
+  
+  @objc(addObject:)
+  dynamic internal func add(_ anObject: AnyObject) {
+    contents.append(anObject)
+  }
+  
+  @objc(removeLastObject)
+  dynamic internal func removeLastObject() {
+    if !contents.isEmpty {
+      contents.removeLast()
+    }
+  }
+  
+  @objc(replaceObjectAtIndex:withObject:)
+  dynamic internal func replaceObject(at index: Int, with anObject: AnyObject) {
+    //enforces bounds, unlike set equivalent, which can append
+    contents[index] = anObject
+  }
+  
+  //Non-core methods overridden for performance
+  
+  @objc(exchangeObjectAtIndex:withObjectAtIndex:)
+  dynamic internal func exchange(at index: Int, with index2: Int) {
+    contents.swapAt(index, index2)
+  }
+  
+  @objc(replaceObjectsInRange:withObjects:count:)
+  dynamic internal func replaceObjects(in range: _SwiftNSRange,
+                               with objects: UnsafePointer<AnyObject>,
+                               count: Int) {
+    let range = range.location ..< range.location + range.length
+    let buf = UnsafeBufferPointer(start: objects, count: count)
+    if range == contents.startIndex..<contents.endIndex {
+      contents = Array(buf)
+    } else {
+      // We make an Array here to make sure that something is holding onto the
+      // objects in `buf`, since replaceSubrange could release them
+      contents.replaceSubrange(range, with: Array(buf))
+    }
+  }
+  
+  @objc(insertObjects:count:atIndex:)
+  dynamic internal func insertObjects(_ objects: UnsafePointer<AnyObject>,
+                              count: Int,
+                              at index: Int) {
+    let buf = UnsafeBufferPointer(start: objects, count: count)
+    contents.insert(contentsOf: buf, at: index)
+  }
+    
+  @objc(indexOfObjectIdenticalTo:)
+  dynamic internal func index(ofObjectIdenticalTo object: AnyObject) -> Int {
+    return contents.firstIndex { $0 === object } ?? NSNotFound
+  }
+  
+  @objc(removeObjectsInRange:)
+  dynamic internal func removeObjects(in range: _SwiftNSRange) {
+    let range = range.location ..< range.location + range.length
+    contents.replaceSubrange(range, with: [])
+  }
+  
+  @objc(removeAllObjects)
+  dynamic internal func removeAllObjects() {
+    contents = []
+  }
+  
+  @objc(setObject:atIndex:)
+  dynamic internal func setObject(_ anObject: AnyObject, at index: Int) {
+    if index == contents.count {
+      contents.append(anObject)
+    } else {
+      contents[index] = anObject
+    }
+  }
+  
+  @objc(setObject:atIndexedSubscript:) dynamic
+  internal func setObjectSubscript(_ anObject: AnyObject, at index: Int) {
+    if index == contents.count {
+      contents.append(anObject)
+    } else {
+      contents[index] = anObject
+    }
+  }
+}
+
 /// An `NSArray` whose contiguous storage is created and filled, upon
 /// first access, by bridging the elements of a Swift `Array`.
 ///
@@ -160,10 +351,10 @@ extension __SwiftNativeNSArrayWithContiguousStorage : _NSArrayCore {
       to: Optional<AnyObject>.self)
   }
 
-  internal var _heapBufferBridged: _BridgingBufferStorage? {
+  internal var _heapBufferBridged: __BridgingBufferStorage? {
     if let ref =
       _stdlib_atomicLoadARCRef(object: _heapBufferBridgedPtr) {
-      return unsafeBitCast(ref, to: _BridgingBufferStorage.self)
+      return unsafeBitCast(ref, to: __BridgingBufferStorage.self)
     }
     return nil
   }
@@ -174,7 +365,7 @@ extension __SwiftNativeNSArrayWithContiguousStorage : _NSArrayCore {
     self._nativeStorage = _nativeStorage
   }
 
-  internal func _destroyBridgedStorage(_ hb: _BridgingBufferStorage?) {
+  internal func _destroyBridgedStorage(_ hb: __BridgingBufferStorage?) {
     if let bridgedStorage = hb {
       let buffer = _BridgingBuffer(bridgedStorage)
       let count = buffer.count
@@ -216,7 +407,7 @@ extension __SwiftNativeNSArrayWithContiguousStorage : _NSArrayCore {
 
           // Another thread won the race.  Throw out our buffer.
           _destroyBridgedStorage(
-            unsafeDowncast(objects.storage!, to: _BridgingBufferStorage.self))
+            unsafeDowncast(objects.storage!, to: __BridgingBufferStorage.self))
         }
         continue // Try again
       }
@@ -232,13 +423,7 @@ extension __SwiftNativeNSArrayWithContiguousStorage : _NSArrayCore {
   /// bridging of array elements.
   @objc
   internal override var count: Int {
-    if let bridgedStorage = _heapBufferBridged {
-      return _BridgingBuffer(bridgedStorage).count
-    }
-
-    // Check if elements are bridged verbatim.
-    return _nativeStorage._withVerbatimBridgedUnsafeBuffer { $0.count }
-      ?? _nativeStorage._getNonVerbatimBridgedCount()
+    return _nativeStorage.countAndCapacity.count
   }
 }
 #else
@@ -267,10 +452,10 @@ internal class __ContiguousArrayStorageBase
   @usableFromInline
   final var countAndCapacity: _ArrayBody
 
-  @inlinable // FIXME(sil-serialize-all)
+  @inlinable
   @nonobjc
   internal init(_doNotCallMeBase: ()) {
-    _sanityCheckFailure("creating instance of __ContiguousArrayStorageBase")
+    _internalInvariantFailure("creating instance of __ContiguousArrayStorageBase")
   }
   
 #if _runtime(_ObjC)
@@ -280,7 +465,7 @@ internal class __ContiguousArrayStorageBase
     if let result = try _withVerbatimBridgedUnsafeBuffer(body) {
       return result
     }
-    _sanityCheckFailure(
+    _internalInvariantFailure(
       "Can't use a buffer of non-verbatim-bridged elements as an NSArray")
   }
 
@@ -290,38 +475,44 @@ internal class __ContiguousArrayStorageBase
   internal func _withVerbatimBridgedUnsafeBuffer<R>(
     _ body: (UnsafeBufferPointer<AnyObject>) throws -> R
   ) rethrows -> R? {
-    _sanityCheckFailure(
+    _internalInvariantFailure(
       "Concrete subclasses must implement _withVerbatimBridgedUnsafeBuffer")
   }
 
-  @nonobjc
-  internal func _getNonVerbatimBridgedCount() -> Int {
-    _sanityCheckFailure(
-      "Concrete subclasses must implement _getNonVerbatimBridgedCount")
-  }
-
   internal func _getNonVerbatimBridgingBuffer() -> _BridgingBuffer {
-    _sanityCheckFailure(
+    _internalInvariantFailure(
       "Concrete subclasses must implement _getNonVerbatimBridgingBuffer")
+  }
+  
+  @objc(mutableCopyWithZone:)
+  dynamic internal func mutableCopy(with _: _SwiftNSZone?) -> AnyObject {
+    let arr = Array<AnyObject>(_ContiguousArrayBuffer(self))
+    return _SwiftNSMutableArray(arr)
+  }
+  
+  @objc(indexOfObjectIdenticalTo:)
+  dynamic internal func index(ofObjectIdenticalTo object: AnyObject) -> Int {
+    let arr = Array<AnyObject>(_ContiguousArrayBuffer(self))
+    return arr.firstIndex { $0 === object } ?? NSNotFound
   }
 #endif
 
-  @inlinable // FIXME(sil-serialize-all)
+@inlinable
   internal func canStoreElements(ofDynamicType _: Any.Type) -> Bool {
-    _sanityCheckFailure(
+    _internalInvariantFailure(
       "Concrete subclasses must implement canStoreElements(ofDynamicType:)")
   }
 
   /// A type that every element in the array is.
-  @inlinable // FIXME(sil-serialize-all)
+  @inlinable
   internal var staticElementType: Any.Type {
-    _sanityCheckFailure(
+    _internalInvariantFailure(
       "Concrete subclasses must implement staticElementType")
   }
-
-  @inlinable // FIXME(sil-serialize-all)
+  
+  @inlinable
   deinit {
-    _sanityCheck(
+    _internalInvariant(
       self !== _emptyArrayStorage, "Deallocating empty array storage?!")
   }
 }

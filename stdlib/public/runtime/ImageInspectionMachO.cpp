@@ -18,26 +18,32 @@
 ///
 //===----------------------------------------------------------------------===//
 
-#if defined(__APPLE__) && defined(__MACH__)
+#if defined(__APPLE__) && defined(__MACH__) &&                                 \
+    !defined(SWIFT_RUNTIME_MACHO_NO_DYLD)
 
 #include "ImageInspection.h"
+#include "ImageInspectionCommon.h"
+#include "swift/Runtime/Config.h"
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <objc/runtime.h>
 #include <assert.h>
 #include <dlfcn.h>
 
 using namespace swift;
 
 namespace {
-/// The Mach-O section name for the section containing protocol descriptor
-/// references. This lives within SEG_TEXT.
-constexpr const char ProtocolsSection[] = "__swift5_protos";
-/// The Mach-O section name for the section containing protocol conformances.
-/// This lives within SEG_TEXT.
-constexpr const char ProtocolConformancesSection[] = "__swift5_proto";
-/// The Mach-O section name for the section containing type references.
-/// This lives within SEG_TEXT.
-constexpr const char TypeMetadataRecordSection[] = "__swift5_types";
+
+constexpr const char ProtocolsSection[] = MachOProtocolsSection;
+constexpr const char ProtocolConformancesSection[] =
+    MachOProtocolConformancesSection;
+constexpr const char TypeMetadataRecordSection[] =
+    MachOTypeMetadataRecordSection;
+constexpr const char DynamicReplacementSection[] =
+    MachODynamicReplacementSection;
+constexpr const char DynamicReplacementSomeSection[] =
+    MachODynamicReplacementSomeSection;
+constexpr const char TextSegment[] = MachOTextSegment;
 
 #if __POINTER_WIDTH__ == 64
 using mach_header_platform = mach_header_64;
@@ -45,11 +51,9 @@ using mach_header_platform = mach_header_64;
 using mach_header_platform = mach_header;
 #endif
 
-extern "C" void *_NSGetMachExecuteHeader();
-
-template<const char *SECTION_NAME,
+template <const char *SEGMENT_NAME, const char *SECTION_NAME,
          void CONSUME_BLOCK(const void *start, uintptr_t size)>
-void addImageCallback(const mach_header *mh, intptr_t vmaddr_slide) {
+void addImageCallback(const mach_header *mh) {
 #if __POINTER_WIDTH__ == 64
   assert(mh->magic == MH_MAGIC_64 && "loaded non-64-bit image?!");
 #endif
@@ -58,7 +62,7 @@ void addImageCallback(const mach_header *mh, intptr_t vmaddr_slide) {
   unsigned long size;
   const uint8_t *section =
   getsectiondata(reinterpret_cast<const mach_header_platform *>(mh),
-                 SEG_TEXT, SECTION_NAME,
+                 SEGMENT_NAME, SECTION_NAME,
                  &size);
   
   if (!section)
@@ -66,25 +70,93 @@ void addImageCallback(const mach_header *mh, intptr_t vmaddr_slide) {
   
   CONSUME_BLOCK(section, size);
 }
+template <const char *SEGMENT_NAME, const char *SECTION_NAME,
+         void CONSUME_BLOCK(const void *start, uintptr_t size)>
+void addImageCallback(const mach_header *mh, intptr_t vmaddr_slide) {
+  addImageCallback<SEGMENT_NAME, SECTION_NAME, CONSUME_BLOCK>(mh);
+}
+
+template <const char *SEGMENT_NAME, const char *SECTION_NAME,
+          const char *SEGMENT_NAME2, const char *SECTION_NAME2,
+          void CONSUME_BLOCK(const void *start, uintptr_t size,
+                             const void *start2, uintptr_t size2)>
+void addImageCallback2Sections(const mach_header *mh) {
+#if __POINTER_WIDTH__ == 64
+  assert(mh->magic == MH_MAGIC_64 && "loaded non-64-bit image?!");
+#endif
+
+  // Look for a section.
+  unsigned long size;
+  const uint8_t *section =
+  getsectiondata(reinterpret_cast<const mach_header_platform *>(mh),
+                 SEGMENT_NAME, SECTION_NAME,
+                 &size);
+
+  if (!section)
+    return;
+
+  // Look for another section.
+  unsigned long size2;
+  const uint8_t *section2 =
+  getsectiondata(reinterpret_cast<const mach_header_platform *>(mh),
+                 SEGMENT_NAME2, SECTION_NAME2,
+                 &size2);
+  if (!section2)
+    size2 = 0;
+
+  CONSUME_BLOCK(section, size, section2, size2);
+}
+template <const char *SEGMENT_NAME, const char *SECTION_NAME,
+          const char *SEGMENT_NAME2, const char *SECTION_NAME2,
+          void CONSUME_BLOCK(const void *start, uintptr_t size,
+                             const void *start2, uintptr_t size2)>
+void addImageCallback2Sections(const mach_header *mh, intptr_t vmaddr_slide) {
+  addImageCallback2Sections<SEGMENT_NAME, SECTION_NAME,
+                            SEGMENT_NAME2, SECTION_NAME2,
+                            CONSUME_BLOCK>(mh);
+}
 
 } // end anonymous namespace
 
+#if OBJC_ADDLOADIMAGEFUNC_DEFINED && SWIFT_OBJC_INTEROP
+#define REGISTER_FUNC(...)                                               \
+  if (__builtin_available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)) { \
+    objc_addLoadImageFunc(__VA_ARGS__);                                  \
+  } else {                                                               \
+    _dyld_register_func_for_add_image(__VA_ARGS__);                      \
+  }
+#else
+#define REGISTER_FUNC(...) _dyld_register_func_for_add_image(__VA_ARGS__)
+#endif
+
+// WARNING: the callbacks are called from unsafe contexts (with the dyld and
+// ObjC runtime locks held) and must be very careful in what they do. Locking
+// must be arranged to avoid deadlocks (other code must never call out to dyld
+// or ObjC holding a lock that gets taken in one of these callbacks) and the
+// new/delete operators must not be called, in case a program supplies an
+// overload which does not cooperate with these requirements.
+
 void swift::initializeProtocolLookup() {
-  _dyld_register_func_for_add_image(
-    addImageCallback<ProtocolsSection,
-                     addImageProtocolsBlockCallback>);
+  REGISTER_FUNC(addImageCallback<TextSegment, ProtocolsSection,
+                                 addImageProtocolsBlockCallbackUnsafe>);
 }
 
 void swift::initializeProtocolConformanceLookup() {
-  _dyld_register_func_for_add_image(
-    addImageCallback<ProtocolConformancesSection,
-                     addImageProtocolConformanceBlockCallback>);
+  REGISTER_FUNC(
+      addImageCallback<TextSegment, ProtocolConformancesSection,
+                       addImageProtocolConformanceBlockCallbackUnsafe>);
 }
 void swift::initializeTypeMetadataRecordLookup() {
-  _dyld_register_func_for_add_image(
-    addImageCallback<TypeMetadataRecordSection,
-                     addImageTypeMetadataRecordBlockCallback>);
-  
+  REGISTER_FUNC(
+      addImageCallback<TextSegment, TypeMetadataRecordSection,
+                       addImageTypeMetadataRecordBlockCallbackUnsafe>);
+}
+
+void swift::initializeDynamicReplacementLookup() {
+  REGISTER_FUNC(
+      addImageCallback2Sections<TextSegment, DynamicReplacementSection,
+                                TextSegment, DynamicReplacementSomeSection,
+                                addImageDynamicReplacementBlockCallback>);
 }
 
 int swift::lookupSymbol(const void *address, SymbolInfo *info) {
@@ -95,18 +167,10 @@ int swift::lookupSymbol(const void *address, SymbolInfo *info) {
 
   info->fileName = dlinfo.dli_fname;
   info->baseAddress = dlinfo.dli_fbase;
-  info->symbolName = dlinfo.dli_sname;
+  info->symbolName.reset(dlinfo.dli_sname);
   info->symbolAddress = dlinfo.dli_saddr;
   return 1;
 }
 
-void *swift::lookupSection(const char *segment, const char *section, size_t *outSize) {
-  unsigned long size;
-  auto *executableHeader = static_cast<mach_header_platform *>(_NSGetMachExecuteHeader());
-  uint8_t *data = getsectiondata(executableHeader, segment, section, &size);
-  if (outSize != nullptr && data != nullptr)
-    *outSize = size;
-  return static_cast<void *>(data);
-}
-
-#endif // defined(__APPLE__) && defined(__MACH__)
+#endif // defined(__APPLE__) && defined(__MACH__) &&
+       // !defined(SWIFT_RUNTIME_MACHO_NO_DYLD)

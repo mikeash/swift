@@ -3,12 +3,12 @@
 from __future__ import print_function
 
 import argparse
+import difflib
+import io
 import os
-import subprocess
 import sys
 
-from test_util import TestFailedError, run_command, \
-    serializeIncrParseMarkupFile
+from test_util import TestFailedError, serializeIncrParseMarkupFile
 
 
 def main():
@@ -16,12 +16,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description='Utility for testing incremental syntax parsing',
         epilog='''
-    Based of a single template the utility generates a pre-edit and a post-edit 
-    file. It then verifies that incrementally parsing the post-edit file base 
-    on the pre-edit file results in the same syntax tree as reparsing the 
+    Based of a single template the utility generates a pre-edit and a post-edit
+    file. It then verifies that incrementally parsing the post-edit file base
+    on the pre-edit file results in the same syntax tree as reparsing the
     post-edit file from scratch.
 
-    To generate the pre-edit and the post-edit file from the template, it 
+    To generate the pre-edit and the post-edit file from the template, it
     operates on markers of the form:
 
         <<test_case<pre|||post>>>
@@ -68,54 +68,82 @@ def main():
     post_edit_serialized_file = temp_dir + '/' + test_file_name + '.' \
         + test_case + '.post.json'
 
+    incremental_diags_file = temp_dir + '/' + test_file_name + '.' \
+        + test_case + '.diagsViaIncr.txt'
+    post_edit_diags_file = temp_dir + '/' + test_file_name + '.' \
+        + test_case + '.post.diags.txt'
+
     # Generate the syntax tree once incrementally and once from scratch
     try:
-        serializeIncrParseMarkupFile(test_file=test_file, 
-                                     test_case=test_case, 
-                                     mode='incremental', 
-                                     serialization_mode='full',
-                                     serialization_format='json',
+        serializeIncrParseMarkupFile(test_file=test_file,
+                                     test_case=test_case,
+                                     mode='incremental',
                                      omit_node_ids=True,
-                                     output_file=incremental_serialized_file, 
-                                     temp_dir=temp_dir + '/temp', 
-                                     swift_syntax_test=swift_syntax_test, 
+                                     output_file=incremental_serialized_file,
+                                     diags_output_file=incremental_diags_file,
+                                     temp_dir=temp_dir + '/temp',
+                                     swift_syntax_test=swift_syntax_test,
                                      print_visual_reuse_info=visual_reuse_info)
         if visual_reuse_info:
-            # If we just want the reuse info, we don't need to parse the file 
+            # If we just want the reuse info, we don't need to parse the file
             # from scratch or validate it
             sys.exit(0)
 
-        serializeIncrParseMarkupFile(test_file=test_file, 
-                                     test_case=test_case, 
-                                     mode='post-edit', 
-                                     serialization_mode='full',
-                                     serialization_format='json',
+        serializeIncrParseMarkupFile(test_file=test_file,
+                                     test_case=test_case,
+                                     mode='post-edit',
                                      omit_node_ids=True,
-                                     output_file=post_edit_serialized_file, 
-                                     temp_dir=temp_dir + '/temp', 
-                                     swift_syntax_test=swift_syntax_test, 
+                                     output_file=post_edit_serialized_file,
+                                     diags_output_file=post_edit_diags_file,
+                                     temp_dir=temp_dir + '/temp',
+                                     swift_syntax_test=swift_syntax_test,
                                      print_visual_reuse_info=visual_reuse_info)
     except TestFailedError as e:
-        print('Test case "%s" of %s FAILed' % (test_case, test_file), 
+        print('Test case "%s" of %s FAILed' % (test_case, test_file),
               file=sys.stderr)
         print(e.message, file=sys.stderr)
         sys.exit(1)
 
     # Check if the two syntax trees are the same
-    try:
-        run_command(
-            [
-                'diff', '-u',
-                incremental_serialized_file,
-                post_edit_serialized_file
-            ])
-    except subprocess.CalledProcessError as e:
-        print('Test case "%s" of %s FAILed' % (test_case, test_file), 
+    lines = difflib.unified_diff(io.open(incremental_serialized_file, 'r',
+                                         encoding='utf-8', errors='ignore').readlines(),
+                                 io.open(post_edit_serialized_file, 'r',
+                                         encoding='utf-8', errors='ignore').readlines(),
+                                 fromfile=incremental_serialized_file,
+                                 tofile=post_edit_serialized_file)
+    diff = '\n'.join(line for line in lines)
+    if diff:
+        print('Test case "%s" of %s FAILed' % (test_case, test_file),
               file=sys.stderr)
         print('Syntax tree of incremental parsing does not match '
               'from-scratch parsing of post-edit file:\n\n', file=sys.stderr)
-        print(e.output, file=sys.stderr)
+        print(diff, file=sys.stderr)
         sys.exit(1)
+
+    # Verify that if the incremental parse resulted in parser diagnostics, those
+    # diagnostics were also emitted during the full parse.
+    # We can't just diff the outputs because the full parse includes diagnostics
+    # from the whole file, while the incremental parse includes only a subset.
+    # Each diagnostic is searched in the full parse diagnostics array but the
+    # search for each diagnostic continues from where the previous search
+    # stopped.
+    incremental_diags = open(incremental_diags_file).readlines()
+    post_edit_diags = open(post_edit_diags_file).readlines()
+    full_idx = 0
+    for diag in incremental_diags:
+        while full_idx < len(post_edit_diags):
+            if post_edit_diags[full_idx] == diag:
+                break
+            full_idx += 1
+        if full_idx == len(post_edit_diags):
+            print('Test case "%s" of %s FAILed' % (test_case, test_file),
+                  file=sys.stderr)
+            print('Parser diagnostic of incremental parsing was not emitted '
+                  'during from-scratch parsing of post-edit file:',
+                  file=sys.stderr)
+            print(diag, file=sys.stderr)
+            sys.exit(1)
+        full_idx += 1  # continue searching from the next diagnostic line.
 
 
 if __name__ == '__main__':

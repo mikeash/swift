@@ -65,7 +65,7 @@ raw_ostream &operator<<(raw_ostream &Out, const NodeAnnotation Value);
 // Redefine << so that we can output the name of the node kind.
 raw_ostream &operator<<(raw_ostream &Out, const SDKNodeKind Value);
 
-StringRef getDeclKindStr(const DeclKind Value);
+StringRef getDeclKindStr(const DeclKind Value, bool lower);
 
 // Redefine << so that we can output the name of decl kind.
 raw_ostream &operator<<(raw_ostream &Out, const DeclKind Value);
@@ -162,8 +162,7 @@ public:
 
   bool rightCommentUnderscored() const {
     DeclNameViewer Viewer(RightComment);
-    auto HasUnderScore =
-      [](StringRef S) { return S.find('_') != StringRef::npos; };
+    auto HasUnderScore = [](StringRef S) { return S.contains('_'); };
     auto Args = Viewer.args();
     return HasUnderScore(Viewer.base()) ||
         std::any_of(Args.begin(), Args.end(), HasUnderScore);

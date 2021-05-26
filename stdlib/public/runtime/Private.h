@@ -17,10 +17,16 @@
 #ifndef SWIFT_RUNTIME_PRIVATE_H
 #define SWIFT_RUNTIME_PRIVATE_H
 
+#include <functional>
+
 #include "swift/Demangling/Demangler.h"
+#include "swift/Demangling/TypeLookupError.h"
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/Metadata.h"
-#include "llvm/Support/Compiler.h"
+
+#if defined(__APPLE__) && defined(__MACH__)
+#include <TargetConditionals.h>
+#endif
 
 // Opaque ISAs need to use object_getClass which is in runtime.h
 #if SWIFT_HAS_OPAQUE_ISAS
@@ -46,8 +52,10 @@ public:
 
 #define REF_STORAGE(Name, ...) \
   void set##Name() { Data |= Name; } \
-  bool is##Name() const { return Data & Name; }
+  bool is##Name() const { return Data == Name; }
 #include "swift/AST/ReferenceStorage.def"
+
+  bool isStrong() const { return Data == 0; }
 };
 
 /// Type information consists of metadata and its ownership info,
@@ -55,20 +63,30 @@ public:
 /// since we don't represent ownership attributes in the metadata
 /// itself related info has to be bundled with it.
 class TypeInfo {
-  const Metadata *Type;
+  MetadataResponse Response;
   TypeReferenceOwnership ReferenceOwnership;
 
 public:
-  TypeInfo() : Type(nullptr), ReferenceOwnership() {}
+  TypeInfo()
+    : Response{nullptr, MetadataState::Abstract}, ReferenceOwnership() {}
 
+  TypeInfo(MetadataResponse response, TypeReferenceOwnership ownership)
+    : Response(response), ReferenceOwnership(ownership) {}
+
+  // FIXME: remove this constructor and require a response in all cases.
   TypeInfo(const Metadata *type, TypeReferenceOwnership ownership)
-      : Type(type), ReferenceOwnership(ownership) {}
+    : Response{type, MetadataState::Abstract}, ReferenceOwnership(ownership) {}
 
-  operator const Metadata *() { return Type; }
+  const Metadata *getMetadata() const { return Response.Value; }
+  MetadataResponse getResponse() const { return Response; }
 
-  bool isWeak() const { return ReferenceOwnership.isWeak(); }
-  bool isUnowned() const { return ReferenceOwnership.isUnowned(); }
-  bool isUnmanaged() const { return ReferenceOwnership.isUnmanaged(); }
+  operator bool() const { return getMetadata(); }
+
+#define REF_STORAGE(Name, ...) \
+  bool is##Name() const { return ReferenceOwnership.is##Name(); }
+#include "swift/AST/ReferenceStorage.def"
+
+  bool isStrong() const { return ReferenceOwnership.isStrong(); }
 
   TypeReferenceOwnership getReferenceOwnership() const {
     return ReferenceOwnership;
@@ -78,6 +96,35 @@ public:
 #if SWIFT_HAS_ISA_MASKING
   SWIFT_RUNTIME_EXPORT
   uintptr_t swift_isaMask;
+
+// Hardcode the mask. We have our own copy of the value, as it's hard to work
+// out the proper includes from libobjc. The values MUST match the ones from
+// libobjc. Debug builds check these values against objc_debug_isa_class_mask
+// from libobjc.
+#  if TARGET_OS_SIMULATOR && __x86_64__
+// Simulators don't currently use isa masking on x86, but we still want to emit
+// swift_isaMask and the corresponding code in case that changes. libobjc's
+// mask has the bottom bits clear to include pointer alignment, match that
+// value here.
+#    define SWIFT_ISA_MASK 0xfffffffffffffff8ULL
+#  elif __arm64__
+// The ISA mask used when ptrauth is available.
+#  define SWIFT_ISA_MASK_PTRAUTH 0x007ffffffffffff8ULL
+// ARM64 simulators always use the ARM64e mask.
+#    if __has_feature(ptrauth_calls) || TARGET_OS_SIMULATOR
+#      define SWIFT_ISA_MASK SWIFT_ISA_MASK_PTRAUTH
+#    else
+#      if TARGET_OS_OSX
+#      define SWIFT_ISA_MASK 0x00007ffffffffff8ULL
+#      else
+#      define SWIFT_ISA_MASK 0x0000000ffffffff8ULL
+#      endif
+#    endif
+#  elif __x86_64__
+#    define SWIFT_ISA_MASK 0x00007ffffffffff8ULL
+#  else
+#    error Unknown architecture for masked isa.
+#  endif
 #endif
 
 #if SWIFT_OBJC_INTEROP
@@ -128,7 +175,7 @@ public:
 
 #if SWIFT_HAS_ISA_MASKING
     // Apply the mask.
-    bits &= swift_isaMask;
+    bits &= SWIFT_ISA_MASK;
 #endif
 
     // The result is a class pointer.
@@ -160,16 +207,16 @@ public:
   }
 #endif
 
-  LLVM_LIBRARY_VISIBILITY
+  SWIFT_LIBRARY_VISIBILITY
   const ClassMetadata *_swift_getClass(const void *object);
 
-  LLVM_LIBRARY_VISIBILITY
+  SWIFT_LIBRARY_VISIBILITY
   bool usesNativeSwiftReferenceCounting(const ClassMetadata *theClass);
 
   static inline
   bool objectUsesNativeSwiftReferenceCounting(const void *object) {
     assert(!isObjCTaggedPointerOrNull(object));
-#if SWIFT_HAS_OPAQUE_ISAS
+#if SWIFT_OBJC_INTEROP && SWIFT_HAS_OPAQUE_ISAS
     // Fast path for opaque ISAs.  We don't want to call
     // _swift_getClassOfAllocated as that will call object_getClass.
     // Instead we can look at the bits in the ISA and tell if its a
@@ -218,35 +265,47 @@ public:
   _contextDescriptorMatchesMangling(const ContextDescriptor *context,
                                     Demangle::NodePointer node);
   
-  const TypeContextDescriptor *
+  const ContextDescriptor *
   _searchConformancesByMangledTypeName(Demangle::NodePointer node);
 
   Demangle::NodePointer _swift_buildDemanglingForMetadata(const Metadata *type,
                                                       Demangle::Demangler &Dem);
 
-  /// Callback used to provide the substitution for a generic parameter
-  /// referenced by a "flat" index (where all depths have been collapsed)
-  /// to its metadata.
-  using SubstFlatGenericParameterFn =
-    llvm::function_ref<const Metadata *(unsigned flatIndex)>;
-
   /// Callback used to provide the substitution of a generic parameter
   /// (described by depth/index) to its metadata.
   using SubstGenericParameterFn =
-    llvm::function_ref<const Metadata *(unsigned depth, unsigned index)>;
+    std::function<const Metadata *(unsigned depth, unsigned index)>;
+
+  /// Callback used to provide the substitution of a witness table based on
+  /// its index into the enclosing generic environment.
+  using SubstDependentWitnessTableFn =
+    std::function<const WitnessTable *(const Metadata *type, unsigned index)>;
 
   /// Function object that produces substitutions for the generic parameters
   /// that occur within a mangled name, using the generic arguments from
   /// the given metadata.
   ///
-  /// Use with \c _getTypeByMangledName to decode potentially-generic types.
+  /// Use with \c _getTypeByMangledName to decode potentially-generic
+  /// types.
   class SWIFT_RUNTIME_LIBRARY_VISIBILITY SubstGenericParametersFromMetadata {
-    const Metadata *base;
+    /// Whether the source is metadata (vs. a generic environment);
+    const bool sourceIsMetadata;
+
+    union {
+      const TargetContextDescriptor<InProcess> *baseContext;
+      const TargetGenericEnvironment<InProcess> *environment;
+    };
+
+    /// The generic arguments.
+    const void * const *genericArgs;
 
     /// An element in the descriptor path.
     struct PathElement {
-      /// The context described by this path element.
-      const ContextDescriptor *context;
+      /// The generic parameters local to this element.
+      llvm::ArrayRef<GenericParamDescriptor> localGenericParams;
+
+      /// The total number of generic parameters.
+      unsigned numTotalGenericParams;
 
       /// The number of key parameters in the parent.
       unsigned numKeyGenericParamsInParent;
@@ -260,13 +319,21 @@ public:
 
     /// Information about the generic context descriptors that make up \c
     /// descriptor, from the outermost to the innermost.
-    mutable std::vector<PathElement> descriptorPath;
+    mutable llvm::SmallVector<PathElement, 8> descriptorPath;
+
+    /// The number of key generic parameters.
+    mutable unsigned numKeyGenericParameters = 0;
 
     /// Builds the descriptor path.
     ///
     /// \returns a pair containing the number of key generic parameters in
     /// the path up to this point.
-    unsigned buildDescriptorPath(const ContextDescriptor *context) const;
+    unsigned buildDescriptorPath(const ContextDescriptor *context,
+                                 Demangler &demangler) const;
+
+    /// Builds a path from the generic environment.
+    unsigned buildEnvironmentPath(
+               const TargetGenericEnvironment<InProcess> *environment) const;
 
     // Set up the state we need to compute substitutions.
     void setup() const;
@@ -274,18 +341,60 @@ public:
   public:
     /// Produce substitutions entirely from the given metadata.
     explicit SubstGenericParametersFromMetadata(const Metadata *base)
-      : base(base) { }
+      : sourceIsMetadata(true), baseContext(base->getTypeContextDescriptor()),
+        genericArgs(base ? (const void * const *)base->getGenericArgs()
+                         : nullptr) { }
+    
+    /// Produce substitutions from the given instantiation arguments for the
+    /// given context.
+    explicit SubstGenericParametersFromMetadata(const ContextDescriptor *base,
+                                                const void * const *args)
+      : sourceIsMetadata(true), baseContext(base), genericArgs(args)
+    {}
 
-    const Metadata *operator()(unsigned flatIndex) const;
-    const Metadata *operator()(unsigned depth, unsigned index) const;
+    /// Produce substitutions from the given instantiation arguments for the
+    /// given generic environment.
+    explicit SubstGenericParametersFromMetadata(
+               const TargetGenericEnvironment<InProcess> *environment,
+               const void * const *arguments)
+      : sourceIsMetadata(false), environment(environment),
+        genericArgs(arguments) { }
+    
+    const void * const *getGenericArgs() const { return genericArgs; }
+
+    const Metadata *getMetadata(unsigned depth, unsigned index) const;
+    const WitnessTable *getWitnessTable(const Metadata *type,
+                                        unsigned index) const;
   };
+
+  /// Retrieve the type metadata described by the given demangled type name.
+  ///
+  /// \p substGenericParam Function that provides generic argument metadata
+  /// given a particular generic parameter specified by depth/index.
+  /// \p substWitnessTable Function that provides witness tables given a
+  /// particular dependent conformance index.
+  SWIFT_CC(swift)
+  TypeLookupErrorOr<TypeInfo> swift_getTypeByMangledNode(
+                               MetadataRequest request,
+                               Demangler &demangler,
+                               Demangle::NodePointer node,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable);
 
   /// Retrieve the type metadata described by the given type name.
   ///
   /// \p substGenericParam Function that provides generic argument metadata
   /// given a particular generic parameter specified by depth/index.
-  TypeInfo _getTypeByMangledName(StringRef typeName,
-                                 SubstGenericParameterFn substGenericParam);
+  /// \p substWitnessTable Function that provides witness tables given a
+  /// particular dependent conformance index.
+  SWIFT_CC(swift)
+  TypeLookupErrorOr<TypeInfo> swift_getTypeByMangledName(
+                               MetadataRequest request,
+                               StringRef typeName,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable);
 
   /// Function object that produces substitutions for the generic parameters
   /// that occur within a mangled name, using the complete set of generic
@@ -294,10 +403,10 @@ public:
   /// Use with \c _getTypeByMangledName to decode potentially-generic types.
   class SWIFT_RUNTIME_LIBRARY_VISIBILITY SubstGenericParametersFromWrittenArgs {
     /// The complete set of generic arguments.
-    const std::vector<const Metadata *> &allGenericArgs;
+    const llvm::SmallVectorImpl<const Metadata *> &allGenericArgs;
 
     /// The counts of generic parameters at each level.
-    const std::vector<unsigned> &genericParamCounts;
+    const llvm::SmallVectorImpl<unsigned> &genericParamCounts;
 
   public:
     /// Initialize a new function object to handle substitutions. Both
@@ -311,20 +420,22 @@ public:
     /// \param genericParamCounts The count of generic parameters at each
     /// generic level, typically gathered by _gatherGenericParameterCounts.
     explicit SubstGenericParametersFromWrittenArgs(
-        const std::vector<const Metadata *> &allGenericArgs,
-        const std::vector<unsigned> &genericParamCounts)
-      : allGenericArgs(allGenericArgs), genericParamCounts(genericParamCounts) {
-    }
+        const llvm::SmallVectorImpl<const Metadata *> &allGenericArgs,
+        const llvm::SmallVectorImpl<unsigned> &genericParamCounts)
+        : allGenericArgs(allGenericArgs),
+          genericParamCounts(genericParamCounts) {}
 
-    const Metadata *operator()(unsigned flatIndex) const;
-    const Metadata *operator()(unsigned depth, unsigned index) const;
+    const Metadata *getMetadata(unsigned depth, unsigned index) const;
+    const WitnessTable *getWitnessTable(const Metadata *type,
+                                        unsigned index) const;
   };
 
   /// Gather generic parameter counts from a context descriptor.
   ///
   /// \returns true if the innermost descriptor is generic.
   bool _gatherGenericParameterCounts(const ContextDescriptor *descriptor,
-                                     std::vector<unsigned> &genericParamCounts);
+                                     llvm::SmallVectorImpl<unsigned> &genericParamCounts,
+                                     Demangler &BorrowFrom);
 
   /// Map depth/index to a flat index.
   llvm::Optional<unsigned> _depthIndexToFlatIndex(
@@ -341,12 +452,12 @@ public:
   /// generic requirements (e.g., those that need to be
   /// passed to an instantiation function) will be added to this vector.
   ///
-  /// \returns true if an error occurred, false otherwise.
-  bool _checkGenericRequirements(
-                    llvm::ArrayRef<GenericRequirementDescriptor> requirements,
-                    std::vector<const void *> &extraArguments,
-                    SubstFlatGenericParameterFn substFlatGenericParam,
-                    SubstGenericParameterFn substGenericParam);
+  /// \returns the error if an error occurred, None otherwise.
+  llvm::Optional<TypeLookupError> _checkGenericRequirements(
+      llvm::ArrayRef<GenericRequirementDescriptor> requirements,
+      llvm::SmallVectorImpl<const void *> &extraArguments,
+      SubstGenericParameterFn substGenericParam,
+      SubstDependentWitnessTableFn substWitnessTable);
 
   /// A helper function which avoids performing a store if the destination
   /// address already contains the source value.  This is useful when
@@ -372,6 +483,24 @@ public:
     return c;
 #endif
   }
+  
+  template<> inline const ClassMetadata *
+  Metadata::getClassObject() const {
+    switch (getKind()) {
+    case MetadataKind::Class: {
+      // Native Swift class metadata is also the class object.
+      return static_cast<const ClassMetadata *>(this);
+    }
+    case MetadataKind::ObjCClassWrapper: {
+      // Objective-C class objects are referenced by their Swift metadata wrapper.
+      auto wrapper = static_cast<const ObjCClassWrapperMetadata *>(this);
+      return wrapper->Class;
+    }
+    // Other kinds of types don't have class objects.
+    default:
+      return nullptr;
+    }
+  }
 
   void *allocateMetadata(size_t size, size_t align);
 
@@ -389,7 +518,8 @@ public:
   /// \endcode
   void gatherWrittenGenericArgs(const Metadata *metadata,
                                 const TypeContextDescriptor *description,
-                                std::vector<const Metadata *> &allGenericArgs);
+                                llvm::SmallVectorImpl<const Metadata *> &allGenericArgs,
+                                Demangler &BorrowFrom);
 
   Demangle::NodePointer
   _buildDemanglingForContext(const ContextDescriptor *context,
@@ -452,10 +582,62 @@ public:
                            ProtocolDescriptorRef protocol,
                            const WitnessTable **conformance);
 
-  /// Given a type that we know conforms to the given protocol, find the
-  /// superclass that introduced the conformance.
-  const Metadata *findConformingSuperclass(const Metadata *type,
-                                           const ProtocolDescriptor *protocol);
+  /// Construct type metadata for the given protocol.
+  const Metadata *
+  _getSimpleProtocolTypeMetadata(const ProtocolDescriptor *protocol);
+
+  /// Given a type that we know can be used with the given conformance, find
+  /// the superclass that introduced the conformance.
+  const Metadata *findConformingSuperclass(
+                             const Metadata *type,
+                             const ProtocolConformanceDescriptor *conformance);
+
+  /// Determine whether the given type conforms to the given Swift protocol,
+  /// returning the appropriate protocol conformance descriptor when it does.
+  const ProtocolConformanceDescriptor *
+  swift_conformsToSwiftProtocol(const Metadata * const type,
+                                const ProtocolDescriptor *protocol,
+                                StringRef module);
+
+  /// Retrieve an associated type witness from the given witness table.
+  ///
+  /// \param wtable The witness table.
+  /// \param conformingType Metadata for the conforming type.
+  /// \param reqBase "Base" requirement used to compute the witness index
+  /// \param assocType Associated type descriptor.
+  ///
+  /// \returns metadata for the associated type witness.
+  SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+  MetadataResponse swift_getAssociatedTypeWitnessSlow(
+                                        MetadataRequest request,
+                                        WitnessTable *wtable,
+                                        const Metadata *conformingType,
+                                        const ProtocolRequirement *reqBase,
+                                        const ProtocolRequirement *assocType);
+
+  /// Retrieve an associated conformance witness table from the given witness
+  /// table.
+  ///
+  /// \param wtable The witness table.
+  /// \param conformingType Metadata for the conforming type.
+  /// \param assocType Metadata for the associated type.
+  /// \param reqBase "Base" requirement used to compute the witness index
+  /// \param assocConformance Associated conformance descriptor.
+  ///
+  /// \returns corresponding witness table.
+  SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+  const WitnessTable *swift_getAssociatedConformanceWitnessSlow(
+                                  WitnessTable *wtable,
+                                  const Metadata *conformingType,
+                                  const Metadata *assocType,
+                                  const ProtocolRequirement *reqBase,
+                                  const ProtocolRequirement *assocConformance);
+
+#if SWIFT_OBJC_INTEROP
+  /// Returns a retained Quick Look representation object an Obj-C object.
+  SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+  id _quickLookObjectForPointer(void *value);
+#endif
 
 } // end namespace swift
 

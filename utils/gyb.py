@@ -4,16 +4,20 @@
 
 from __future__ import print_function
 
+import io
 import os
 import re
 import sys
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from io import StringIO
 import textwrap
 import tokenize
 from bisect import bisect
+
+
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+
 
 try:
     basestring
@@ -48,7 +52,7 @@ def split_lines(s):
     If the lines are later concatenated, the result is s, possibly
     with a single appended newline.
     """
-    return [l + '\n' for l in s.split('\n')]
+    return [line + '\n' for line in s.split('\n')]
 
 
 # text on a line up to the first '$$', '${', or '%%'
@@ -99,7 +103,7 @@ tokenize_re = re.compile(
   )
 ''', re.VERBOSE | re.MULTILINE)
 
-gyb_block_close = re.compile('\}%[ \t]*\n?')
+gyb_block_close = re.compile(r'\}%[ \t]*\n?')
 
 
 def token_pos_to_index(token_pos, start, line_starts):
@@ -395,8 +399,10 @@ class ParseContext(object):
 
     def __init__(self, filename, template=None):
         self.filename = os.path.abspath(filename)
+        if sys.platform == 'win32':
+            self.filename = '/'.join(self.filename.split(os.sep))
         if template is None:
-            with open(filename) as f:
+            with io.open(os.path.normpath(filename), encoding='utf-8') as f:
                 self.template = f.read()
         else:
             self.template = template
@@ -573,8 +579,6 @@ class ExecutionContext(object):
                 # We can only insert the line directive at a line break
                 if len(self.result_text) == 0 \
                    or self.result_text[-1].endswith('\n'):
-                    if sys.platform == 'win32':
-                        file = file.replace('\\', '/')
                     substitutions = {'file': file, 'line': line + 1}
                     format_str = self.line_directive + '\n'
                     self.result_text.append(format_str % substitutions)
@@ -733,8 +737,10 @@ class Code(ASTNode):
             result_string = None
             if isinstance(result, Number) and not isinstance(result, Integral):
                 result_string = repr(result)
-            else:
+            elif isinstance(result, Integral) or isinstance(result, list):
                 result_string = str(result)
+            else:
+                result_string = StringIO(result).read()
             context.append_text(
                 result_string, self.filename, self.start_line_number)
 
@@ -745,13 +751,13 @@ class Code(ASTNode):
             s = indent + 'Code: {' + source_lines[0] + '}'
         else:
             s = indent + 'Code:\n' + indent + '{\n' + '\n'.join(
-                indent + 4 * ' ' + l for l in source_lines
+                indent + 4 * ' ' + line for line in source_lines
             ) + '\n' + indent + '}'
         return s + self.format_children(indent)
 
 
 def expand(filename, line_directive=_default_line_directive, **local_bindings):
-    r"""Return the contents of the givepn template file, executed with the given
+    r"""Return the contents of the given template file, executed with the given
     local bindings.
 
     >>> from tempfile import NamedTemporaryFile
@@ -760,8 +766,8 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     >>> # manually handle closing and deleting this file to allow us to open
     >>> # the file by its name across all platforms.
     >>> f = NamedTemporaryFile(delete=False)
-    >>> f.write(
-    ... r'''---
+    >>> _ = f.write(
+    ... br'''---
     ... % for i in range(int(x)):
     ... a pox on ${i} for epoxy
     ... % end
@@ -779,7 +785,7 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     ...                    'line: %(line)d)',
     ...     x=2
     ... ).replace(
-    ...   '"%s"' % f.name, '"dummy.file"')
+    ...   '"%s"' % f.name.replace('\\', '/'), '"dummy.file"')
     >>> print(result, end='')
     //#sourceLocation(file: "dummy.file", line: 1)
     ---
@@ -800,7 +806,7 @@ def expand(filename, line_directive=_default_line_directive, **local_bindings):
     >>> f.close()
     >>> os.remove(f.name)
     """
-    with open(filename) as f:
+    with io.open(filename, encoding='utf-8') as f:
         t = parse_template(filename, f.read())
         d = os.getcwd()
         os.chdir(os.path.dirname(os.path.abspath(filename)))
@@ -1067,7 +1073,7 @@ def execute_template(
     Keyword arguments become local variable bindings in the execution context
 
     >>> root_directory = os.path.abspath('/')
-    >>> file_name = root_directory + 'dummy.file'
+    >>> file_name = (root_directory + 'dummy.file').replace('\\', '/')
     >>> ast = parse_template(file_name, text=
     ... '''Nothing
     ... % if x:
@@ -1133,16 +1139,6 @@ def execute_template(
 
 
 def main():
-    """
-    Lint this file.
-    >>> import sys
-    >>> gyb_path = os.path.realpath(__file__).replace('.pyc', '.py')
-    >>> sys.path.append(os.path.dirname(gyb_path))
-    >>> import python_lint
-    >>> python_lint.lint([gyb_path], verbose=False)
-    0
-    """
-
     import argparse
     import sys
 
@@ -1215,12 +1211,12 @@ def main():
         help='''Bindings to be set in the template's execution context''')
 
     parser.add_argument(
-        'file', type=argparse.FileType(),
+        'file', type=str,
         help='Path to GYB template file (defaults to stdin)', nargs='?',
-        default=sys.stdin)
+        default='-')
     parser.add_argument(
-        '-o', dest='target', type=argparse.FileType('w'),
-        help='Output file (defaults to stdout)', default=sys.stdout)
+        '-o', dest='target', type=str,
+        help='Output file (defaults to stdout)', default='-')
     parser.add_argument(
         '--test', action='store_true',
         default=False, help='Run a self-test')
@@ -1237,7 +1233,10 @@ def main():
              Line directive format string, which will be
              provided 2 substitutions, `%%(line)d` and `%%(file)s`.
 
-             Example: `// #sourceLocation(file: "%%(file)s", line: %%(line)d)`
+             Example: `#sourceLocation(file: "%%(file)s", line: %%(line)d)`
+
+             The default works automatically with the `line-directive` tool,
+             which see for more information.
              ''')
 
     args = parser.parse_args(sys.argv[1:])
@@ -1249,15 +1248,23 @@ def main():
             sys.exit(1)
 
     bindings = dict(x.split('=', 1) for x in args.defines)
-    ast = parse_template(args.file.name, args.file.read())
+    if args.file == '-':
+        ast = parse_template('stdin', sys.stdin.read())
+    else:
+        with io.open(os.path.normpath(args.file), 'r', encoding='utf-8') as f:
+            ast = parse_template(args.file, f.read())
     if args.dump:
         print(ast)
     # Allow the template to open files and import .py files relative to its own
     # directory
-    os.chdir(os.path.dirname(os.path.abspath(args.file.name)))
+    os.chdir(os.path.dirname(os.path.abspath(args.file)))
     sys.path = ['.'] + sys.path
 
-    args.target.write(execute_template(ast, args.line_directive, **bindings))
+    if args.target == '-':
+        sys.stdout.write(execute_template(ast, args.line_directive, **bindings))
+    else:
+        with io.open(args.target, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(execute_template(ast, args.line_directive, **bindings))
 
 
 if __name__ == '__main__':

@@ -20,7 +20,7 @@
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
-#include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -53,9 +53,26 @@ void trySpecializeApplyOfGeneric(
 /// Specifically, it contains information which formal parameters and returns
 /// are changed from indirect values to direct values.
 class ReabstractionInfo {
-  /// A 1-bit means that this parameter/return value is converted from indirect
-  /// to direct.
+  /// A 1-bit means that this argument (= either indirect return value or
+  /// parameter) is converted from indirect to direct.
   SmallBitVector Conversions;
+
+  /// For each bit set in Conversions, there is a bit set in TrivialArgs if the
+  /// argument has a trivial type.
+  SmallBitVector TrivialArgs;
+
+  /// Set to true if the function has a re-abstracted (= converted from
+  /// indirect to direct) resilient argument or return type. This can happen if
+  /// the function is compiled within the type's resilience domain, i.e. in
+  /// its module (where the type is loadable).
+  /// In this case we need to generate a different mangled name for the
+  /// function to distinguish it from functions in other modules, which cannot
+  /// re-abstract this resilient type.
+  /// Fortunately, a flag is sufficient to describe this: either a function has
+  /// re-abstracted resilient types or not. It cannot happen that two
+  /// functions have two different subsets of re-abstracted resilient parameter
+  /// types.
+  bool hasConvertedResilientParams = false;
 
   /// If set, indirect to direct conversions should be performed by the generic
   /// specializer.
@@ -78,7 +95,7 @@ class ReabstractionInfo {
 
   /// The generic signature of the specialization.
   /// It is nullptr if the specialization is not polymorphic.
-  GenericSignature *SpecializedGenericSig;
+  GenericSignature SpecializedGenericSig;
 
   // Set of substitutions from callee's invocation before
   // any transformations performed by the generic specializer.
@@ -100,6 +117,11 @@ class ReabstractionInfo {
   // Reference to the original generic non-specialized callee function.
   SILFunction *Callee;
 
+  // The module the specialization is created in.
+  ModuleDecl *TargetModule = nullptr;
+
+  bool isWholeModule = false;
+
   // The apply site which invokes the generic function.
   ApplySite Apply;
 
@@ -114,12 +136,36 @@ class ReabstractionInfo {
   // It uses interface types.
   SubstitutionMap CallerInterfaceSubs;
 
+  bool isPrespecialization = false;
+
+  // Is the generated specialization going to be serialized?
+  IsSerialized_t Serialized;
+  
+  enum TypeCategory {
+    NotLoadable,
+    Loadable,
+    LoadableAndTrivial
+  };
+  
+  unsigned param2ArgIndex(unsigned ParamIdx) const  {
+    return ParamIdx + NumFormalIndirectResults;
+  }
+
   // Create a new substituted type with the updated signature.
   CanSILFunctionType createSubstitutedType(SILFunction *OrigF,
                                            SubstitutionMap SubstMap,
                                            bool HasUnboundGenericParams);
 
   void createSubstitutedAndSpecializedTypes();
+  
+  TypeCategory getReturnTypeCategory(const SILResultInfo &RI,
+                                     const SILFunctionConventions &substConv,
+                                     TypeExpansionContext typeExpansion);
+
+  TypeCategory getParamTypeCategory(const SILParameterInfo &PI,
+                                    const SILFunctionConventions &substConv,
+                                    TypeExpansionContext typeExpansion);
+
   bool prepareAndCheck(ApplySite Apply, SILFunction *Callee,
                        SubstitutionMap ParamSubs,
                        OptRemark::Emitter *ORE = nullptr);
@@ -131,27 +177,49 @@ class ReabstractionInfo {
   void finishPartialSpecializationPreparation(
       FunctionSignaturePartialSpecializer &FSPS);
 
-  ReabstractionInfo() {}
 public:
+  ReabstractionInfo() {}
+
   /// Constructs the ReabstractionInfo for generic function \p Callee with
   /// substitutions \p ParamSubs.
   /// If specialization is not possible getSpecializedType() will return an
   /// invalid type.
-  ReabstractionInfo(ApplySite Apply, SILFunction *Callee,
+  ReabstractionInfo(ModuleDecl *targetModule,
+                    bool isModuleWholeModule,
+                    ApplySite Apply, SILFunction *Callee,
                     SubstitutionMap ParamSubs,
+                    IsSerialized_t Serialized,
                     bool ConvertIndirectToDirect = true,
                     OptRemark::Emitter *ORE = nullptr);
 
   /// Constructs the ReabstractionInfo for generic function \p Callee with
-  /// additional requirements. Requirements may contain new layout,
-  /// conformances or same concrete type requirements.
-  ReabstractionInfo(SILFunction *Callee, ArrayRef<Requirement> Requirements);
+  /// a specialization signature.
+  ReabstractionInfo(ModuleDecl *targetModule, bool isModuleWholeModule,
+                    SILFunction *Callee, GenericSignature SpecializedSig,
+                    bool isPrespecialization = false);
+
+  bool isPrespecialized() const { return isPrespecialization; }
+
+  IsSerialized_t isSerialized() const {
+    return Serialized;
+  }
+  
+  /// Returns true if the specialized function needs an alternative mangling.
+  /// See hasConvertedResilientParams.
+  bool needAlternativeMangling() const {
+    return hasConvertedResilientParams;
+  }
+
+  TypeExpansionContext getResilienceExpansion() const {
+    auto resilience = (Serialized ? ResilienceExpansion::Minimal
+                                  : ResilienceExpansion::Maximal);
+    return TypeExpansionContext(resilience, TargetModule, isWholeModule);
+  }
 
   /// Returns true if the \p ParamIdx'th (non-result) formal parameter is
   /// converted from indirect to direct.
   bool isParamConverted(unsigned ParamIdx) const {
-    return ConvertIndirectToDirect &&
-           Conversions.test(ParamIdx + NumFormalIndirectResults);
+    return ConvertIndirectToDirect && isArgConverted(param2ArgIndex(ParamIdx));
   }
 
   /// Returns true if the \p ResultIdx'th formal result is converted from
@@ -204,7 +272,7 @@ public:
     return SpecializedGenericEnv;
   }
 
-  GenericSignature *getSpecializedGenericSignature() const {
+  GenericSignature getSpecializedGenericSignature() const {
     return SpecializedGenericSig;
   }
 
@@ -263,7 +331,6 @@ class GenericFuncSpecializer {
   SILModule &M;
   SILFunction *GenericFunc;
   SubstitutionMap ParamSubs;
-  IsSerialized_t Serialized;
   const ReabstractionInfo &ReInfo;
 
   SubstitutionMap ContextSubs;
@@ -273,24 +340,23 @@ public:
   GenericFuncSpecializer(SILOptFunctionBuilder &FuncBuilder,
                          SILFunction *GenericFunc,
                          SubstitutionMap ParamSubs,
-                         IsSerialized_t Serialized,
                          const ReabstractionInfo &ReInfo);
 
   /// If we already have this specialization, reuse it.
   SILFunction *lookupSpecialization();
 
   /// Return a newly created specialized function.
-  SILFunction *tryCreateSpecialization();
+  SILFunction *tryCreateSpecialization(bool forcePrespecialization = false);
 
   /// Try to specialize GenericFunc given a list of ParamSubs.
   /// Returns either a new or existing specialized function, or nullptr.
-  SILFunction *trySpecialization() {
+  SILFunction *trySpecialization(bool forcePrespecialization = false) {
     if (!ReInfo.getSpecializedType())
       return nullptr;
 
     SILFunction *SpecializedF = lookupSpecialization();
     if (!SpecializedF)
-      SpecializedF = tryCreateSpecialization();
+      SpecializedF = tryCreateSpecialization(forcePrespecialization);
 
     return SpecializedF;
   }
@@ -307,6 +373,12 @@ public:
 /// Checks if a given mangled name could be a name of a known
 /// prespecialization for -Onone support.
 bool isKnownPrespecialization(StringRef SpecName);
+
+/// Checks if all OnoneSupport pre-specializations are included in the module
+/// as public functions.
+///
+/// Issues errors for all missing functions.
+void checkCompletenessOfPrespecializations(SILModule &M);
 
 /// Create a new apply based on an old one, but with a different
 /// function being applied.

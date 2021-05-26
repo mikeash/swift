@@ -1,32 +1,68 @@
-function(swift_android_libcxx_include_paths var)
-  set(${var}
-        "${SWIFT_ANDROID_NDK_PATH}/sources/cxx-stl/llvm-libc++/include"
-        "${SWIFT_ANDROID_NDK_PATH}/sources/cxx-stl/llvm-libc++abi/include"
-      PARENT_SCOPE)
-endfunction()
-
-function(swift_android_include_for_arch arch var)
-  set(paths)
-  list(APPEND paths
-       "${SWIFT_ANDROID_NDK_PATH}/sources/android/support/include"
-       "${SWIFT_ANDROID_NDK_PATH}/sysroot/usr/include"
-       "${SWIFT_ANDROID_NDK_PATH}/sysroot/usr/include/${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_TRIPLE}") 
-  set(${var} ${paths} PARENT_SCOPE)
-endfunction()
-
-function(swift_android_lib_for_arch arch var)
-  set(_prebuilt "${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_PREBUILT_PATH}")
-  set(_host "${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_TRIPLE}")
-
-  set(paths)
-  if(arch STREQUAL armv7)
-    list(APPEND paths "${_prebuilt}/${_host}/lib/armv7-a")
-  elseif(arch STREQUAL aarch64)
-    list(APPEND paths "${_prebuilt}/${_host}/lib64")
+function(swift_android_prebuilt_host_name prebuilt_var_name)
+  # Get the prebuilt suffix to create the correct toolchain path when using the NDK
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL Darwin)
+    set(${prebuilt_var_name} darwin-x86_64 PARENT_SCOPE)
+  elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL Linux)
+    set(${prebuilt_var_name} linux-x86_64 PARENT_SCOPE)
+  elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
+    set(${prebuilt_var_name} Windows-x86_64 PARENT_SCOPE)
   else()
-    message(SEND_ERROR "unknown architecture (${arch}) for android")
+    message(SEND_ERROR "cannot cross-compile to android from ${CMAKE_HOST_SYSTEM_NAME}")
   endif()
-  list(APPEND paths "${_prebuilt}/lib/gcc/${_host}/${SWIFT_ANDROID_NDK_GCC_VERSION}.x")
+endfunction()
 
+function(swift_android_libgcc_for_arch_cross_compile arch var)
+  set(paths)
+  if(NOT "${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
+    list(APPEND paths "${SWIFT_SDK_ANDROID_ARCH_${arch}_PATH}/../lib/gcc/${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_TRIPLE}/${SWIFT_ANDROID_NDK_GCC_VERSION}.x")
+  endif()
   set(${var} ${paths} PARENT_SCOPE)
+endfunction()
+
+function(swift_android_sysroot sysroot_var_name)
+  if(NOT "${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
+    swift_android_prebuilt_host_name(prebuilt_build)
+    set(${sysroot_var_name} "${SWIFT_ANDROID_NDK_PATH}/toolchains/llvm/prebuilt/${prebuilt_build}/sysroot" PARENT_SCOPE)
+  elseif(NOT "${SWIFT_ANDROID_NATIVE_SYSROOT}" STREQUAL "")
+    set(${sysroot_var_name} "${SWIFT_ANDROID_NATIVE_SYSROOT}" PARENT_SCOPE)
+  else()
+    message(SEND_ERROR "Couldn't find Android sysroot")
+  endif()
+endfunction()
+
+function(swift_android_tools_path arch path_var_name)
+  if(NOT "${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
+    swift_android_prebuilt_host_name(prebuilt_build)
+    if("${arch}" STREQUAL "i686")
+      set(ndk_prebuilt_path
+        "${SWIFT_ANDROID_NDK_PATH}/toolchains/x86-${SWIFT_ANDROID_NDK_GCC_VERSION}/prebuilt/${prebuilt_build}")
+    elseif("${arch}" STREQUAL "x86_64")
+      set(ndk_prebuilt_path
+        "${SWIFT_ANDROID_NDK_PATH}/toolchains/x86_64-${SWIFT_ANDROID_NDK_GCC_VERSION}/prebuilt/${prebuilt_build}")
+    else()
+      set(ndk_prebuilt_path
+        "${SWIFT_ANDROID_NDK_PATH}/toolchains/${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_TRIPLE}-${SWIFT_ANDROID_NDK_GCC_VERSION}/prebuilt/${prebuilt_build}")
+    endif()
+
+    set(${path_var_name} "${ndk_prebuilt_path}/${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_TRIPLE}/bin" PARENT_SCOPE)
+  elseif(NOT "${SWIFT_ANDROID_NATIVE_SYSROOT}" STREQUAL "")
+    set(${path_var_name} "${SWIFT_ANDROID_NATIVE_SYSROOT}/usr/bin" PARENT_SCOPE)
+  else()
+    message(SEND_ERROR "Couldn't set ${arch} tools path for Android")
+  endif()
+endfunction ()
+
+function(swift_android_cxx_libraries_for_arch arch libraries_var_name)
+  set(link_libraries)
+  if(NOT "${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
+    set(android_libcxx_path "${SWIFT_SDK_ANDROID_ARCH_${arch}_PATH}/usr/lib/${SWIFT_SDK_ANDROID_ARCH_${arch}_NDK_TRIPLE}")
+    list(APPEND link_libraries ${android_libcxx_path}/libc++abi.a
+                               ${android_libcxx_path}/libc++_shared.so)
+  elseif(NOT "${SWIFT_ANDROID_NATIVE_SYSROOT}" STREQUAL "")
+      list(APPEND link_libraries "${SWIFT_ANDROID_NATIVE_SYSROOT}/usr/lib/libc++_shared.so")
+  else()
+    message(SEND_ERROR "Couldn't set ${arch} libc++ libraries needed for Android")
+  endif()
+
+  set(${libraries_var_name} ${link_libraries} PARENT_SCOPE)
 endfunction()

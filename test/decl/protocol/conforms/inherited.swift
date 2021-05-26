@@ -1,11 +1,15 @@
 // RUN: %target-typecheck-verify-swift
 
-// Inheritable: method with 'Self' in its signature
+// Inheritable: method with 'Self' in contravariant position.
 protocol P1 {
-  func f1(_ x: Self?) -> Bool
+  func f1a(_ x: Self?) -> Bool
+
+  func f1b(_ x: [Self])
+
+  func f1c(_ x: [String : Self])
 }
 
-// Never inheritable: property with 'Self' in its signature.
+// Inheritable: property with 'Self' in its signature.
 protocol P2 {
   var prop2: Self { get set }
 }
@@ -13,7 +17,7 @@ protocol P2a {
   var prop2a: Self { get set }
 }
 
-// Never inheritable: subscript with 'Self' in its result type.
+// Inheritable: subscript with 'Self' in its result type.
 protocol P3 {
   subscript (i: Int) -> Self { get }
 }
@@ -52,12 +56,13 @@ protocol P9 {
   static func ==(x: Self, y: Self) -> Bool 
 }
 
-// Never inheritable: method with 'Self' in a non-contravariant position.
+// Never inheritable: method with 'Self' in invariant position.
+struct G<T> {}
 protocol P10 {
-  func f10(_ arr: [Self])
+  func f10(_ arr: G<Self>)
 }
 protocol P10a {
-  func f10a(_ arr: [Self])
+  func f10a(_ arr: G<Self>)
 }
 
 // Never inheritable: method with 'Self' in curried position.
@@ -91,10 +96,14 @@ protocol P15 {
 // non-final class.
 class A : P1, P2, P3, P4, P5, P6, P7, P8, P9, P10 {
   // P1
-  func f1(_ x: A?) -> Bool { return true }
+  func f1a(_ x: A?) -> Bool { return true }
+
+  func f1b(_ x: [A]) { }
+
+  func f1c(_ x: [String : A]) { }
 
   // P2
-  var prop2: A { // expected-error{{protocol 'P2' requirement 'prop2' cannot be satisfied by a non-final class ('A') because it uses 'Self' in a non-parameter, non-result type position}}
+  var prop2: A { // expected-error{{property 'prop2' in non-final class 'A' must specify type 'Self' to conform to protocol 'P2'}}
     get { return self }
     set {}
   }
@@ -106,7 +115,7 @@ class A : P1, P2, P3, P4, P5, P6, P7, P8, P9, P10 {
   }
 
   // P3
-  subscript (i: Int) -> A { // expected-error{{protocol 'P3' requirement 'subscript(_:)' cannot be satisfied by a non-final class ('A') because it uses 'Self' in a non-parameter, non-result type position}}
+  subscript (i: Int) -> A { // expected-error{{subscript 'subscript(_:)' in non-final class 'A' must return 'Self' to conform to protocol 'P3'}}
     get {
      return self
     }
@@ -135,17 +144,17 @@ class A : P1, P2, P3, P4, P5, P6, P7, P8, P9, P10 {
   required init(int: Int) { }
 
   // P10
-  func f10(_ arr: [A]) { } // expected-error{{protocol 'P10' requirement 'f10' cannot be satisfied by a non-final class ('A') because it uses 'Self' in a non-parameter, non-result type position}}
+  func f10(_ arr: G<A>) { } // expected-error{{protocol 'P10' requirement 'f10' cannot be satisfied by a non-final class ('A') because it uses 'Self' in a non-parameter, non-result type position}}
 
   // P10a
-  func f10a(_ arr: [A]) { } // expected-note {{'f10a' declared here}}
+  func f10a(_ arr: G<A>) { } // expected-note {{'f10a' declared here}}
 
   // P11
   func f11() -> (_ x: A) -> Int { return { x in 5 } }
 }
 
 extension A: P2a, P5a, P10a {}
-// expected-error@-1 {{protocol 'P2a' requirement 'prop2a' cannot be satisfied by a non-final class ('A') because it uses 'Self' in a non-parameter, non-result type position}}
+// expected-error@-1 {{property 'prop2a' in non-final class 'A' must specify type 'Self' to conform to protocol 'P2a'}}
 // expected-error@-2 {{method 'f5a()' in non-final class 'A' must return 'Self' to conform to protocol 'P5a'}}
 // expected-error@-3 {{protocol 'P10a' requirement 'f10a' cannot be satisfied by a non-final class ('A') because it uses 'Self' in a non-parameter, non-result type position}}
 
@@ -196,7 +205,11 @@ func testB8(_ b8: B8) {
 // Class A9 conforms to everything.
 final class A9 : P1, P2, P3, P4, P5, P6, P7, P8, P9, P10 {
   // P1
-  func f1(_ x: A9?) -> Bool { return true }
+  func f1a(_ x: A9?) -> Bool { return true }
+
+  func f1b(_ x: [A9]) { }
+
+  func f1c(_ x: [String : A9]) { }
 
   // P2
   var prop2: A9 {
@@ -231,7 +244,7 @@ final class A9 : P1, P2, P3, P4, P5, P6, P7, P8, P9, P10 {
   required init(int: Int) { }
 
   // P10
-  func f10(_ arr: [A9]) { }
+  func f10(_ arr: G<A9>) { }
 
   // P11
   func f11() -> (_ x: A9) -> Int { return { x in 5 } }

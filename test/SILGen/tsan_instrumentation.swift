@@ -1,9 +1,9 @@
-// RUN: %target-swift-emit-silgen -sanitize=thread %s | %FileCheck %s
 // REQUIRES: tsan_runtime
+// RUN: %target-swift-emit-silgen -sanitize=thread %s | %FileCheck %s
+// RUN: %target-swift-frontend -sanitize=thread -emit-ir -primary-file %s | %FileCheck --check-prefix=CHECK-LLVM-IR %s
 
-// FIXME: This should be covered by "tsan_runtime"; older versions of Apple OSs
-// don't support TSan.
-// UNSUPPORTED: remote_run
+// TSan is only supported on 64 bit.
+// REQUIRES: PTRSIZE=64
 
 func takesInout(_ p: inout Int) { }
 func takesInout(_ p: inout MyStruct) { }
@@ -20,7 +20,7 @@ class MyClass {
 var gStruct = MyStruct()
 var gClass = MyClass()
 
-// CHECK-LABEL: sil hidden @$s20tsan_instrumentation17inoutGlobalStructyyF : $@convention(thin) () -> () {
+// CHECK-LABEL: sil hidden [ossa] @$s20tsan_instrumentation17inoutGlobalStructyyF : $@convention(thin) () -> () {
 // CHECK:  [[GLOBAL_ADDR:%.*]] = global_addr @$s20tsan_instrumentation7gStructAA02MyC0Vvp : $*MyStruct
 // CHECK:  [[WRITE:%.*]] = begin_access [modify] [dynamic] [[GLOBAL_ADDR]] : $*MyStruct
 // CHECK:  {{%.*}} = builtin "tsanInoutAccess"([[WRITE]] : $*MyStruct) : $()
@@ -31,7 +31,7 @@ func inoutGlobalStruct() {
 }
 
 
-// CHECK-LABEL: sil hidden @$s20tsan_instrumentation31inoutGlobalStructStoredPropertyyyF : $@convention(thin) () -> () {
+// CHECK-LABEL: sil hidden [ossa] @$s20tsan_instrumentation31inoutGlobalStructStoredPropertyyyF : $@convention(thin) () -> () {
 // CHECK:  [[GLOBAL_ADDR:%.*]] = global_addr @$s20tsan_instrumentation7gStructAA02MyC0Vvp : $*MyStruct
 // CHECK:  [[WRITE:%.*]] = begin_access [modify] [dynamic] [[GLOBAL_ADDR]] : $*MyStruct
 // CHECK:  {{%.*}} = builtin "tsanInoutAccess"([[WRITE]] : $*MyStruct) : $()
@@ -45,13 +45,13 @@ func inoutGlobalStructStoredProperty() {
   takesInout(&gStruct.storedProperty)
 }
 
-// CHECK-LABEL: sil hidden @$s20tsan_instrumentation30inoutGlobalClassStoredPropertyyyF : $@convention(thin) () -> () {
+// CHECK-LABEL: sil hidden [ossa] @$s20tsan_instrumentation30inoutGlobalClassStoredPropertyyyF : $@convention(thin) () -> () {
 // CHECK:  [[GLOBAL_ADDR:%.*]] = global_addr @$s20tsan_instrumentation6gClassAA02MyC0Cvp : $*MyClass
 // CHECK:  [[READ:%.*]] = begin_access [read] [dynamic] [[GLOBAL_ADDR]] : $*MyClass
 // CHECK:  [[LOADED_CLASS:%.*]] = load [copy] [[READ]] : $*MyClass
 // CHECK:  end_access [[READ]]
 // CHECK:  [[BORROWED_CLASS:%.*]] = begin_borrow [[LOADED_CLASS]]
-// CHECK:  [[MODIFY:%.*]] = class_method [[BORROWED_CLASS]] : $MyClass, #MyClass.storedProperty!modify.1 :
+// CHECK:  [[MODIFY:%.*]] = class_method [[BORROWED_CLASS]] : $MyClass, #MyClass.storedProperty!modify :
 // CHECK:  ([[BUFFER_ADDRESS:%.*]], [[TOKEN:%.*]]) = begin_apply [[MODIFY]]([[BORROWED_CLASS]]) : $@yield_once @convention(method) (@guaranteed MyClass) -> @yields @inout Int
 // CHECK:  {{%.*}} = builtin "tsanInoutAccess"([[BUFFER_ADDRESS]] : $*Int) : $()
 // CHECK:  [[TAKES_INOUT_FUNC:%.*]] = function_ref @$s20tsan_instrumentation10takesInoutyySizF : $@convention(thin) (@inout Int) -> ()
@@ -63,4 +63,54 @@ func inoutGlobalClassStoredProperty() {
   // buffer that is passed inout to materializeForSet and one for the
   // temporary buffer passed to takesInout().
   takesInout(&gClass.storedProperty)
+}
+
+// Known-empty types don't have storage, so there is no address
+// to pass to the TSan runtime to check for data races on inout accesses.
+// In this case, the instrumentation should skip the call to
+// __tsan_external_write()
+
+struct ZeroSizedStruct {
+  mutating
+  func mutate() { }
+}
+
+struct NonEmptyStruct {
+  var f: Int = 5
+  mutating
+  func mutate() { }
+}
+
+// CHECK-LLVM-IR-LABEL: testNoInstrumentZeroSizedStruct
+func testNoInstrumentZeroSizedStruct() {
+  var s = ZeroSizedStruct()
+
+// CHECK-LLVM-IR-NOT: tsan_external_write
+  s.mutate()
+}
+
+func takesInout<T>(_ p: inout T) { }
+
+// CHECK-LLVM-IR-LABEL: testNoInstrumentEmptyTuple
+func testNoInstrumentEmptyTuple() {
+  var t: Void = ()
+
+// CHECK-LLVM-IR-NOT: tsan_external_write
+  takesInout(&t)
+}
+
+// CHECK-LLVM-IR-LABEL: testNoInstrumentMutateInoutZeroSizedStruct
+func testNoInstrumentMutateInoutZeroSizedStruct(p: inout ZeroSizedStruct) {
+
+// CHECK-LLVM-IR-NOT: tsan_external_write
+  p.mutate()
+}
+
+// CHECK-LLVM-IR-LABEL: testInstrumentNonEmptyStruct
+func testInstrumentNonEmptyStruct() {
+  // Make sure we actually instrument accesses to non-empty structs.
+  var s = NonEmptyStruct()
+
+// CHECK-LLVM-IR: tsan_external_write
+  s.mutate()
 }

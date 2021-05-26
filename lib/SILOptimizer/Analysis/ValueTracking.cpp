@@ -12,25 +12,24 @@
 
 #define DEBUG_TYPE "sil-value-tracking"
 #include "swift/SILOptimizer/Analysis/ValueTracking.h"
-#include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
+#include "swift/SIL/InstructionUtils.h"
+#include "swift/SIL/PatternMatch.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
-#include "swift/SIL/InstructionUtils.h"
-#include "swift/SILOptimizer/Utils/Local.h"
-#include "swift/SIL/PatternMatch.h"
+#include "swift/SILOptimizer/Analysis/SimplifyInstruction.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/Support/Debug.h"
 using namespace swift;
 using namespace swift::PatternMatch;
 
-bool swift::isNotAliasingArgument(SILValue V,
-                                  InoutAliasingAssumption isInoutAliasing) {
+bool swift::isExclusiveArgument(SILValue V) {
   auto *Arg = dyn_cast<SILFunctionArgument>(V);
   if (!Arg)
     return false;
 
   SILArgumentConvention Conv = Arg->getArgumentConvention();
-  return Conv.isNotAliasedIndirectParameter(isInoutAliasing);
+  return Conv.isExclusiveIndirectParameter();
 }
 
 /// Check if the parameter \V is based on a local object, e.g. it is an
@@ -81,10 +80,8 @@ static bool isLocalObject(SILValue Obj) {
   return true;
 }
 
-bool swift::pointsToLocalObject(SILValue V,
-                                InoutAliasingAssumption isInoutAliasing) {
-  V = getUnderlyingObject(V);
-  return isLocalObject(V) || isNotAliasingArgument(V, isInoutAliasing);
+bool swift::pointsToLocalObject(SILValue V) {
+  return isLocalObject(getUnderlyingObject(V));
 }
 
 /// Check if the value \p Value is known to be zero, non-zero or unknown.
@@ -139,7 +136,7 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
   if (auto *T = dyn_cast<TupleExtractInst>(Value)) {
     // Make sure we are extracting the number value and not
     // the overflow flag.
-    if (T->getFieldNo() != 0)
+    if (T->getFieldIndex() != 0)
       return IsZeroKind::Unknown;
 
     auto *BI = dyn_cast<BuiltinInst>(T->getOperand());
@@ -295,25 +292,6 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         Value = BI->getArguments()[0];
         continue;
       }
-
-      // Source and target type sizes are the same.
-      // S->U conversion can only succeed if
-      // the sign bit of its operand is 0, i.e. it is >= 0.
-      // The sign bit of a result is 0 only if the sign
-      // bit of a source operand is 0.
-      case BuiltinValueKind::SUCheckedConversion:
-        Value = BI->getArguments()[0];
-        continue;
-
-      // Source and target type sizes are the same.
-      // U->S conversion can only succeed if
-      // the top bit of its operand is 0, i.e.
-      // it is representable as a signed integer >=0.
-      // The sign bit of a result is 0 only if the sign
-      // bit of a source operand is 0.
-      case BuiltinValueKind::USCheckedConversion:
-        Value = BI->getArguments()[0];
-        continue;
 
       // Sign bit of the operand is promoted.
       case BuiltinValueKind::SExt:

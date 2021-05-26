@@ -23,8 +23,8 @@ void ClassHierarchyAnalysis::init() {
   auto module = M->getSwiftModule();
 
   // For each class declaration in our V-table list:
-  for (auto &VT : M->getVTableList()) {
-    ClassDecl *C = VT.getClass();
+  for (auto &VT : M->getVTables()) {
+    ClassDecl *C = VT->getClass();
 
     while (true) {
       // Ignore classes that are at the top of the class hierarchy:
@@ -64,7 +64,7 @@ void ClassHierarchyAnalysis::init() {
   }
 }
 
-/// \brief Get all subclasses of a given class.
+/// Get all subclasses of a given class.
 ///
 /// \p Current class, whose direct and indirect subclasses are
 ///    to be collected.

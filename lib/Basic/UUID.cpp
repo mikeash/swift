@@ -16,6 +16,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Basic/UUID.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 
 // WIN32 doesn't natively support <uuid/uuid.h>. Instead, we use Win32 APIs.
 #if defined(_WIN32)
@@ -23,6 +25,7 @@
 #define NOMINMAX
 #include <objbase.h>
 #include <string>
+#include <algorithm>
 #else
 #include <uuid/uuid.h>
 #endif
@@ -94,6 +97,7 @@ void swift::UUID::toString(llvm::SmallVectorImpl<char> &out) const {
 
   char* signedStr = reinterpret_cast<char*>(str);
   memcpy(out.data(), signedStr, StringBufferSize);
+  llvm::transform(out, std::begin(out), toupper);
 #else
   uuid_unparse_upper(Value, out.data());
 #endif

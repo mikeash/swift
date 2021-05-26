@@ -182,46 +182,19 @@ private:
 
 /// Records the reason a declaration is potentially unavailable.
 class UnavailabilityReason {
-public:
-  enum class Kind {
-    /// The declaration is potentially unavailable because it requires an OS
-    /// version range that is not guaranteed by the minimum deployment
-    /// target.
-    RequiresOSVersionRange,
-
-    /// The declaration is potentially unavailable because it is explicitly
-    /// weakly linked.
-    ExplicitlyWeakLinked
-  };
-
 private:
-  // A value of None indicates the declaration is potentially unavailable
-  // because it is explicitly weak linked.
-  Optional<VersionRange> RequiredDeploymentRange;
+  VersionRange RequiredDeploymentRange;
 
-  UnavailabilityReason(const Optional<VersionRange> &RequiredDeploymentRange)
+  explicit UnavailabilityReason(const VersionRange RequiredDeploymentRange)
       : RequiredDeploymentRange(RequiredDeploymentRange) {}
 
 public:
-  static UnavailabilityReason explicitlyWeaklyLinked() {
-    return UnavailabilityReason(None);
-  }
-
   static UnavailabilityReason requiresVersionRange(const VersionRange Range) {
     return UnavailabilityReason(Range);
   }
 
-  Kind getReasonKind() const {
-    if (RequiredDeploymentRange.hasValue()) {
-      return Kind::RequiresOSVersionRange;
-    } else {
-      return Kind::ExplicitlyWeakLinked;
-    }
-  }
-
   const VersionRange &getRequiredOSVersionRange() const {
-    assert(getReasonKind() == Kind::RequiresOSVersionRange);
-    return RequiredDeploymentRange.getValue();
+    return RequiredDeploymentRange;
   }
 };
 
@@ -239,6 +212,10 @@ class AvailabilityContext {
 public:
   /// Creates a context that requires certain versions of the target OS.
   explicit AvailabilityContext(VersionRange OSVersion) : OSVersion(OSVersion) {}
+
+  /// Creates a context that imposes the constraints of the ASTContext's
+  /// deployment target.
+  static AvailabilityContext forDeploymentTarget(ASTContext &Ctx);
 
   /// Creates a context that imposes no constraints.
   ///
@@ -329,11 +306,11 @@ public:
 
   static AvailabilityContext inferForType(Type t);
 
-  /// \brief Returns the context where a declaration is available
+  /// Returns the context where a declaration is available
   ///  We assume a declaration without an annotation is always available.
   static AvailabilityContext availableRange(const Decl *D, ASTContext &C);
 
-  /// \brief Returns the context for which the declaration
+  /// Returns the context for which the declaration
   /// is annotated as available, or None if the declaration
   /// has no availability annotation.
   static Optional<AvailabilityContext> annotatedAvailableRange(const Decl *D,

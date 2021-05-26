@@ -15,23 +15,17 @@
 //
 //===----------------------------------------------------------------------===//
 #include "swift/AST/Evaluator.h"
+#include "swift/AST/DeclContext.h"
+#include "swift/AST/DiagnosticEngine.h"
+#include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Range.h"
+#include "swift/Basic/SourceManager.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/SaveAndRestore.h"
+#include <vector>
 
 using namespace swift;
-
-AnyRequest::HolderBase::~HolderBase() { }
-
-std::string AnyRequest::getAsString() const {
-  std::string result;
-  {
-    llvm::raw_string_ostream out(result);
-    simple_display(out, *this);
-  }
-  return result;
-}
 
 AbstractRequestFunction *
 Evaluator::getAbstractRequestFunction(uint8_t zoneID, uint8_t requestID) const {
@@ -48,8 +42,9 @@ Evaluator::getAbstractRequestFunction(uint8_t zoneID, uint8_t requestID) const {
 }
 
 void Evaluator::registerRequestFunctions(
-                               uint8_t zoneID,
+                               Zone zone,
                                ArrayRef<AbstractRequestFunction *> functions) {
+  uint8_t zoneID = static_cast<uint8_t>(zone);
 #ifndef NDEBUG
   for (const auto &zone : requestFunctionsByZone) {
     assert(zone.first != zoneID);
@@ -59,53 +54,32 @@ void Evaluator::registerRequestFunctions(
   requestFunctionsByZone.push_back({zoneID, functions});
 }
 
-Evaluator::Evaluator(DiagnosticEngine &diags,
-                     CycleDiagnosticKind shouldDiagnoseCycles)
-  : diags(diags), shouldDiagnoseCycles(shouldDiagnoseCycles) { }
+Evaluator::Evaluator(DiagnosticEngine &diags, const LangOptions &opts)
+    : diags(diags),
+      debugDumpCycles(opts.DebugDumpCycles),
+      recorder(opts.RecordRequestReferences) {}
 
-void Evaluator::emitRequestEvaluatorGraphViz(llvm::StringRef graphVizPath) {
-  std::error_code error;
-  llvm::raw_fd_ostream out(graphVizPath, error, llvm::sys::fs::F_Text);
-  printDependenciesGraphviz(out);
-}
-
-bool Evaluator::checkDependency(const AnyRequest &request) {
-  // If there is an active request, record it's dependency on this request.
-  if (!activeRequests.empty())
-    dependencies[activeRequests.back()].push_back(request);
-
+bool Evaluator::checkDependency(const ActiveRequest &request) {
   // Record this as an active request.
-  if (activeRequests.insert(request)) {
+  if (activeRequests.insert(request))
     return false;
-  }
 
   // Diagnose cycle.
-  switch (shouldDiagnoseCycles) {
-  case CycleDiagnosticKind::NoDiagnose:
-    return true;
-
-  case CycleDiagnosticKind::DebugDiagnose: {
-    llvm::errs() << "===CYCLE DETECTED===\n";
-    llvm::DenseSet<AnyRequest> visitedAnywhere;
-    llvm::SmallVector<AnyRequest, 4> visitedAlongPath;
-    std::string prefixStr;
-    printDependencies(activeRequests.front(), llvm::errs(), visitedAnywhere,
-                      visitedAlongPath, activeRequests.getArrayRef(),
-                      prefixStr, /*lastChild=*/true);
-    return true;
-  }
-
-  case CycleDiagnosticKind::FullDiagnose:
-    diagnoseCycle(request);
-    return true;
-  }
-
+  diagnoseCycle(request);
   return true;
 }
 
-void Evaluator::diagnoseCycle(const AnyRequest &request) {
+void Evaluator::diagnoseCycle(const ActiveRequest &request) {
+  if (debugDumpCycles) {
+    llvm::errs() << "===CYCLE DETECTED===\n";
+    for (auto &req : activeRequests) {
+      simple_display(llvm::errs(), req);
+      llvm::errs() << "\n";
+    }
+  }
+
   request.diagnoseCycle(diags);
-  for (const auto &step : reversed(activeRequests)) {
+  for (const auto &step : llvm::reverse(activeRequests)) {
     if (step == request) return;
 
     step.noteCycleStep(diags);
@@ -114,179 +88,67 @@ void Evaluator::diagnoseCycle(const AnyRequest &request) {
   llvm_unreachable("Diagnosed a cycle but it wasn't represented in the stack");
 }
 
-void Evaluator::printDependencies(
-                            const AnyRequest &request,
-                            llvm::raw_ostream &out,
-                            llvm::DenseSet<AnyRequest> &visitedAnywhere,
-                            llvm::SmallVectorImpl<AnyRequest> &visitedAlongPath,
-                            llvm::ArrayRef<AnyRequest> highlightPath,
-                            std::string &prefixStr,
-                            bool lastChild) const {
-  out << prefixStr << " `--";
+void evaluator::DependencyRecorder::recordDependency(
+    const DependencyCollector::Reference &ref) {
+  if (activeRequestReferences.empty())
+    return;
 
-  // Determine whether this node should be highlighted.
-  bool isHighlighted = false;
-  if (std::find(highlightPath.begin(), highlightPath.end(), request)
-        != highlightPath.end()) {
-    isHighlighted = true;
-    out.changeColor(llvm::buffer_ostream::Colors::GREEN);
-  }
-
-  // Print this node.
-  simple_display(out, request);
-
-  // Turn off the highlight.
-  if (isHighlighted) {
-    out.resetColor();
-  }
-
-  // Print the cached value, if known.
-  auto cachedValue = cache.find(request);
-  if (cachedValue != cache.end()) {
-    out << " -> ";
-    printEscapedString(cachedValue->second.getAsString(), out);
-  }
-
-  if (!visitedAnywhere.insert(request).second) {
-    // We've already seed this node. Check whether it's part of a cycle.
-    if (std::find(visitedAlongPath.begin(), visitedAlongPath.end(), request)
-          != visitedAlongPath.end()) {
-      // We have a cyclic dependency.
-      out.changeColor(llvm::raw_ostream::RED);
-      out << " (cyclic dependency)\n";
-    } else {
-      // We have seen this node before, but it's not a cycle. Elide its
-      // children.
-      out << " (elided)\n";
-    }
-
-    out.resetColor();
-  } else if (dependencies.count(request) == 0) {
-    // We have not seen this node before, so we don't know its dependencies.
-    out.changeColor(llvm::raw_ostream::GREEN);
-    out << " (dependency not evaluated)\n";
-    out.resetColor();
-
-    // Remove from the visited set.
-    visitedAnywhere.erase(request);
-  } else {
-    // Print children.
-    out << "\n";
-
-    // Setup the prefix to print the children.
-    prefixStr += ' ';
-    prefixStr += (lastChild ? ' ' : '|');
-    prefixStr += "  ";
-
-    // Note that this request is along the path.
-    visitedAlongPath.push_back(request);
-
-    // Print the children.
-    auto &dependsOn = dependencies.find(request)->second;
-    for (unsigned i : indices(dependsOn)) {
-      printDependencies(dependsOn[i], out, visitedAnywhere, visitedAlongPath,
-                        highlightPath, prefixStr, i == dependsOn.size()-1);
-    }
-
-    // Drop our changes to the prefix.
-    prefixStr.erase(prefixStr.end() - 4, prefixStr.end());
-
-    // Remove from the visited set and path.
-    visitedAnywhere.erase(request);
-    assert(visitedAlongPath.back() == request);
-    visitedAlongPath.pop_back();
-  }
+  activeRequestReferences.back().insert(ref);
 }
 
-void Evaluator::dumpDependencies(const AnyRequest &request) const {
-  printDependencies(request, llvm::dbgs());
+evaluator::DependencyCollector::DependencyCollector(
+    evaluator::DependencyRecorder &parent) : parent(parent) {
+#ifndef NDEBUG
+  assert(!parent.isRecording &&
+         "Probably not a good idea to allow nested recording");
+  parent.isRecording = true;
+#endif
 }
 
-void Evaluator::printDependenciesGraphviz(llvm::raw_ostream &out) const {
-  // Form a list of all of the requests we know about.
-  std::vector<AnyRequest> allRequests;
-  for (const auto &knownRequest : dependencies) {
-    allRequests.push_back(knownRequest.first);
-  }
-
-  // Sort the list of requests based on the display strings, so we get
-  // deterministic output.
-  auto getDisplayString = [&](const AnyRequest &request) {
-    std::string result;
-    {
-      llvm::raw_string_ostream out(result);
-      simple_display(out, request);
-    }
-    return result;
-  };
-  std::sort(allRequests.begin(), allRequests.end(),
-            [&](const AnyRequest &lhs, const AnyRequest &rhs) {
-              return getDisplayString(lhs) < getDisplayString(rhs);
-            });
-
-  // Manage request IDs to use in the resulting output graph.
-  llvm::DenseMap<AnyRequest, unsigned> requestIDs;
-  unsigned nextID = 0;
-
-  // Prepopulate the known requests.
-  for (const auto &request : allRequests) {
-    requestIDs[request] = nextID++;
-  }
-
-  auto getRequestID = [&](const AnyRequest &request) {
-    auto known = requestIDs.find(request);
-    if (known != requestIDs.end()) return known->second;
-
-    // We discovered a new request; record it's ID and add it to the list of
-    // all requests.
-    allRequests.push_back(request);
-    requestIDs[request] = nextID;
-    return nextID++;
-  };
-
-  auto getNodeName = [&](const AnyRequest &request) {
-    std::string result;
-    {
-      llvm::raw_string_ostream out(result);
-      out << "request_" << getRequestID(request);
-    }
-    return result;
-  };
-
-  // Emit the graph header.
-  out << "digraph Dependencies {\n";
-
-  // Emit the edges.
-  for (const auto &source : allRequests) {
-    auto known = dependencies.find(source);
-    assert(known != dependencies.end());
-    for (const auto &target : known->second) {
-      out << "  " << getNodeName(source) << " -> " << getNodeName(target)
-          << ";\n";
-    }
-  }
-
-  out << "\n";
-
-  // Emit the nodes.
-  for (unsigned i : indices(allRequests)) {
-    const auto &request = allRequests[i];
-    out << "  " << getNodeName(request);
-    out << " [label=\"";
-    printEscapedString(request.getAsString(), out);
-
-    auto cachedValue = cache.find(request);
-    if (cachedValue != cache.end()) {
-      out << " -> ";
-      printEscapedString(cachedValue->second.getAsString(), out);
-    }
-    out << "\"];\n";
-  }
-
-  // Done!
-  out << "}\n";
+evaluator::DependencyCollector::~DependencyCollector() {
+#ifndef NDEBUG
+  assert(parent.isRecording &&
+         "Should have been recording this whole time");
+  parent.isRecording = false;
+#endif
 }
 
-void Evaluator::dumpDependenciesGraphviz() const {
-  printDependenciesGraphviz(llvm::dbgs());
+void evaluator::DependencyCollector::addUsedMember(DeclContext *subject,
+                                                   DeclBaseName name) {
+  assert(subject->isTypeContext());
+  return parent.recordDependency(Reference::usedMember(subject, name));
+}
+
+void evaluator::DependencyCollector::addPotentialMember(DeclContext *subject) {
+  assert(subject->isTypeContext());
+  return parent.recordDependency(Reference::potentialMember(subject));
+}
+
+void evaluator::DependencyCollector::addTopLevelName(DeclBaseName name) {
+  return parent.recordDependency(Reference::topLevel(name));
+}
+
+void evaluator::DependencyCollector::addDynamicLookupName(DeclBaseName name) {
+  return parent.recordDependency(Reference::dynamic(name));
+}
+
+void evaluator::DependencyRecorder::enumerateReferencesInFile(
+    const SourceFile *SF, ReferenceEnumerator f) const {
+  auto entry = fileReferences.find(SF);
+  if (entry == fileReferences.end()) {
+    return;
+  }
+
+  for (const auto &ref : entry->getSecond()) {
+    switch (ref.kind) {
+    case DependencyCollector::Reference::Kind::Empty:
+    case DependencyCollector::Reference::Kind::Tombstone:
+      llvm_unreachable("Cannot enumerate dead reference!");
+    case DependencyCollector::Reference::Kind::UsedMember:
+    case DependencyCollector::Reference::Kind::PotentialMember:
+    case DependencyCollector::Reference::Kind::TopLevel:
+    case DependencyCollector::Reference::Kind::Dynamic:
+      f(ref);
+    }
+  }
 }

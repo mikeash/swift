@@ -87,9 +87,9 @@ public:
   RCStateTransition(ImmutablePointerSet<SILInstruction> *I) {
     assert(I->size() == 1);
     SILInstruction *Inst = *I->begin();
-    Kind = getRCStateTransitionKind(Inst);
+    Kind = getRCStateTransitionKind(Inst->asSILNode());
     if (isRCStateTransitionEndPoint(Kind)) {
-      EndPoint = Inst;
+      EndPoint = Inst->asSILNode();
       return;
     }
 
@@ -126,7 +126,6 @@ public:
   /// Returns a Range of Mutators. Asserts if this transition is not a mutator
   /// transition.
   mutator_range getMutators() const {
-    assert(isMutator() && "This should never be called given mutators");
     return {Mutators->begin(), Mutators->end()};
   }
 

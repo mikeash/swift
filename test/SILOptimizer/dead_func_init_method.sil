@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -sil-deadfuncelim %s | %FileCheck %s
+// RUN: %target-sil-opt -sil-deadfuncelim %s | %FileCheck %s
 
 // Check that we don't crash on this.
 
@@ -27,16 +27,16 @@ bb0(%4 : $@thick Derived.Type):
 
 sil @testit : $@convention(method) (@thick Derived.Type) -> @thick Derived.Type {
 bb0(%1 : $@thick Derived.Type):
-  %157 = class_method %1 : $@thick Derived.Type, #Derived.init!allocator.1 : (Derived.Type) -> () -> Derived, $@convention(method) (@thick Derived.Type) -> @owned Derived
+  %157 = class_method %1 : $@thick Derived.Type, #Derived.init!allocator : (Derived.Type) -> () -> Derived, $@convention(method) (@thick Derived.Type) -> @owned Derived
   return %1 : $@thick Derived.Type
 }
 
 sil_vtable Base {
-  #Base.init!allocator.1: @BaseInit
+  #Base.init!allocator: @BaseInit
 }
 
 sil_vtable Derived {
-  #Base.init!allocator.1: @DerivedInit
+  #Base.init!allocator: @DerivedInit [override]
 }
 
 

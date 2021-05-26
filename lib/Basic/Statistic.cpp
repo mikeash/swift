@@ -10,20 +10,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/AST/Decl.h"
+#include "swift/Basic/Statistic.h"
+#include "swift/Config.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
-#include "swift/Basic/Statistic.h"
-#include "swift/Basic/Timer.h"
-#include "swift/AST/Decl.h"
-#include "swift/AST/Expr.h"
-#include "swift/SIL/SILFunction.h"
-#include "swift/Driver/DependencyGraph.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Config/config.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
 #include <limits>
@@ -45,6 +41,11 @@
 #ifdef HAVE_MALLOC_MALLOC_H
 #include <malloc/malloc.h>
 #endif
+#if defined(_WIN32)
+#define NOMINMAX
+#include "Windows.h"
+#include "psapi.h"
+#endif
 
 namespace swift {
 using namespace llvm;
@@ -56,24 +57,14 @@ bool environmentVariableRequestedMaximumDeterminism() {
   return false;
 }
 
-static int64_t
-getChildrenMaxResidentSetSize() {
-#if defined(HAVE_GETRUSAGE) && !defined(__HAIKU__)
-  struct rusage RU;
-  ::getrusage(RUSAGE_CHILDREN, &RU);
-  int64_t M = static_cast<int64_t>(RU.ru_maxrss);
-  if (M < 0) {
-    M = std::numeric_limits<int64_t>::max();
-  } else {
-#ifndef __APPLE__
-    // Apple systems report bytes; everything else appears to report KB.
-    M <<= 10;
-#endif
+uint64_t getInstructionsExecuted() {
+#if defined(HAVE_PROC_PID_RUSAGE) && defined(RUSAGE_INFO_V4)
+  struct rusage_info_v4 ru;
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru) == 0) {
+    return ru.ri_instructions;
   }
-  return M;
-#else
-  return 0;
 #endif
+  return 0;
 }
 
 static std::string
@@ -162,9 +153,8 @@ auxName(StringRef ModuleName,
 }
 
 class UnifiedStatsReporter::RecursionSafeTimers {
-
   struct RecursionSafeTimer {
-    llvm::Optional<SharedTimer> Timer;
+    llvm::Optional<llvm::NamedRegionTimer> Timer;
     size_t RecursionDepth;
   };
 
@@ -175,9 +165,9 @@ public:
   void beginTimer(StringRef Name) {
     RecursionSafeTimer &T = Timers[Name];
     if (T.RecursionDepth == 0) {
-      T.Timer.emplace(Name);
+      T.Timer.emplace(Name, Name, "swift", "Swift compilation");
     }
-    T.RecursionDepth++;
+    ++T.RecursionDepth;
   }
 
   void endTimer(StringRef Name) {
@@ -185,7 +175,7 @@ public:
     assert(I != Timers.end());
     RecursionSafeTimer &T = I->getValue();
     assert(T.RecursionDepth != 0);
-    T.RecursionDepth--;
+    --T.RecursionDepth;
     if (T.RecursionDepth == 0) {
       T.Timer.reset();
     }
@@ -235,7 +225,7 @@ class StatsProfiler {
       if (I != Children.end()) {
         return I->getSecond().get();
       } else {
-        auto N = llvm::make_unique<Node>(this);
+        auto N = std::make_unique<Node>(this);
         auto P = N.get();
         Children.insert(std::make_pair(K, std::move(N)));
         return P;
@@ -358,26 +348,49 @@ UnifiedStatsReporter::UnifiedStatsReporter(StringRef ProgramName,
     ProfileDirname(Directory),
     StartedTime(llvm::TimeRecord::getCurrentTime()),
     MainThreadID(std::this_thread::get_id()),
-    Timer(make_unique<NamedRegionTimer>(AuxName,
+    Timer(std::make_unique<NamedRegionTimer>(AuxName,
                                         "Building Target",
                                         ProgramName, "Running Program")),
     SourceMgr(SM),
     ClangSourceMgr(CSM),
-    RecursiveTimers(llvm::make_unique<RecursionSafeTimers>())
+    RecursiveTimers(std::make_unique<RecursionSafeTimers>()),
+    IsFlushingTracesAndProfiles(false)
 {
   path::append(StatsFilename, makeStatsFileName(ProgramName, AuxName));
   path::append(TraceFilename, makeTraceFileName(ProgramName, AuxName));
   path::append(ProfileDirname, makeProfileDirName(ProgramName, AuxName));
   EnableStatistics(/*PrintOnExit=*/false);
-  SharedTimer::enableCompilationTimers();
   if (TraceEvents || ProfileEvents || ProfileEntities)
     LastTracedFrontendCounters.emplace();
   if (TraceEvents)
     FrontendStatsEvents.emplace();
   if (ProfileEvents)
-    EventProfilers = make_unique<StatsProfilers>();
+    EventProfilers =std::make_unique<StatsProfilers>();
   if (ProfileEntities)
-    EntityProfilers = make_unique<StatsProfilers>();
+    EntityProfilers =std::make_unique<StatsProfilers>();
+}
+
+void UnifiedStatsReporter::recordJobMaxRSS(long rss) {
+  maxChildRSS = std::max(maxChildRSS, rss);
+}
+
+int64_t UnifiedStatsReporter::getChildrenMaxResidentSetSize() {
+#if defined(HAVE_GETRUSAGE) && !defined(__HAIKU__)
+  struct rusage RU;
+  ::getrusage(RUSAGE_CHILDREN, &RU);
+  int64_t M = static_cast<int64_t>(RU.ru_maxrss);
+  if (M < 0) {
+    M = std::numeric_limits<int64_t>::max();
+  } else {
+#ifndef __APPLE__
+    // Apple systems report bytes; everything else appears to report KB.
+    M <<= 10;
+#endif
+  }
+  return M;
+#else
+  return maxChildRSS;
+#endif
 }
 
 UnifiedStatsReporter::AlwaysOnDriverCounters &
@@ -410,7 +423,7 @@ UnifiedStatsReporter::publishAlwaysOnStatsToLLVM() {
     auto &C = getFrontendCounters();
 #define FRONTEND_STATISTIC(TY, NAME)                            \
     do {                                                        \
-      static Statistic Stat = {#TY, #NAME, #NAME, {0}, {false}};  \
+      static Statistic Stat = {#TY, #NAME, #NAME};              \
       Stat += (C).NAME;                                         \
     } while (0);
 #include "swift/Basic/Statistics.def"
@@ -420,7 +433,7 @@ UnifiedStatsReporter::publishAlwaysOnStatsToLLVM() {
     auto &C = getDriverCounters();
 #define DRIVER_STATISTIC(NAME)                                       \
     do {                                                             \
-      static Statistic Stat = {"Driver", #NAME, #NAME, {0}, {false}};  \
+      static Statistic Stat = {"Driver", #NAME, #NAME};              \
       Stat += (C).NAME;                                              \
     } while (0);
 #include "swift/Basic/Statistics.def"
@@ -505,12 +518,9 @@ FrontendStatsTracer::~FrontendStatsTracer()
 // associated fields in the provided AlwaysOnFrontendCounters.
 void updateProcessWideFrontendCounters(
     UnifiedStatsReporter::AlwaysOnFrontendCounters &C) {
-#if defined(HAVE_PROC_PID_RUSAGE) && defined(RUSAGE_INFO_V4)
-  struct rusage_info_v4 ru;
-  if (0 == proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru)) {
-    C.NumInstructionsExecuted = ru.ri_instructions;
+  if (auto instrExecuted = getInstructionsExecuted()) {
+    C.NumInstructionsExecuted = instrExecuted;
   }
-#endif
 
 #if defined(HAVE_MALLOC_ZONE_STATISTICS) && defined(HAVE_MALLOC_MALLOC_H)
   // On Darwin we have a lifetime max that's maintained by malloc we can
@@ -549,6 +559,13 @@ UnifiedStatsReporter::saveAnyFrontendStatsEvents(
     bool IsEntry)
 {
   assert(MainThreadID == std::this_thread::get_id());
+
+  // Don't record any new stats if we're currently flushing the ones we've
+  // already recorded. This can happen when requests get kicked off when
+  // computing source ranges.
+  if (IsFlushingTracesAndProfiles)
+    return;
+
   // First make a note in the recursion-safe timers; these
   // are active anytime UnifiedStatsReporter is active.
   if (IsEntry) {
@@ -635,10 +652,10 @@ UnifiedStatsReporter::~UnifiedStatsReporter()
   if (currentProcessExitStatus != EXIT_SUCCESS) {
     if (FrontendCounters) {
       auto &C = getFrontendCounters();
-      C.NumProcessFailures++;
+      ++C.NumProcessFailures;
     } else {
       auto &C = getDriverCounters();
-      C.NumProcessFailures++;
+      ++C.NumProcessFailures;
     }
   }
 
@@ -691,7 +708,7 @@ UnifiedStatsReporter::~UnifiedStatsReporter()
   //    compile-time) so we sequence printing our own stats and LLVM's timers
   //    manually.
 
-#if !defined(NDEBUG) || defined(LLVM_ENABLE_STATS)
+#if !defined(NDEBUG) || LLVM_ENABLE_STATS
   publishAlwaysOnStatsToLLVM();
   PrintStatisticsJSON(ostream);
   TimerGroup::clearAll();
@@ -703,6 +720,10 @@ UnifiedStatsReporter::~UnifiedStatsReporter()
 
 void
 UnifiedStatsReporter::flushTracesAndProfiles() {
+  // Note that we're currently flushing statistics and shouldn't record any
+  // more until we've finished.
+  llvm::SaveAndRestore<bool> flushing(IsFlushingTracesAndProfiles, true);
+
   if (FrontendStatsEvents && SourceMgr) {
     std::error_code EC;
     raw_fd_ostream tstream(TraceFilename, EC, fs::F_Append | fs::F_Text);

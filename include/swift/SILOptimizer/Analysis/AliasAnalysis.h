@@ -27,27 +27,26 @@ namespace {
   /// A key used for the AliasAnalysis cache.
   ///
   /// This struct represents the argument list to the method 'alias'.  The two
-  /// SILValue pointers are mapped to size_t indices because we need an
+  /// SILValue pointers are mapped to integer indices because we need an
   /// efficient way to invalidate them (the mechanism is described below). The
   /// Type arguments are translated to void* because their underlying storage is
   /// opaque pointers that never goes away.
   struct AliasKeyTy {
     // The SILValue pair:
-    size_t V1, V2;
+    swift::ValueIndexTy V1, V2;
     // The TBAAType pair:
     void *T1, *T2;
   };
 
   /// A key used for the MemoryBehavior Analysis cache.
   ///
-  /// The two SILValue pointers are mapped to size_t indices because we need an
+  /// The two SILValue pointers are mapped to integer indices because we need an
   /// efficient way to invalidate them (the mechanism is described below).  The
   /// RetainObserveKind represents the inspection mode for the memory behavior
   /// analysis.
   struct MemBehaviorKeyTy {
     // The SILValue pair:
-    size_t V1, V2;
-    RetainObserveKind InspectionMode; 
+    swift::ValueIndexTy V1, V2;
   };
 }
 
@@ -114,19 +113,25 @@ private:
   /// The computeMemoryBehavior() method uses this map to cache queries.
   llvm::DenseMap<MemBehaviorKeyTy, MemoryBehavior> MemoryBehaviorCache;
 
-  /// The AliasAnalysis cache can't directly map a pair of ValueBase pointers
-  /// to alias results because we'd like to be able to remove deleted pointers
-  /// without having to scan the whole map. So, instead of storing pointers we
-  /// map pointers to indices and store the indices.
-  ValueEnumerator<ValueBase*> AliasValueBaseToIndex;
-  
-  /// Same as AliasValueBaseToIndex, map a pointer to the indices for
-  /// MemoryBehaviorCache.
+  /// Set of instructions inside immutable-scopes.
   ///
-  /// NOTE: we do not use the same ValueEnumerator for the alias cache, 
-  /// as when either cache is cleared, we can not clear the ValueEnumerator
-  /// because doing so could give rise to collisions in the other cache.
-  ValueEnumerator<SILNode*> MemoryBehaviorNodeToIndex;
+  /// Contains pairs of intruction indices: the first instruction is the begin-
+  /// scope instruction (e.g. begin_access), the second instruction is an
+  /// instruction inside the scope (only may-write instructions are considered).
+  llvm::DenseSet<MemBehaviorKeyTy> instsInImmutableScopes;
+
+  /// Computed immutable scopes.
+  ///
+  /// Contains the begin-scope instruction's indices (e.g. begin_access) of
+  /// all computed scopes.
+  llvm::DenseSet<ValueIndexTy> immutableScopeComputed;
+
+  /// The caches can't directly map a pair of value/instruction pointers
+  /// to results because we'd like to be able to remove deleted instruction
+  /// pointers without having to scan the whole map. So, instead of storing
+  /// pointers we map pointers to indices and store the indices.
+  ValueEnumerator<ValueBase *> ValueToIndex;
+  ValueEnumerator<SILInstruction *> InstructionToIndex;
 
   AliasResult aliasAddressProjection(SILValue V1, SILValue V2,
                                      SILValue O1, SILValue O2);
@@ -137,23 +142,16 @@ private:
                          SILType TBAAType2 = SILType());  
 
   /// Returns True if memory of type \p T1 and \p T2 may alias.
-  bool typesMayAlias(SILType T1, SILType T2);
+  bool typesMayAlias(SILType T1, SILType T2, const SILFunction &F);
 
-  virtual void handleDeleteNotification(SILNode *node) override {
-    assert(node->isRepresentativeSILNodeInObject());
-
-    // The pointer 'node' is going away.  We can't scan the whole cache
-    // and remove all of the occurrences of the pointer. Instead we remove
-    // the pointer from the cache that translates pointers to indices.
-    auto value = dyn_cast<ValueBase>(node);
-    if (!value) return;
-
-    AliasValueBaseToIndex.invalidateValue(value);
-    MemoryBehaviorNodeToIndex.invalidateValue(node);
-  }
+  virtual void handleDeleteNotification(SILNode *node) override;
 
   virtual bool needsNotifications() override { return true; }
 
+  void computeImmutableScope(SingleValueInstruction *beginScopeInst,
+                             ValueIndexTy beginIdx);
+
+  bool isInImmutableScope(SILInstruction *inst, SILValue V);
 
 public:
   AliasAnalysis(SILModule *M)
@@ -165,7 +163,16 @@ public:
   }
   
   virtual void initialize(SILPassManager *PM) override;
-  
+
+  /// Explicitly invalidate an instruction.
+  ///
+  /// This can be useful to update the alias analysis within a pass.
+  /// It's needed if e.g. \p inst is an address projection and its operand gets
+  /// replaced with a different underlying object.
+  void invalidateInstruction(SILInstruction *inst) {
+    handleDeleteNotification(inst->asSILNode());
+  }
+
   /// Perform an alias query to see if V1, V2 refer to the same values.
   AliasResult alias(SILValue V1, SILValue V2, SILType TBAAType1 = SILType(),
                     SILType TBAAType2 = SILType());
@@ -194,66 +201,47 @@ public:
     return alias(V1, V2, TBAAType1, TBAAType2) == AliasResult::MayAlias;
   }
 
-  /// \returns True if the release of the \p Ptr can access memory accessed by
-  /// \p User.
+  /// \returns True if the release of the \p releasedReference can access or
+  /// free memory accessed by \p User.
   bool mayValueReleaseInterfereWithInstruction(SILInstruction *User,
-                                               SILValue Ptr);
+                                               SILValue releasedReference);
 
   /// Use the alias analysis to determine the memory behavior of Inst with
   /// respect to V.
-  ///
-  /// TODO: When ref count behavior is separated from generic memory behavior,
-  /// the InspectionMode flag will be unnecessary.
-  MemoryBehavior computeMemoryBehavior(SILInstruction *Inst, SILValue V,
-                                       RetainObserveKind);
+  MemoryBehavior computeMemoryBehavior(SILInstruction *Inst, SILValue V);
 
   /// Use the alias analysis to determine the memory behavior of Inst with
   /// respect to V.
-  ///
-  /// TODO: When ref count behavior is separated from generic memory behavior,
-  /// the InspectionMode flag will be unnecessary.
-  MemoryBehavior computeMemoryBehaviorInner(SILInstruction *Inst, SILValue V,
-                                            RetainObserveKind);
+  MemoryBehavior computeMemoryBehaviorInner(SILInstruction *Inst, SILValue V);
 
-  /// Returns true if \p Inst may read from memory in a manner that
-  /// affects V.
+  /// Returns true if \p Inst may read from memory at address \p V.
+  ///
+  /// For details see SILInstruction::MemoryBehavior::MayRead.
   bool mayReadFromMemory(SILInstruction *Inst, SILValue V) {
-    auto B = computeMemoryBehavior(Inst, V, RetainObserveKind::IgnoreRetains);
+    auto B = computeMemoryBehavior(Inst, V);
     return B == MemoryBehavior::MayRead ||
            B == MemoryBehavior::MayReadWrite ||
            B == MemoryBehavior::MayHaveSideEffects;
   }
 
-  /// Returns true if \p Inst may write to memory in a manner that
-  /// affects V.
+  /// Returns true if \p Inst may write to memory or deinitialize memory at
+  /// address \p V.
+  ///
+  /// For details see SILInstruction::MemoryBehavior::MayWrite.
   bool mayWriteToMemory(SILInstruction *Inst, SILValue V) {
-    auto B = computeMemoryBehavior(Inst, V, RetainObserveKind::IgnoreRetains);
+    auto B = computeMemoryBehavior(Inst, V);
     return B == MemoryBehavior::MayWrite ||
            B == MemoryBehavior::MayReadWrite ||
            B == MemoryBehavior::MayHaveSideEffects;
   }
 
-  /// Returns true if \p Inst may read or write to memory in a manner that
-  /// affects V.
+  /// Returns true if \p Inst may read from memory, write to memory or
+  /// deinitialize memory at address \p V.
+  ///
+  /// For details see SILInstruction::MemoryBehavior.
   bool mayReadOrWriteMemory(SILInstruction *Inst, SILValue V) {
-    auto B = computeMemoryBehavior(Inst, V, RetainObserveKind::IgnoreRetains);
+    auto B = computeMemoryBehavior(Inst, V);
     return MemoryBehavior::None != B;
-  }
-
-  /// Returns true if Inst may have side effects in a manner that affects V.
-  bool mayHaveSideEffects(SILInstruction *Inst, SILValue V) {
-    auto B = computeMemoryBehavior(Inst, V, RetainObserveKind::ObserveRetains);
-    return B == MemoryBehavior::MayWrite ||
-           B == MemoryBehavior::MayReadWrite ||
-           B == MemoryBehavior::MayHaveSideEffects;
-  }
-
-  /// Returns true if Inst may have side effects in a manner that affects
-  /// V. This is independent of whether or not Inst may write to V and is meant
-  /// to encode notions such as ref count modifications.
-  bool mayHavePureSideEffects(SILInstruction *Inst, SILValue V) {
-    auto B = computeMemoryBehavior(Inst, V, RetainObserveKind::ObserveRetains);
-    return MemoryBehavior::MayHaveSideEffects == B;
   }
 
   /// Returns true if \p Ptr may be released in the function call \p FAS.
@@ -268,12 +256,15 @@ public:
   AliasKeyTy toAliasKey(SILValue V1, SILValue V2, SILType Type1, SILType Type2);
 
   /// Encodes the memory behavior query as a MemBehaviorKeyTy.
-  MemBehaviorKeyTy toMemoryBehaviorKey(SILInstruction *V1, SILValue V2,
-                                       RetainObserveKind K);
+  MemBehaviorKeyTy toMemoryBehaviorKey(SILInstruction *V1, SILValue V2);
 
   virtual void invalidate() override {
     AliasCache.clear();
     MemoryBehaviorCache.clear();
+    InstructionToIndex.clear();
+    ValueToIndex.clear();
+    instsInImmutableScopes.clear();
+    immutableScopeComputed.clear();
   }
 
   virtual void invalidate(SILFunction *,
@@ -299,26 +290,22 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &OS,
 /// Otherwise, return an empty type.
 SILType computeTBAAType(SILValue V);
 
-/// Check if \p V points to a let-member.
-/// Nobody can write into let members.
-bool isLetPointer(SILValue V);
-
 } // end namespace swift
 
 namespace llvm {
   template <> struct DenseMapInfo<AliasKeyTy> {
     static inline AliasKeyTy getEmptyKey() {
-      auto Allone = std::numeric_limits<size_t>::max();
+      auto Allone = std::numeric_limits<swift::ValueIndexTy>::max();
       return {0, Allone, nullptr, nullptr};
     }
     static inline AliasKeyTy getTombstoneKey() {
-      auto Allone = std::numeric_limits<size_t>::max();
+      auto Allone = std::numeric_limits<swift::ValueIndexTy>::max();
       return {Allone, 0, nullptr, nullptr};
     }
     static unsigned getHashValue(const AliasKeyTy Val) {
       unsigned H = 0;
-      H ^= DenseMapInfo<size_t>::getHashValue(Val.V1);
-      H ^= DenseMapInfo<size_t>::getHashValue(Val.V2);
+      H ^= DenseMapInfo<swift::ValueIndexTy>::getHashValue(Val.V1);
+      H ^= DenseMapInfo<swift::ValueIndexTy>::getHashValue(Val.V2);
       H ^= DenseMapInfo<void *>::getHashValue(Val.T1);
       H ^= DenseMapInfo<void *>::getHashValue(Val.T2);
       return H;
@@ -333,25 +320,22 @@ namespace llvm {
 
   template <> struct DenseMapInfo<MemBehaviorKeyTy> {
     static inline MemBehaviorKeyTy getEmptyKey() {
-      auto Allone = std::numeric_limits<size_t>::max();
-      return {0, Allone, RetainObserveKind::RetainObserveKindEnd};
+      auto Allone = std::numeric_limits<swift::ValueIndexTy>::max();
+      return {0, Allone};
     }
     static inline MemBehaviorKeyTy getTombstoneKey() {
-      auto Allone = std::numeric_limits<size_t>::max();
-      return {Allone, 0, RetainObserveKind::RetainObserveKindEnd};
+      auto Allone = std::numeric_limits<swift::ValueIndexTy>::max();
+      return {Allone, 0};
     }
     static unsigned getHashValue(const MemBehaviorKeyTy V) {
       unsigned H = 0;
-      H ^= DenseMapInfo<size_t>::getHashValue(V.V1);
-      H ^= DenseMapInfo<size_t>::getHashValue(V.V2);
-      H ^= DenseMapInfo<int>::getHashValue(static_cast<int>(V.InspectionMode));
+      H ^= DenseMapInfo<swift::ValueIndexTy>::getHashValue(V.V1);
+      H ^= DenseMapInfo<swift::ValueIndexTy>::getHashValue(V.V2);
       return H;
     }
     static bool isEqual(const MemBehaviorKeyTy LHS,
                         const MemBehaviorKeyTy RHS) {
-      return LHS.V1 == RHS.V1 &&
-             LHS.V2 == RHS.V2 &&
-             LHS.InspectionMode == RHS.InspectionMode; 
+      return LHS.V1 == RHS.V1 && LHS.V2 == RHS.V2;
     }
   };
 }

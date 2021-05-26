@@ -40,17 +40,15 @@ private:
   bool computeMainAndSupplementaryOutputFilenames();
   void computeDumpScopeMapLocations();
   void computeHelpOptions();
-  void computeImplicitImportModuleNames();
+  void computeImplicitImportModuleNames(llvm::opt::OptSpecifier id,
+                                        bool isTestable);
   void computeImportObjCHeaderOptions();
   void computeLLVMArgs();
   void computePlaygroundOptions();
   void computePrintStatsOptions();
   void computeTBDOptions();
 
-  void setUnsignedIntegerArgument(options::ID optionID, unsigned radix,
-                                  unsigned &valueToSet);
-
-  bool setUpInputKindAndImmediateArgs();
+  bool setUpImmediateArgs();
 
   bool checkUnusedSupplementaryOutputPaths() const;
 

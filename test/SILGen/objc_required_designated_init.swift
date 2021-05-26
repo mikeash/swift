@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -emit-module -enable-sil-ownership %S/Inputs/objc_required_designated_init_2.swift -module-name Booms -o %t/Booms.swiftmodule -import-objc-header %S/Inputs/objc_required_designated_init.h
-// RUN: %target-swift-emit-silgen -I %t -enable-sil-ownership -verify %s -import-objc-header %S/Inputs/objc_required_designated_init.h | %FileCheck %s
+// RUN: %target-swift-frontend -emit-module %S/Inputs/objc_required_designated_init_2.swift -module-name Booms -o %t/Booms.swiftmodule -import-objc-header %S/Inputs/objc_required_designated_init.h
+// RUN: %target-swift-emit-silgen -I %t -verify %s -import-objc-header %S/Inputs/objc_required_designated_init.h | %FileCheck %s
 // RUN: %target-swift-emit-ir -I %t %s -import-objc-header %S/Inputs/objc_required_designated_init.h
 
 // REQUIRES: objc_interop
@@ -28,16 +28,16 @@ class Root {
 // so do not appear in the vtable.
 
 // CHECK-LABEL: sil_vtable Baboom {
-// CHECK-NOT: #Boom.init!allocator.1: (Boom.Type) -> () -> Boom : @$s29objc_required_designated_init6BaboomCACycfC [override]
-// CHECK:     #Baboom.deinit!deallocator.1: @$s29objc_required_designated_init6BaboomCfD
+// CHECK-NOT: #Boom.init!allocator: (Boom.Type) -> () -> Boom : @$s29objc_required_designated_init6BaboomCACycfC [override]
+// CHECK:     #Baboom.deinit!deallocator: @$s29objc_required_designated_init6BaboomCfD
 // CHECK: }
 
 // CHECK-LABEL: sil_vtable BigBadaBoom {
-// CHECK-NOT: #Badaboom.init!allocator.1
-// CHECK:     #BigBadaBoom.deinit!deallocator.1: @$s29objc_required_designated_init11BigBadaBoomCfD
+// CHECK-NOT: #Badaboom.init!allocator
+// CHECK:     #BigBadaBoom.deinit!deallocator: @$s29objc_required_designated_init11BigBadaBoomCfD
 // CHECK: }
 
 // CHECK-LABEL: sil_vtable Root {
-// CHECK-NOT: #Root.init!allocator.1
-// CHECK:     #Root.deinit!deallocator.1: @$s29objc_required_designated_init4RootCfD
+// CHECK-NOT: #Root.init!allocator
+// CHECK:     #Root.deinit!deallocator: @$s29objc_required_designated_init4RootCfD
 // CHECK: }

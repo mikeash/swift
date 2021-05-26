@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 //
 // Note that this file is used by both swift-corelibs-libdispatch and the
-// Dispatch overlay for Darwin in swift/stdlib/public/SDK/Dispatch/.
+// Dispatch overlay for Darwin in swift/stdlib/public/Darwin/Dispatch/.
 //
 //===----------------------------------------------------------------------===//
 
@@ -32,7 +32,7 @@
 #pragma clang assume_nonnull begin
 
 #ifdef __cplusplus
-namespace swift { extern "C" {
+extern "C" {
 #endif
 
 typedef void (^__swift_shims_dispatch_block_t)(void);
@@ -215,8 +215,8 @@ static inline unsigned int
 _swift_dispatch_data_apply(
     __swift_shims_dispatch_data_t data,
     __swift_shims_dispatch_data_applier SWIFT_DISPATCH_NOESCAPE applier) {
-  return dispatch_data_apply(data, ^bool(dispatch_data_t data, size_t off, const void *loc, size_t size){
-    return applier(data, off, loc, size);
+  return dispatch_data_apply((dispatch_data_t)data, ^bool(dispatch_data_t data, size_t off, const void *loc, size_t size){
+    return applier((__swift_shims_dispatch_data_t)data, off, loc, size);
   });
 }
 
@@ -239,7 +239,7 @@ static inline void _swift_dispatch_source_set_registration_handler(
 }
 
 #if defined(__ANDROID__)
-extern void _dispatch_install_thread_detach_callback(dispatch_function_t cb);
+extern void _dispatch_install_thread_detach_callback(void (*cb)(void));
 #endif
 
 static inline void _swift_dispatch_retain(dispatch_object_t object) {
@@ -251,7 +251,7 @@ static inline void _swift_dispatch_release(dispatch_object_t object) {
 }
 
 #ifdef __cplusplus
-}} // extern "C", namespace swift
+} // extern "C"
 #endif
 
 #pragma clang assume_nonnull end

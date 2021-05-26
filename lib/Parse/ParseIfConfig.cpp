@@ -17,6 +17,7 @@
 #include "swift/Parse/Parser.h"
 
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/DiagnosticSuppression.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Version.h"
@@ -37,13 +38,20 @@ namespace {
 static
 Optional<PlatformConditionKind> getPlatformConditionKind(StringRef Name) {
   return llvm::StringSwitch<Optional<PlatformConditionKind>>(Name)
-    .Case("os", PlatformConditionKind::OS)
-    .Case("arch", PlatformConditionKind::Arch)
-    .Case("_endian", PlatformConditionKind::Endianness)
-    .Case("_runtime", PlatformConditionKind::Runtime)
-    .Case("canImport", PlatformConditionKind::CanImport)
-    .Case("targetEnvironment", PlatformConditionKind::TargetEnvironment)
+#define PLATFORM_CONDITION(LABEL, IDENTIFIER) \
+    .Case(IDENTIFIER, PlatformConditionKind::LABEL)
+#include "swift/AST/PlatformConditionKinds.def"
     .Default(None);
+}
+
+/// Get platform condition name from PlatformConditionKind.
+static StringRef getPlatformConditionName(PlatformConditionKind Kind) {
+  switch (Kind) {
+#define PLATFORM_CONDITION(LABEL, IDENTIFIER) \
+  case PlatformConditionKind::LABEL: return IDENTIFIER;
+#include "swift/AST/PlatformConditionKinds.def"
+  }
+  llvm_unreachable("Unhandled PlatformConditionKind in switch");
 }
 
 /// Extract source text of the expression.
@@ -66,6 +74,62 @@ static bool isValidVersion(const version::Version &Version,
   if (UnaryOperator == "<")
     return Version < ExpectedVersion;
   llvm_unreachable("unsupported unary operator");
+}
+
+static llvm::VersionTuple getCanImportVersion(TupleExpr *te,
+                                              DiagnosticEngine *D,
+                                              bool &underlyingVersion) {
+  llvm::VersionTuple result;
+  if (te->getElements().size() != 2) {
+    if (D) {
+      D->diagnose(te->getLoc(), diag::canimport_two_parameters);
+    }
+    return result;
+  }
+  auto label = te->getElementName(1);
+  auto subE = te->getElement(1);
+  if (label.str() == "_version") {
+    underlyingVersion = false;
+  } else if (label.str() == "_underlyingVersion") {
+    underlyingVersion = true;
+  } else {
+    if (D) {
+      D->diagnose(subE->getLoc(), diag::canimport_label);
+    }
+    return result;
+  }
+  StringRef verText;
+  if (auto *nle = dyn_cast<NumberLiteralExpr>(subE)) {
+    verText = nle->getDigitsText();
+  } else if (auto *sle= dyn_cast<StringLiteralExpr>(subE)) {
+    verText = sle->getValue();
+  }
+  if (verText.empty())
+    return result;
+  if (result.tryParse(verText)) {
+    if (D) {
+      D->diagnose(subE->getLoc(), diag::canimport_version, verText);
+    }
+  }
+  return result;
+}
+
+static Expr *getSingleSubExp(Expr *exp, StringRef kindName,
+                             DiagnosticEngine *D) {
+  if (auto *pe = dyn_cast<ParenExpr>(exp)) {
+    return pe->getSubExpr();
+  }
+  if (kindName == "canImport") {
+    if (auto *te = dyn_cast<TupleExpr>(exp)) {
+      bool underlyingVersion;
+      if (D) {
+        // Diagnose canImport syntax
+        (void)getCanImportVersion(te, D, underlyingVersion);
+      }
+      return te->getElement(0);
+    }
+  }
+  return nullptr;
 }
 
 /// The condition validator.
@@ -94,7 +158,7 @@ class ValidateIfConfigCondition :
     return nullptr;
   }
 
-  // Support '||' and '&&' operator. The procedence of '&&' is higher than '||'.
+  // Support '||' and '&&' operator. The precedence of '&&' is higher than '||'.
   // Invalid operator and the next operand are diagnosed and removed from AST.
   Expr *foldSequence(Expr *LHS, ArrayRef<Expr*> &S, bool isRecurse = false) {
     assert(!S.empty() && ((S.size() & 1) == 0));
@@ -140,11 +204,7 @@ class ValidateIfConfigCondition :
 
       // Apply the operator with left-associativity by folding the first two
       // operands.
-      TupleExpr *Arg = TupleExpr::create(Ctx, SourceLoc(), { LHS, RHS },
-                                         { }, { }, SourceLoc(),
-                                         /*HasTrailingClosure=*/false,
-                                         /*Implicit=*/true);
-      LHS = new (Ctx) BinaryExpr(Op, Arg, /*implicit*/false);
+      LHS = BinaryExpr::create(Ctx, LHS, Op, RHS, /*implicit*/ false);
 
       // If we don't have the next operator, we're done.
       if (IsEnd)
@@ -200,13 +260,11 @@ public:
       return nullptr;
     }
 
-    auto *ArgP = dyn_cast<ParenExpr>(E->getArg());
-    if (!ArgP) {
+    Expr *Arg = getSingleSubExp(E->getArg(), *KindName, &D);
+    if (!Arg) {
       D.diagnose(E->getLoc(), diag::platform_condition_expected_one_argument);
       return nullptr;
     }
-    Expr *Arg = ArgP->getSubExpr();
-
     // '_compiler_version' '(' string-literal ')'
     if (*KindName == "_compiler_version") {
       auto SLE = dyn_cast<StringLiteralExpr>(Arg);
@@ -264,9 +322,10 @@ public:
       return nullptr;
     }
 
-    std::vector<StringRef> suggestions;
+    PlatformConditionKind suggestedKind = *Kind;
+    std::vector<StringRef> suggestedValues;
     if (!LangOptions::checkPlatformConditionSupported(*Kind, *ArgStr,
-                                                      suggestions)) {
+                                                      suggestedKind, suggestedValues)) {
       if (Kind == PlatformConditionKind::Runtime) {
         // Error for _runtime()
         D.diagnose(Arg->getLoc(),
@@ -287,15 +346,32 @@ public:
         DiagName = "import conditional"; break;
       case PlatformConditionKind::TargetEnvironment:
         DiagName = "target environment"; break;
+      case PlatformConditionKind::PtrAuth:
+        DiagName = "pointer authentication scheme"; break;
       case PlatformConditionKind::Runtime:
         llvm_unreachable("handled above");
       }
       auto Loc = Arg->getLoc();
       D.diagnose(Loc, diag::unknown_platform_condition_argument,
                  DiagName, *KindName);
-      for (auto suggestion : suggestions)
+      if (suggestedKind != *Kind) {
+        auto suggestedKindName = getPlatformConditionName(suggestedKind);
+        D.diagnose(Loc, diag::note_typo_candidate, suggestedKindName)
+          .fixItReplace(E->getFn()->getSourceRange(), suggestedKindName);
+      }
+      for (auto suggestion : suggestedValues)
         D.diagnose(Loc, diag::note_typo_candidate, suggestion)
           .fixItReplace(Arg->getSourceRange(), suggestion);
+    }
+    else if (!suggestedValues.empty()) {
+      // The value the user gave has been replaced by something newer.
+      assert(suggestedValues.size() == 1 && "only support one replacement");
+      auto replacement = suggestedValues.front();
+
+      auto Loc = Arg->getLoc();
+      D.diagnose(Loc, diag::renamed_platform_condition_argument,
+                 *ArgStr, replacement)
+        .fixItReplace(Arg->getSourceRange(), replacement);
     }
 
     return E;
@@ -381,13 +457,24 @@ public:
 
   bool visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) {
     auto Name = getDeclRefStr(E);
-    return Ctx.LangOpts.isCustomConditionalCompilationFlagSet(Name);
+
+    // Check whether this is any one of the known compiler features.
+    const auto &langOpts = Ctx.LangOpts;
+    bool isKnownFeature = llvm::StringSwitch<bool>(Name)
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option) \
+        .Case("$" #FeatureName, Option)
+#include "swift/Basic/Features.def"
+        .Default(false);
+
+    if (isKnownFeature)
+      return true;
+    
+    return langOpts.isCustomConditionalCompilationFlagSet(Name);
   }
 
   bool visitCallExpr(CallExpr *E) {
     auto KindName = getDeclRefStr(E->getFn());
-    auto *Arg = cast<ParenExpr>(E->getArg())->getSubExpr();
-
+    auto *Arg = getSingleSubExp(E->getArg(), KindName, nullptr);
     if (KindName == "_compiler_version") {
       auto Str = cast<StringLiteralExpr>(Arg)->getValue();
       auto Val = version::Version::parseCompilerVersionString(
@@ -412,7 +499,13 @@ public:
       }
     } else if (KindName == "canImport") {
       auto Str = extractExprSource(Ctx.SourceMgr, Arg);
-      return Ctx.canImportModule({ Ctx.getIdentifier(Str) , E->getLoc()  });
+      bool underlyingModule = false;
+      llvm::VersionTuple version;
+      if (auto *te = dyn_cast<TupleExpr>(E->getArg())) {
+        version = getCanImportVersion(te, nullptr, underlyingModule);
+      }
+      return Ctx.canImportModule({ Ctx.getIdentifier(Str) , E->getLoc() },
+                                 version, underlyingModule);
     }
 
     auto Val = getDeclRefStr(Arg);
@@ -430,9 +523,8 @@ public:
 
   bool visitBinaryExpr(BinaryExpr *E) {
     auto OpName = getDeclRefStr(E->getFn());
-    auto Args = E->getArg()->getElements();
-    if (OpName == "||") return visit(Args[0]) || visit(Args[1]);
-    if (OpName == "&&") return visit(Args[0]) && visit(Args[1]);
+    if (OpName == "||") return visit(E->getLHS()) || visit(E->getRHS());
+    if (OpName == "&&") return visit(E->getLHS()) && visit(E->getRHS());
     llvm_unreachable("unsupported binary operator");
   }
 
@@ -460,9 +552,8 @@ public:
 
   bool visitBinaryExpr(BinaryExpr *E) {
     auto OpName = getDeclRefStr(E->getFn());
-    auto Args = E->getArg()->getElements();
-    if (OpName == "||") return visit(Args[0]) && visit(Args[1]);
-    if (OpName == "&&") return visit(Args[0]) || visit(Args[1]);
+    if (OpName == "||") return visit(E->getLHS()) && visit(E->getRHS());
+    if (OpName == "&&") return visit(E->getLHS()) || visit(E->getRHS());
     llvm_unreachable("unsupported binary operator");
   }
 
@@ -495,9 +586,8 @@ static bool isPlatformConditionDisjunction(Expr *E, PlatformConditionKind Kind,
                                            ArrayRef<StringRef> Vals) {
   if (auto *Or = dyn_cast<BinaryExpr>(E)) {
     if (getDeclRefStr(Or->getFn()) == "||") {
-      auto Args = Or->getArg()->getElements();
-      return (isPlatformConditionDisjunction(Args[0], Kind, Vals) &&
-              isPlatformConditionDisjunction(Args[1], Kind, Vals));
+      return (isPlatformConditionDisjunction(Or->getLHS(), Kind, Vals) &&
+              isPlatformConditionDisjunction(Or->getRHS(), Kind, Vals));
     }
   } else if (auto *P = dyn_cast<ParenExpr>(E)) {
     return isPlatformConditionDisjunction(P->getSubExpr(), Kind, Vals);
@@ -558,11 +648,10 @@ static Expr *findAnyLikelySimulatorEnvironmentTest(Expr *Condition) {
 
   if (auto *And = dyn_cast<BinaryExpr>(Condition)) {
     if (getDeclRefStr(And->getFn()) == "&&") {
-      auto Args = And->getArg()->getElements();
-      if ((isSimulatorPlatformOSTest(Args[0]) &&
-           isSimulatorPlatformArchTest(Args[1])) ||
-          (isSimulatorPlatformOSTest(Args[1]) &&
-           isSimulatorPlatformArchTest(Args[0]))) {
+      if ((isSimulatorPlatformOSTest(And->getLHS()) &&
+           isSimulatorPlatformArchTest(And->getRHS())) ||
+          (isSimulatorPlatformOSTest(And->getRHS()) &&
+           isSimulatorPlatformArchTest(And->getLHS()))) {
         return And;
       }
     }
@@ -577,11 +666,42 @@ static Expr *findAnyLikelySimulatorEnvironmentTest(Expr *Condition) {
 /// Delegate callback function to parse elements in the blocks.
 ParserResult<IfConfigDecl> Parser::parseIfConfig(
     llvm::function_ref<void(SmallVectorImpl<ASTNode> &, bool)> parseElements) {
+  assert(Tok.is(tok::pound_if));
   SyntaxParsingContext IfConfigCtx(SyntaxContext, SyntaxKind::IfConfigDecl);
 
   SmallVector<IfConfigClause, 4> Clauses;
   Parser::StructureMarkerRAII ParsingDecl(
       *this, Tok.getLoc(), Parser::StructureMarkerKind::IfConfig);
+
+  // Find the region containing code completion token.
+  SourceLoc codeCompletionClauseLoc;
+  if (SourceMgr.hasCodeCompletionBuffer() &&
+      SourceMgr.getCodeCompletionBufferID() == L->getBufferID() &&
+      SourceMgr.isBeforeInBuffer(Tok.getLoc(),
+                                 SourceMgr.getCodeCompletionLoc())) {
+    llvm::SaveAndRestore<Optional<StableHasher>> H(CurrentTokenHash, None);
+    BacktrackingScope backtrack(*this);
+    do {
+      auto startLoc = Tok.getLoc();
+      consumeToken();
+      skipUntilConditionalBlockClose();
+      auto endLoc = PreviousLoc;
+      if (SourceMgr.rangeContainsTokenLoc(SourceRange(startLoc, endLoc),
+                                          SourceMgr.getCodeCompletionLoc())){
+        codeCompletionClauseLoc = startLoc;
+        break;
+      }
+    } while (Tok.isNot(tok::pound_endif, tok::eof));
+  }
+
+  bool shouldEvaluate =
+      // Don't evaluate if it's in '-parse' mode, etc.
+      shouldEvaluatePoundIfDecls() &&
+      // If it's in inactive #if ... #endif block, there's no point to do it.
+      !InInactiveClauseEnvironment &&
+      // If this directive contains code completion location, 'isActive' is
+      // determined solely by which block has the completion token.
+      !codeCompletionClauseLoc.isValid();
 
   bool foundActive = false;
   bool isVersionCondition = false;
@@ -594,10 +714,18 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
     Expr *Condition = nullptr;
     bool isActive = false;
 
+    if (!Tok.isAtStartOfLine() && isElse && Tok.is(tok::kw_if)) {
+      diagnose(Tok, diag::unexpected_if_following_else_compilation_directive)
+          .fixItReplace(SourceRange(ClauseLoc, consumeToken()), "#elseif");
+      isElse = false;
+    }
+
     // Parse the condition.  Evaluate it to determine the active
     // clause unless we're doing a parse-only pass.
     if (isElse) {
-      isActive = !foundActive && State->PerformConditionEvaluation;
+      isActive = !foundActive && shouldEvaluate;
+      if (SyntaxContext->isEnabled())
+        SyntaxContext->addRawSyntax(ParsedRawSyntaxNode());
     } else {
       llvm::SaveAndRestore<bool> S(InPoundIfEnvironment, true);
       ParserResult<Expr> Result = parseExprSequence(diag::expected_expr,
@@ -612,13 +740,17 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
         // Error in the condition;
         isActive = false;
         isVersionCondition = false;
-      } else if (!foundActive && State->PerformConditionEvaluation) {
+      } else if (!foundActive && shouldEvaluate) {
         // Evaluate the condition only if we haven't found any active one and
         // we're not in parse-only mode.
         isActive = evaluateIfConfigCondition(Condition, Context);
         isVersionCondition = isVersionIfConfigCondition(Condition);
       }
     }
+
+    // Treat the region containing code completion token as "active".
+    if (codeCompletionClauseLoc.isValid() && !foundActive)
+      isActive = (ClauseLoc == codeCompletionClauseLoc);
 
     foundActive |= isActive;
 
@@ -636,8 +768,21 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
 
     // Parse elements
     SmallVector<ASTNode, 16> Elements;
+    llvm::SaveAndRestore<bool> S(InInactiveClauseEnvironment,
+                                 InInactiveClauseEnvironment || !isActive);
+    // Disable updating the interface hash inside inactive blocks.
+    Optional<llvm::SaveAndRestore<Optional<StableHasher>>> T;
+    if (!isActive)
+      T.emplace(CurrentTokenHash, None);
+
     if (isActive || !isVersionCondition) {
       parseElements(Elements, isActive);
+    } else if (SyntaxContext->isEnabled()) {
+      // We shouldn't skip code if we are building syntax tree.
+      // The parser will keep running and we just discard the AST part.
+      DiagnosticSuppression suppression(Context.Diags);
+      SmallVector<ASTNode, 16> dropedElements;
+      parseElements(dropedElements, false);
     } else {
       DiagnosticTransaction DT(Diags);
       skipUntilConditionalBlockClose();

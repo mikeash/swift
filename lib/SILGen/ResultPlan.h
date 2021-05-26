@@ -49,6 +49,11 @@ public:
   emitForeignErrorArgument(SILGenFunction &SGF, SILLocation loc) {
     return None;
   }
+  
+  virtual ManagedValue
+  emitForeignAsyncCompletionHandler(SILGenFunction &SGF, SILLocation loc) {
+    return {};
+  }
 };
 
 using ResultPlanPtr = std::unique_ptr<ResultPlan>;
@@ -68,7 +73,7 @@ struct ResultPlanBuilder {
                     const CalleeTypeInfo &calleeTypeInfo)
       : SGF(SGF), loc(loc), calleeTypeInfo(calleeTypeInfo),
         // We reverse the order so we can pop values off the back.
-        allResults(reversed(calleeTypeInfo.substFnType->getResults())) {}
+        allResults(llvm::reverse(calleeTypeInfo.substFnType->getResults())) {}
 
   ResultPlanPtr build(Initialization *emitInto, AbstractionPattern origType,
                       CanType substType);

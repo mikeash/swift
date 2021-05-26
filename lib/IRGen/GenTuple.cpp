@@ -149,6 +149,7 @@ namespace {
       const TupleFieldInfo &field = asImpl().getFields()[fieldNo];
       switch (field.getKind()) {
       case ElementLayout::Kind::Empty:
+      case ElementLayout::Kind::EmptyTailAllocatedCType:
       case ElementLayout::Kind::Fixed:
         return field.getFixedByteOffset();
       case ElementLayout::Kind::InitialNonFixedSize:
@@ -194,6 +195,7 @@ namespace {
         }
         
         case ElementLayout::Kind::Empty:
+        case ElementLayout::Kind::EmptyTailAllocatedCType:
         case ElementLayout::Kind::InitialNonFixedSize:
         case ElementLayout::Kind::NonFixed:
           continue;
@@ -227,6 +229,11 @@ namespace {
       }
     }
 
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                          SILType T) const override {
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    }
+
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
       return None;
     }
@@ -250,6 +257,11 @@ namespace {
       : TupleTypeInfoBase(fields, ty, size, std::move(spareBits), align,
                           isPOD, isBT, alwaysFixedSize)
     {}
+
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                          SILType T) const override {
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+    }
 
     llvm::NoneType getNonFixedOffsets(IRGenFunction &IGF) const {
       return None;
@@ -295,6 +307,54 @@ namespace {
                                             SILType T) const {
       return TupleNonFixedOffsets(T);
     }
+
+    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                          SILType T) const override {
+      if (!areFieldsABIAccessible()) {
+        return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
+      }
+
+      std::vector<TypeLayoutEntry *> fields;
+      for (auto &field : asImpl().getFields()) {
+        auto fieldTy = field.getType(IGM, T);
+        fields.push_back(
+            field.getTypeInfo().buildTypeLayoutEntry(IGM, fieldTy));
+      }
+
+      if (fields.empty()) {
+        return IGM.typeLayoutCache.getEmptyEntry();
+      }
+
+      if (fields.size() == 1) {
+        return fields[0];
+      }
+
+      return IGM.typeLayoutCache.getOrCreateAlignedGroupEntry(fields, 1, false);
+    }
+
+
+    llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
+                                         llvm::Value *numEmptyCases,
+                                         Address structAddr,
+                                         SILType structType,
+                                         bool isOutlined) const override {
+      // The runtime will overwrite this with a concrete implementation
+      // in the value witness table.
+      return emitGetEnumTagSinglePayloadCall(IGF, structType, numEmptyCases,
+                                             structAddr);
+    }
+
+    void storeEnumTagSinglePayload(IRGenFunction &IGF,
+                                   llvm::Value *index,
+                                   llvm::Value *numEmptyCases,
+                                   Address structAddr,
+                                   SILType structType,
+                                   bool isOutlined) const override {
+      // The runtime will overwrite this with a concrete implementation
+      // in the value witness table.
+      emitStoreEnumTagSinglePayloadCall(IGF, structType, index,
+                                        numEmptyCases, structAddr);
+    }
   };
 
   class TupleTypeBuilder :
@@ -332,7 +392,7 @@ namespace {
                                      FieldsAreABIAccessible_t fieldsAccessible,
                                           StructLayout &&layout) {
       auto tupleAccessible = IsABIAccessible_t(
-        IGM.getSILModule().isTypeABIAccessible(TheTuple));
+        IGM.isTypeABIAccessible(TheTuple));
       return NonFixedTupleTypeInfo::create(fields, fieldsAccessible,
                                            layout.getType(),
                                            layout.getAlignment(),

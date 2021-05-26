@@ -11,8 +11,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "IRGenMangler.h"
+#include "GenClass.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/AST/ProtocolAssociations.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/ABI/MetadataValues.h"
@@ -47,16 +50,14 @@ std::string IRGenMangler::mangleValueWitness(Type type, ValueWitness witness) {
     GET_MANGLING(AssignWithTake) \
     GET_MANGLING(GetEnumTagSinglePayload) \
     GET_MANGLING(StoreEnumTagSinglePayload) \
-    GET_MANGLING(StoreExtraInhabitant) \
-    GET_MANGLING(GetExtraInhabitantIndex) \
     GET_MANGLING(GetEnumTag) \
     GET_MANGLING(DestructiveProjectEnumData) \
     GET_MANGLING(DestructiveInjectEnumTag)
 #undef GET_MANGLING
     case ValueWitness::Size:
     case ValueWitness::Flags:
+    case ValueWitness::ExtraInhabitantCount:
     case ValueWitness::Stride:
-    case ValueWitness::ExtraInhabitantFlags:
       llvm_unreachable("not a function witness");
   }
   appendOperator("w", Code);
@@ -83,6 +84,7 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
                                   llvm::function_ref<void ()> body) {
   Mod = IGM.getSwiftModule();
   OptimizeProtocolNames = false;
+  UseObjCRuntimeNames = true;
 
   llvm::SaveAndRestore<bool>
     AllowSymbolicReferencesLocally(AllowSymbolicReferences);
@@ -90,28 +92,43 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
     CanSymbolicReferenceLocally(CanSymbolicReference);
 
   AllowSymbolicReferences = true;
-  CanSymbolicReference = [&IGM](SymbolicReferent s) -> bool {
+  CanSymbolicReference = [&](SymbolicReferent s) -> bool {
     if (auto type = s.dyn_cast<const NominalTypeDecl *>()) {
-      // FIXME: Sometimes we fail to emit metadata for Clang imported types
-      // even after noting use of their type descriptor or metadata. Work
-      // around by not symbolic-referencing imported types for now.
-      if (type->hasClangNode())
+      // The short-substitution types in the standard library have compact
+      // manglings already, and the runtime ought to have a lookup table for
+      // them. Symbolic referencing would be wasteful.
+      if (type->getModuleContext()->isStdlibModule()
+          && Mangle::getStandardTypeSubst(type->getName().str())) {
         return false;
+      }
       
-      // TODO: We ought to be able to use indirect symbolic references even
-      // when the referent may be in another file, once the on-disk
-      // ObjectMemoryReader can handle them.
-      // Private entities are known to be accessible.
-      if (type->getEffectiveAccess() >= AccessLevel::Internal &&
-          (!IGM.CurSourceFile ||
-           IGM.CurSourceFile != type->getParentSourceFile()))
-        return false;
-      
-      // @objc protocols don't have descriptors.
-      if (auto proto = dyn_cast<ProtocolDecl>(type))
-        if (proto->isObjC())
+      // TODO: We could assign a symbolic reference discriminator to refer
+      // to objc protocol refs.
+      if (auto proto = dyn_cast<ProtocolDecl>(type)) {
+        if (proto->isObjC()) {
           return false;
-      
+        }
+      }
+
+      // Classes defined in Objective-C don't have descriptors.
+      // TODO: We could assign a symbolic reference discriminator to refer
+      // to objc class refs.
+      if (auto clas = dyn_cast<ClassDecl>(type)) {
+        // Swift-defined classes can be symbolically referenced.
+        if (hasKnownSwiftMetadata(IGM, const_cast<ClassDecl*>(clas)))
+          return true;
+
+        // Foreign class types can be symbolically referenced.
+        if (clas->getForeignClassKind() == ClassDecl::ForeignKind::CFType)
+          return true;
+
+        // Otherwise no.
+        return false;
+      }
+
+      return true;
+    } else if (s.is<const OpaqueTypeDecl *>()) {
+      // Always symbolically reference opaque types.
       return true;
     } else {
       llvm_unreachable("symbolic referent not handled");
@@ -127,24 +144,43 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
 
 SymbolicMangling
 IRGenMangler::mangleTypeForReflection(IRGenModule &IGM,
-                                      Type Ty) {
+                                      CanGenericSignature Sig,
+                                      CanType Ty) {
   return withSymbolicReferences(IGM, [&]{
+    bindGenericParameters(Sig);
     appendType(Ty);
   });
 }
 
-SymbolicMangling
-IRGenMangler::mangleProtocolConformanceForReflection(IRGenModule &IGM,
-                                  Type ty, ProtocolConformanceRef conformance) {
-  return withSymbolicReferences(IGM, [&]{
-    if (conformance.isConcrete()) {
-      appendProtocolConformance(conformance.getConcrete());
-    } else {
-      // Use a special mangling for abstract conformances.
-      appendType(ty);
-      appendProtocolName(conformance.getAbstract());
-    }
-  });
+
+
+std::string IRGenMangler::mangleProtocolConformanceDescriptor(
+                                 const RootProtocolConformance *conformance) {
+  beginMangling();
+  if (isa<NormalProtocolConformance>(conformance)) {
+    appendProtocolConformance(conformance);
+    appendOperator("Mc");
+  } else {
+    auto protocol = cast<SelfProtocolConformance>(conformance)->getProtocol();
+    appendProtocolName(protocol);
+    appendOperator("MS");
+  }
+  return finalize();
+}
+
+std::string IRGenMangler::mangleProtocolConformanceInstantiationCache(
+                                 const RootProtocolConformance *conformance) {
+  beginMangling();
+  if (isa<NormalProtocolConformance>(conformance)) {
+    appendProtocolConformance(conformance);
+    appendOperator("Mc");
+  } else {
+    auto protocol = cast<SelfProtocolConformance>(conformance)->getProtocol();
+    appendProtocolName(protocol);
+    appendOperator("MS");
+  }
+  appendOperator("MK");
+  return finalize();
 }
 
 std::string IRGenMangler::mangleTypeForLLVMTypeName(CanType Ty) {
@@ -230,10 +266,68 @@ mangleSymbolNameForSymbolicMangling(const SymbolicMangling &mangling,
       = '_';
     Buffer << ' ';
     if (auto ty = referent.dyn_cast<const NominalTypeDecl*>())
-      appendContext(ty);
+      appendContext(ty, ty->getAlternateModuleName());
+    else if (auto opaque = referent.dyn_cast<const OpaqueTypeDecl*>())
+      appendOpaqueDeclName(opaque);
     else
       llvm_unreachable("unhandled referent");
   }
   
+  return finalize();
+}
+
+std::string IRGenMangler::mangleSymbolNameForAssociatedConformanceWitness(
+                                  const NormalProtocolConformance *conformance,
+                                  CanType associatedType,
+                                  const ProtocolDecl *proto) {
+  beginManglingWithoutPrefix();
+  if (conformance) {
+    Buffer << "associated conformance ";
+    appendProtocolConformance(conformance);
+  } else {
+    Buffer << "default associated conformance";
+  }
+
+  bool isFirstAssociatedTypeIdentifier = true;
+  appendAssociatedTypePath(associatedType, isFirstAssociatedTypeIdentifier);
+  appendProtocolName(proto);
+  return finalize();
+}
+
+std::string IRGenMangler::mangleSymbolNameForMangledMetadataAccessorString(
+                                           const char *kind,
+                                           CanGenericSignature genericSig,
+                                           CanType type) {
+  beginManglingWithoutPrefix();
+  Buffer << kind << " ";
+
+  if (genericSig)
+    appendGenericSignature(genericSig);
+
+  if (type)
+    appendType(type);
+  return finalize();
+}
+
+std::string IRGenMangler::mangleSymbolNameForMangledConformanceAccessorString(
+                                           const char *kind,
+                                           CanGenericSignature genericSig,
+                                           CanType type,
+                                           ProtocolConformanceRef conformance) {
+  beginManglingWithoutPrefix();
+  Buffer << kind << " ";
+
+  if (genericSig)
+    appendGenericSignature(genericSig);
+
+  appendAnyProtocolConformance(genericSig, type, conformance);
+  return finalize();
+}
+
+std::string IRGenMangler::mangleSymbolNameForGenericEnvironment(
+                                              CanGenericSignature genericSig) {
+  beginManglingWithoutPrefix();
+  Buffer << "generic environment ";
+  appendGenericSignature(genericSig);
   return finalize();
 }

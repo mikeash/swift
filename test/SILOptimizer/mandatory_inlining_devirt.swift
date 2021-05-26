@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -enable-sil-ownership -sil-verify-all %s -module-name test -emit-sil -o - -verify | %FileCheck %s
+// RUN: %target-swift-frontend -sil-verify-all %s -module-name test -emit-sil -o - -verify | %FileCheck %s
 
 
 // Constructor calls are dispatched dynamically for open classes, even if
@@ -6,7 +6,7 @@
 
 open class OpenClass {
   // CHECK-LABEL: sil @$s4test9OpenClassC1xACSi_tcfC
-  // CHECK: [[M:%[0-9]+]] = class_method %1 : $@thick OpenClass.Type, #OpenClass.init!allocator.1
+  // CHECK: [[M:%[0-9]+]] = class_method %1 : $@thick OpenClass.Type, #OpenClass.init!allocator
   // CHECK: apply [[M]]
   // CHECK: return
   public convenience init(x: Int) {

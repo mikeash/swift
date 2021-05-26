@@ -12,10 +12,12 @@
 
 import SwiftPrivate
 import SwiftPrivateLibcExtras
-#if os(macOS) || os(iOS)
+#if canImport(Darwin)
 import Darwin
-#elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku)
+#elseif canImport(Glibc)
 import Glibc
+#elseif os(Windows)
+import CRT
 #endif
 
 #if _runtime(_ObjC)
@@ -28,7 +30,7 @@ import Foundation
 //
 
 func findSubstring(_ haystack: Substring, _ needle: String) -> String.Index? {
-  return findSubstring(String(haystack._ephemeralContent), needle)
+  return findSubstring(haystack._ephemeralString, needle)
 }
 
 func findSubstring(_ string: String, _ substring: String) -> String.Index? {
@@ -73,6 +75,7 @@ func findSubstring(_ string: String, _ substring: String) -> String.Index? {
 #endif
 }
 
+#if !os(Windows)
 public func createTemporaryFile(
   _ fileNamePrefix: String, _ fileNameSuffix: String, _ contents: String
 ) -> String {
@@ -95,6 +98,7 @@ public func createTemporaryFile(
   }
   return fileName
 }
+#endif
 
 public final class Box<T> {
   public init(_ value: T) { self.value = value }
@@ -110,22 +114,28 @@ public func <=> <T: Comparable>(lhs: T, rhs: T) -> ExpectedComparisonResult {
 }
 
 public struct TypeIdentifier : Hashable, Comparable {
+  public var value: Any.Type
+
   public init(_ value: Any.Type) {
     self.value = value
   }
 
   public var hashValue: Int { return objectID.hashValue }
-  public var value: Any.Type
-  
-  internal var objectID : ObjectIdentifier { return ObjectIdentifier(value) }
-}
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(objectID)
+  }
 
-public func < (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
-  return lhs.objectID < rhs.objectID
-}
+  internal var objectID : ObjectIdentifier {
+    return ObjectIdentifier(value)
+  }
 
-public func == (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
-  return lhs.objectID == rhs.objectID
+  public static func < (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
+    return lhs.objectID < rhs.objectID
+  }
+
+  public static func == (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
+    return lhs.objectID == rhs.objectID
+  }
 }
 
 extension TypeIdentifier
@@ -258,7 +268,15 @@ public func _isStdlibDebugConfiguration() -> Bool {
 #endif
 }
 
-@_fixed_layout
+// Return true if the Swift runtime available is at least 5.1
+public func _hasSwift_5_1() -> Bool {
+  if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+    return true
+  }
+  return false
+}
+
+@frozen
 public struct LinearCongruentialGenerator: RandomNumberGenerator {
 
   @usableFromInline

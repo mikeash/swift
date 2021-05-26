@@ -1,11 +1,14 @@
 // RUN: %target-run-simple-swift %t
 // REQUIRES: executable_test
+// UNSUPPORTED: OS=windows-msvc
 
 import StdlibUnittest
-#if os(Linux) || os(Android)
+#if canImport(Darwin)
+  import Darwin
+#elseif canImport(Glibc)
   import Glibc
 #else
-  import Darwin
+#error("Unsupported platform")
 #endif
 
 var MMapTests = TestSuite("MMaptests")

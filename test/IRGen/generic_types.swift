@@ -1,4 +1,5 @@
-// RUN: %target-swift-frontend %s -emit-ir | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-runtime
+// RUN: %target-swift-frontend -enable-objc-interop %s -emit-ir | %FileCheck %s --check-prefixes=CHECK,CHECK-objc
+// RUN: %target-swift-frontend -disable-objc-interop %s -emit-ir | %FileCheck %s --check-prefixes=CHECK,CHECK-native
 
 // REQUIRES: CPU=x86_64
 
@@ -20,13 +21,15 @@
 // -- negative size in words
 // CHECK-SAME:   i32 2,
 // -- positive size in words
-// CHECK-SAME:   i32 17,
+// CHECK-objc-SAME:   i32 17,
+// CHECK-native-SAME:   i32 14,
 // -- num immediate members
 // CHECK-SAME:   i32 7,
 // -- num fields
 // CHECK-SAME:   i32 1,
 // -- field offset vector offset
-// CHECK-SAME:   i32 16,
+// CHECK-objc-SAME:   i32 11,
+// CHECK-native-SAME:   i32 8,
 // -- instantiation cache
 // CHECK-SAME:   @"$s13generic_types1ACMI"
 // -- instantiation pattern
@@ -147,24 +150,25 @@ struct X2: P2 {
   typealias A = X1
 }
 
-// Check for correct root generic parameters in the generic requirements of X3.
-// CHECK-LABEL: @"$sq_1A13generic_types2P2P_MXA" = linkonce_odr hidden constant
+// Check for correct generic parameters in the nominal type descriptor
+// CHECK-LABEL: @"$s13generic_types2X3VMn" =
 
 // Root: generic parameter 1
-// CHECK-SAME: i32 1
+// CHECK-SAME: @"symbolic q_"
 
-// Protocol P2
-// CHECK-SAME: $s13generic_types2P2Mp
+// U.A (via P2)
+// CHECK-SAME: @"symbolic 1A_____Qy_ 13generic_types2P2P
+
 struct X3<T, U> where U: P2, U.A: P1 { }
 
-// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} internal %swift.type* @"$s13generic_types1ACMi"(%swift.type_descriptor*, i8**, i8*) {{.*}} {
+// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} internal %swift.type* @"$s13generic_types1ACMi"(%swift.type_descriptor* %0, i8** %1, i8* %2) {{.*}} {
 // CHECK:   [[T0:%.*]] = bitcast i8** %1 to %swift.type**
 // CHECK:   %T = load %swift.type*, %swift.type** [[T0]],
 // CHECK:   [[METADATA:%.*]] = call %swift.type* @swift_allocateGenericClassMetadata(%swift.type_descriptor* %0, i8** %1, i8* %2)
 // CHECK-NEXT:   ret %swift.type* [[METADATA]]
 // CHECK: }
 
-// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} internal %swift.type* @"$s13generic_types1BCMi"(%swift.type_descriptor*, i8**, i8*) {{.*}} {
+// CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} internal %swift.type* @"$s13generic_types1BCMi"(%swift.type_descriptor* %0, i8** %1, i8* %2) {{.*}} {
 // CHECK:   [[T0:%.*]] = bitcast i8** %1 to %swift.type**
 // CHECK:   %T = load %swift.type*, %swift.type** [[T0]],
 // CHECK:   [[METADATA:%.*]] = call %swift.type* @swift_allocateGenericClassMetadata(%swift.type_descriptor* %0, i8** %1, i8* %2)

@@ -21,6 +21,7 @@
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/Stmt.h" // for PoundAvailableInfo
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/STLExtras.h"
@@ -153,13 +154,21 @@ private:
 
   SourceRange SrcRange;
 
+  /// A canonical availiability info for this context, computed top-down from the root
+  /// context (compilation deployment target).
   AvailabilityContext AvailabilityInfo;
+
+  /// If this context was annotated with an availability attribute, this property captures that.
+  /// It differs from the above `AvailabilityInfo` by being independent of the deployment target,
+  /// and is used for providing availability attribute redundancy warning diagnostics.
+  AvailabilityContext ExplicitAvailabilityInfo;
 
   std::vector<TypeRefinementContext *> Children;
 
   TypeRefinementContext(ASTContext &Ctx, IntroNode Node,
                         TypeRefinementContext *Parent, SourceRange SrcRange,
-                        const AvailabilityContext &Info);
+                        const AvailabilityContext &Info,
+                        const AvailabilityContext &ExplicitInfo);
 
 public:
   
@@ -171,6 +180,7 @@ public:
   static TypeRefinementContext *createForDecl(ASTContext &Ctx, Decl *D,
                                               TypeRefinementContext *Parent,
                                               const AvailabilityContext &Info,
+                                              const AvailabilityContext &ExplicitInfo,
                                               SourceRange SrcRange);
   
   /// Create a refinement context for the Then branch of the given IfStmt.
@@ -244,6 +254,12 @@ public:
     return AvailabilityInfo;
   }
 
+  /// Returns the information on what availability was specified by the programmer
+  /// on this context (if any).
+  const AvailabilityContext &getExplicitAvailabilityInfo() const {
+    return ExplicitAvailabilityInfo;
+  }
+
   /// Adds a child refinement context.
   void addChild(TypeRefinementContext *Child) {
     assert(Child->getSourceRange().isValid());
@@ -255,9 +271,7 @@ public:
   TypeRefinementContext *findMostRefinedSubContext(SourceLoc Loc,
                                                    SourceManager &SM);
 
-  LLVM_ATTRIBUTE_DEPRECATED(
-      void dump(SourceManager &SrcMgr) const LLVM_ATTRIBUTE_USED,
-      "only for use within the debugger");
+  SWIFT_DEBUG_DUMPER(dump(SourceManager &SrcMgr));
   void dump(raw_ostream &OS, SourceManager &SrcMgr) const;
   void print(raw_ostream &OS, SourceManager &SrcMgr, unsigned Indent = 0) const;
   

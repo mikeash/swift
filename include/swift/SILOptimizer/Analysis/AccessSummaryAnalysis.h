@@ -19,10 +19,10 @@
 #ifndef SWIFT_SILOPTIMIZER_ANALYSIS_ACCESS_SUMMARY_ANALYSIS_H_
 #define SWIFT_SILOPTIMIZER_ANALYSIS_ACCESS_SUMMARY_ANALYSIS_H_
 
+#include "swift/Basic/IndexTrie.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SILOptimizer/Analysis/BottomUpIPAnalysis.h"
-#include "swift/SILOptimizer/Utils/IndexTrie.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -36,7 +36,7 @@ public:
     SILAccessKind Kind;
 
     /// The location of the access. Used for diagnostics.
-    SILLocation AccessLoc = SILLocation((Expr *)nullptr);
+    SILLocation AccessLoc = SILLocation::invalid();
 
     const IndexTrieNode *SubPath = nullptr;
 
@@ -62,7 +62,8 @@ public:
 
     /// Returns a description of the summary. For debugging and testing
     /// purposes.
-    std::string getDescription(SILType BaseType, SILModule &M) const;
+    std::string getDescription(SILType BaseType, SILModule &M,
+                               TypeExpansionContext context) const;
   };
 
   typedef llvm::SmallDenseMap<const IndexTrieNode *, SubAccessSummary, 8>
@@ -85,7 +86,8 @@ public:
 
     /// Returns a description of the summary. For debugging and testing
     /// purposes.
-    std::string getDescription(SILType BaseType, SILModule &M) const;
+    std::string getDescription(SILType BaseType, SILModule &M,
+                               TypeExpansionContext context) const;
 
     /// Returns the accesses that the function performs to subpaths of the
     /// argument.
@@ -171,21 +173,12 @@ private:
 
   llvm::SpecificBumpPtrAllocator<FunctionInfo> Allocator;
 
-  /// A trie of integer indices that gives pointer identity to a path of
-  /// projections. This is shared between all functions in the module.
-  std::unique_ptr<IndexTrieNode> SubPathTrie;
-
 public:
-  AccessSummaryAnalysis() : BottomUpIPAnalysis(SILAnalysisKind::AccessSummary) {
-    SubPathTrie.reset(new IndexTrieNode());
-  }
+  AccessSummaryAnalysis()
+      : BottomUpIPAnalysis(SILAnalysisKind::AccessSummary) {}
 
   /// Returns a summary of the accesses performed by the given function.
   const FunctionSummary &getOrCreateSummary(SILFunction *Fn);
-
-  IndexTrieNode *getSubPathTrieRoot() {
-    return SubPathTrie.get();
-  }
 
   /// Returns an IndexTrieNode that represents the single subpath accessed from
   /// BAI or the root if no such node exists.
@@ -208,7 +201,8 @@ public:
   /// The base type must be the type of the root of the path.
   static std::string getSubPathDescription(SILType BaseType,
                                            const IndexTrieNode *SubPath,
-                                           SILModule &M);
+                                           SILModule &M,
+                                           TypeExpansionContext context);
 
   /// Performs a lexicographic comparison of two subpaths, first by path length
   /// and then by index of the last path component. Returns true when lhs

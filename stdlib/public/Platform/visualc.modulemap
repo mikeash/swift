@@ -16,13 +16,13 @@ module visualc [system] {
     export *
   }
 
-  module vadefs {
-    header "vadefs.h"
+  module vcruntime {
+    header "vcruntime.h"
     export *
   }
 
-  module vcruntime {
-    header "vcruntime.h"
+  module setjmp {
+    header "setjmp.h"
     export *
   }
 

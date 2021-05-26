@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -12,13 +12,19 @@
 
 
 import SwiftPrivate
-import SwiftPrivatePthreadExtras
+import SwiftPrivateThreadExtras
 import SwiftPrivateLibcExtras
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if canImport(Darwin)
+#if _runtime(_ObjC)
+import Foundation
+#endif
 import Darwin
-#elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin) || os(Haiku)
+#elseif canImport(Glibc)
 import Glibc
+#elseif os(Windows)
+import CRT
+import WinSDK
 #endif
 
 #if _runtime(_ObjC)
@@ -100,6 +106,26 @@ public struct SourceLocStack {
   }
 }
 
+fileprivate struct AtomicBool {
+    
+    private var _value: _stdlib_AtomicInt
+    
+    init(_ b: Bool) { self._value = _stdlib_AtomicInt(b ? 1 : 0) }
+    
+    func store(_ b: Bool) { _value.store(b ? 1 : 0) }
+    
+    func load() -> Bool { return _value.load() != 0 }
+    
+    @discardableResult
+    func orAndFetch(_ b: Bool) -> Bool {
+        return _value.orAndFetch(b ? 1 : 0) != 0
+    }
+
+    func fetchAndClear() -> Bool {
+        return _value.fetchAndAnd(0) != 0
+    }
+}
+
 func _printStackTrace(_ stackTrace: SourceLocStack?) {
   guard let s = stackTrace, !s.locs.isEmpty else { return }
   print("stacktrace:")
@@ -109,10 +135,8 @@ func _printStackTrace(_ stackTrace: SourceLocStack?) {
   }
 }
 
-// FIXME: these variables should be atomic, since multiple threads can call
-// `expect*()` functions.
-var _anyExpectFailed = false
-var _seenExpectCrash = false
+fileprivate var _anyExpectFailed = AtomicBool(false)
+fileprivate var _seenExpectCrash = AtomicBool(false)
 
 /// Run `body` and expect a failure to happen.
 ///
@@ -122,16 +146,22 @@ public func expectFailure(
   stackTrace: SourceLocStack = SourceLocStack(),
   showFrame: Bool = true,
   file: String = #file, line: UInt = #line, invoking body: () -> Void) {
-  let startAnyExpectFailed = _anyExpectFailed
-  _anyExpectFailed = false
+  let startAnyExpectFailed = _anyExpectFailed.fetchAndClear()
   body()
-  let endAnyExpectFailed = _anyExpectFailed
-  _anyExpectFailed = false
+  let endAnyExpectFailed = _anyExpectFailed.fetchAndClear()
   expectTrue(
     endAnyExpectFailed, "running `body` should produce an expected failure",
     stackTrace: stackTrace.pushIf(showFrame, file: file, line: line)
   )
-  _anyExpectFailed = _anyExpectFailed || startAnyExpectFailed
+  _anyExpectFailed.orAndFetch(startAnyExpectFailed)
+}
+
+/// An opaque function that ignores its argument and returns nothing.
+public func noop<T>(_ value: T) {}
+
+/// An opaque function that simply returns its argument.
+public func identity<T>(_ value: T) -> T {
+  return value
 }
 
 public func identity(_ element: OpaqueValue<Int>) -> OpaqueValue<Int> {
@@ -254,7 +284,7 @@ public func expectationFailure(
   _ reason: String,
   trace message: String,
   stackTrace: SourceLocStack) {
-  _anyExpectFailed = true
+  _anyExpectFailed.store(true)
   stackTrace.print()
   print(reason, terminator: reason == "" ? "" : "\n")
   print(message, terminator: message == "" ? "" : "\n")
@@ -329,6 +359,9 @@ public func expectLT<T : Comparable>(_ lhs: T, _ rhs: T,
   if !(lhs < rhs) {
     expectationFailure("\(lhs) < \(rhs)", trace: message(),
       stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
+  } else if !(rhs > lhs) {
+    expectationFailure("\(lhs) < \(rhs) (flipped)", trace: message(),
+      stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
   }
 }
 
@@ -339,6 +372,9 @@ public func expectLE<T : Comparable>(_ lhs: T, _ rhs: T,
   file: String = #file, line: UInt = #line) {
   if !(lhs <= rhs) {
     expectationFailure("\(lhs) <= \(rhs)", trace: message(),
+      stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
+  } else if !(rhs >= lhs) {
+    expectationFailure("\(lhs) <= \(rhs) (flipped)", trace: message(),
       stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
   }
 }
@@ -351,6 +387,9 @@ public func expectGT<T : Comparable>(_ lhs: T, _ rhs: T,
   if !(lhs > rhs) {
     expectationFailure("\(lhs) > \(rhs)", trace: message(),
       stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
+  } else if !(rhs < lhs) {
+    expectationFailure("\(lhs) > \(rhs) (flipped)", trace: message(),
+      stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
   }
 }
 
@@ -361,6 +400,9 @@ public func expectGE<T : Comparable>(_ lhs: T, _ rhs: T,
   file: String = #file, line: UInt = #line) {
   if !(lhs >= rhs) {
     expectationFailure("\(lhs) >= \(rhs)", trace: message(),
+      stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
+  } else if !(rhs <= lhs) {
+    expectationFailure("\(lhs) >= \(rhs) (flipped)", trace: message(),
       stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
   }
 }
@@ -487,8 +529,7 @@ public func expectMutableSliceType<X : MutableCollection>(
 /// to be.
 public func expectSequenceAssociatedTypes<X : Sequence>(
   sequenceType: X.Type,
-  iteratorType: X.Iterator.Type,
-  subSequenceType: X.SubSequence.Type
+  iteratorType: X.Iterator.Type
 ) {}
 
 /// Check that all associated types of a `Collection` are what we expect them
@@ -667,12 +708,12 @@ public func expectNotNil<T>(_ value: T?,
 }
 
 public func expectCrashLater(withMessage message: String = "") {
-  print("\(_stdlibUnittestStreamPrefix);expectCrash;\(_anyExpectFailed)")
+  print("\(_stdlibUnittestStreamPrefix);expectCrash;\(_anyExpectFailed.load())")
 
   var stderr = _Stderr()
   print("\(_stdlibUnittestStreamPrefix);expectCrash;\(message)", to: &stderr)
 
-  _seenExpectCrash = true
+  _seenExpectCrash.store(true)
 }
 
 public func expectCrash(withMessage message: String = "", executing: () -> Void) -> Never {
@@ -707,7 +748,14 @@ extension ProcessTerminationStatus {
   var isSwiftTrap: Bool {
     switch self {
     case .signal(let signal):
+#if os(Windows)
+      return CInt(signal) == SIGILL
+#elseif os(WASI)
+      // No signals support on WASI yet, see https://github.com/WebAssembly/WASI/issues/166.
+      return false
+#else
       return CInt(signal) == SIGILL || CInt(signal) == SIGTRAP
+#endif
     default:
       // This default case is needed for standard library builds where
       // resilience is enabled.
@@ -738,12 +786,21 @@ func _stdlib_getline() -> String? {
 func _printDebuggingAdvice(_ fullTestName: String) {
   print("To debug, run:")
   var invocation = [CommandLine.arguments[0]]
+#if os(Windows)
+  var buffer: UnsafeMutablePointer<CChar>?
+  var length: Int = 0
+  if _dupenv_s(&buffer, &length, "SWIFT_INTERPRETER") != 0, let buffer = buffer {
+    invocation.insert(String(cString: buffer), at: 0)
+    free(buffer)
+  }
+#else
   let interpreter = getenv("SWIFT_INTERPRETER")
   if interpreter != nil {
     if let interpreterCmd = String(validatingUTF8: interpreter!) {
         invocation.insert(interpreterCmd, at: 0)
     }
   }
+#endif
   print("$ \(invocation.joined(separator: " ")) " +
     "--stdlib-unittest-in-process --stdlib-unittest-filter \"\(fullTestName)\"")
 }
@@ -804,25 +861,91 @@ func _childProcess() {
     }
 
     let testSuite = _allTestSuites[_testSuiteNameToIndex[testSuiteName]!]
-    _anyExpectFailed = false
+    _anyExpectFailed.store(false)
     testSuite._runTest(name: testName, parameter: testParameter)
 
-    print("\(_stdlibUnittestStreamPrefix);end;\(_anyExpectFailed)")
+    print("\(_stdlibUnittestStreamPrefix);end;\(_anyExpectFailed.load())")
 
     var stderr = _Stderr()
     print("\(_stdlibUnittestStreamPrefix);end", to: &stderr)
 
-    if !testSuite._testByName(testName).canReuseChildProcessAfterTest {
+    if testSuite._shouldShutDownChildProcess(forTestNamed: testName) {
       return
     }
   }
 }
 
-struct _ParentProcess {
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+@inline(never)
+func _childProcessAsync() async {
+  _installTrapInterceptor()
+
+#if _runtime(_ObjC)
+  objc_setUncaughtExceptionHandler {
+    let exception = ($0 as Optional)! as AnyObject
+    var stderr = _Stderr()
+    let maybeNSException =
+        unsafeBitCast(exception, to: _StdlibUnittestNSException.self)
+    if let name = maybeNSException.name {
+      print("*** [StdlibUnittest] Terminating due to uncaught exception " +
+        "\(name): \(exception)",
+        to: &stderr)
+    } else {
+      print("*** [StdlibUnittest] Terminating due to uncaught exception: " +
+        "\(exception)",
+        to: &stderr)
+    }
+  }
+#endif
+
+  while let line = _stdlib_getline() {
+    let parts = line._split(separator: ";")
+
+    if parts[0] == _stdlibUnittestStreamPrefix {
+      precondition(parts[1] == "shutdown")
+      return
+    }
+
+    let testSuiteName = parts[0]
+    let testName = parts[1]
+    var testParameter: Int?
+    if parts.count > 2 {
+      testParameter = Int(parts[2])!
+    } else {
+      testParameter = nil
+    }
+
+    let testSuite = _allTestSuites[_testSuiteNameToIndex[testSuiteName]!]
+    _anyExpectFailed.store(false)
+    await testSuite._runTestAsync(name: testName, parameter: testParameter)
+
+    print("\(_stdlibUnittestStreamPrefix);end;\(_anyExpectFailed.load())")
+
+    var stderr = _Stderr()
+    print("\(_stdlibUnittestStreamPrefix);end", to: &stderr)
+
+    if testSuite._shouldShutDownChildProcess(forTestNamed: testName) {
+      return
+    }
+  }
+}
+#endif
+
+class _ParentProcess {
+#if os(Windows)
+  internal var _process: HANDLE = INVALID_HANDLE_VALUE
+  internal var _childStdin: _FDOutputStream =
+      _FDOutputStream(handle: INVALID_HANDLE_VALUE)
+  internal var _childStdout: _FDInputStream =
+      _FDInputStream(handle: INVALID_HANDLE_VALUE)
+  internal var _childStderr: _FDInputStream =
+      _FDInputStream(handle: INVALID_HANDLE_VALUE)
+#else
   internal var _pid: pid_t?
   internal var _childStdin: _FDOutputStream = _FDOutputStream(fd: -1)
   internal var _childStdout: _FDInputStream = _FDInputStream(fd: -1)
   internal var _childStderr: _FDInputStream = _FDInputStream(fd: -1)
+#endif
 
   internal var _runTestsInProcess: Bool
   internal var _filter: String?
@@ -834,16 +957,32 @@ struct _ParentProcess {
     self._args = args
   }
 
-  mutating func _spawnChild() {
+  func _spawnChild() {
     let params = ["--stdlib-unittest-run-child"] + _args
+#if os(Windows)
+    let (hProcess, hStdIn, hStdOut, hStdErr) = spawnChild(params)
+    self._process = hProcess
+    self._childStdin = _FDOutputStream(handle: hStdIn)
+    self._childStdout = _FDInputStream(handle: hStdOut)
+    self._childStderr = _FDInputStream(handle: hStdErr)
+#else
     let (pid, childStdinFD, childStdoutFD, childStderrFD) = spawnChild(params)
     _pid = pid
     _childStdin = _FDOutputStream(fd: childStdinFD)
     _childStdout = _FDInputStream(fd: childStdoutFD)
     _childStderr = _FDInputStream(fd: childStderrFD)
+#endif
   }
 
-  mutating func _waitForChild() -> ProcessTerminationStatus {
+  func _waitForChild() -> ProcessTerminationStatus {
+#if os(Windows)
+    let status = waitProcess(_process)
+    _process = INVALID_HANDLE_VALUE
+
+    _childStdin.close()
+    _childStdout.close()
+    _childStderr.close()
+#else
     let status = posixWaitpid(_pid!)
     _pid = nil
     _childStdin.close()
@@ -852,13 +991,46 @@ struct _ParentProcess {
     _childStdin = _FDOutputStream(fd: -1)
     _childStdout = _FDInputStream(fd: -1)
     _childStderr = _FDInputStream(fd: -1)
+#endif
     return status
   }
 
-  internal mutating func _readFromChild(
-    onStdoutLine: (String) -> (done: Bool, Void),
-    onStderrLine: (String) -> (done: Bool, Void)
+  internal func _readFromChild(
+    onStdoutLine: @escaping (String) -> (done: Bool, Void),
+    onStderrLine: @escaping (String) -> (done: Bool, Void)
   ) {
+#if os(Windows)
+    let (_, stdoutThread) = _stdlib_thread_create_block({
+      while !self._childStdout.isEOF {
+        self._childStdout.read()
+        while var line = self._childStdout.getline() {
+          if let cr = line.firstIndex(of: "\r") {
+            line.remove(at: cr)
+          }
+          var done: Bool
+          (done: done, ()) = onStdoutLine(line)
+          if done { return }
+        }
+      }
+    }, ())
+
+    let (_, stderrThread) = _stdlib_thread_create_block({
+      while !self._childStderr.isEOF {
+        self._childStderr.read()
+        while var line = self._childStderr.getline() {
+          if let cr = line.firstIndex(of: "\r") {
+            line.remove(at: cr)
+          }
+          var done: Bool
+          (done: done, ()) = onStderrLine(line)
+          if done { return }
+        }
+      }
+    }, ())
+
+    let (_, _) = _stdlib_thread_join(stdoutThread!, Void.self)
+    let (_, _) = _stdlib_thread_join(stderrThread!, Void.self)
+#else
     var readfds = _stdlib_fd_set()
     var writefds = _stdlib_fd_set()
     var errorfds = _stdlib_fd_set()
@@ -896,19 +1068,26 @@ struct _ParentProcess {
         continue
       }
     }
+#endif
   }
 
   /// Returns the values of the corresponding variables in the child process.
-  internal mutating func _runTestInChild(
+  internal func _runTestInChild(
     _ testSuite: TestSuite,
     _ testName: String,
     parameter: Int?
   ) -> (anyExpectFailed: Bool, seenExpectCrash: Bool,
         status: ProcessTerminationStatus?,
         crashStdout: [Substring], crashStderr: [Substring]) {
+#if os(Windows)
+    if _process == INVALID_HANDLE_VALUE {
+      _spawnChild()
+    }
+#else
     if _pid == nil {
       _spawnChild()
     }
+#endif
 
     print("\(testSuite.name);\(testName)", terminator: "", to: &_childStdin)
     if let parameter = parameter {
@@ -942,6 +1121,8 @@ struct _ParentProcess {
                               omittingEmptySubsequences: false)
         switch controlMessage[1] {
         case "expectCrash":
+          fallthrough
+        case "expectCrash\r":
           if isStdout {
             stdoutSeenCrashDelimiter = true
             anyExpectFailedInChild = controlMessage[2] == "true"
@@ -950,6 +1131,8 @@ struct _ParentProcess {
             expectingPreCrashMessage = String(controlMessage[2])
           }
         case "end":
+          fallthrough
+        case "end\r":
           if isStdout {
             stdoutEnd = true
             anyExpectFailedInChild = controlMessage[2] == "true"
@@ -957,11 +1140,15 @@ struct _ParentProcess {
             stderrEnd = true
           }
         default:
-          fatalError("unexpected message")
+          fatalError("unexpected message: \(controlMessage[1])")
         }
         line = line[line.startIndex..<index]
         if line.isEmpty {
+#if os(Windows)
+          return (done: isStdout ? stdoutEnd : stderrEnd, ())
+#else
           return (done: stdoutEnd && stderrEnd, ())
+#endif
         }
       }
       if !expectingPreCrashMessage.isEmpty
@@ -995,7 +1182,11 @@ struct _ParentProcess {
       } else {
         print("stderr>>> \(line)")
       }
+#if os(Windows)
+      return (done: isStdout ? stdoutEnd : stderrEnd, ())
+#else
       return (done: stdoutEnd && stderrEnd, ())
+#endif
     }
 
     _readFromChild(
@@ -1005,7 +1196,7 @@ struct _ParentProcess {
     // Check if the child has sent us "end" markers for the current test.
     if stdoutEnd && stderrEnd {
       var status: ProcessTerminationStatus?
-      if !testSuite._testByName(testName).canReuseChildProcessAfterTest {
+      if testSuite._shouldShutDownChildProcess(forTestNamed: testName) {
         status = _waitForChild()
         switch status! {
         case .exit(0):
@@ -1031,13 +1222,25 @@ struct _ParentProcess {
       status, capturedCrashStdout, capturedCrashStderr)
   }
 
-  internal mutating func _shutdownChild() -> (failed: Bool, Void) {
+  internal func _shutdownChild() -> (failed: Bool, Void) {
+#if os(Windows)
+    if _process == INVALID_HANDLE_VALUE {
+      // The child process is not running.  Report that it didn't fail during
+      // shutdown.
+      return (failed: false, ())
+    }
+#else
     if _pid == nil {
       // The child process is not running.  Report that it didn't fail during
       // shutdown.
       return (failed: false, ())
     }
-    print("\(_stdlibUnittestStreamPrefix);shutdown", to: &_childStdin)
+#endif
+    // If the child process expects an EOF, its stdin fd has already been closed and
+    // it will shut itself down automatically.
+    if !_childStdin.isClosed {
+      print("\(_stdlibUnittestStreamPrefix);shutdown", to: &_childStdin)
+    }
 
     var childCrashed = false
 
@@ -1075,7 +1278,7 @@ struct _ParentProcess {
     case xFail
   }
 
-  internal mutating func runOneTest(
+  internal func runOneTest(
     fullTestName: String,
     testSuite: TestSuite,
     test t: TestSuite._Test,
@@ -1098,22 +1301,27 @@ struct _ParentProcess {
     if _runTestsInProcess {
       if t.stdinText != nil {
         print("The test \(fullTestName) requires stdin input and can't be run in-process, marking as failed")
-        _anyExpectFailed = true
+        _anyExpectFailed.store(true)
+      } else if t.requiresOwnProcess {
+        print("The test \(fullTestName) requires running in a child process and can't be run in-process, marking as failed.")
+        _anyExpectFailed.store(true)
       } else {
-        _anyExpectFailed = false
+        _anyExpectFailed.store(false)
         testSuite._runTest(name: t.name, parameter: testParameter)
       }
     } else {
-      (_anyExpectFailed, expectCrash, childTerminationStatus, crashStdout,
+      var anyExpectFailed = false
+      (anyExpectFailed, expectCrash, childTerminationStatus, crashStdout,
        crashStderr) =
         _runTestInChild(testSuite, t.name, parameter: testParameter)
+      _anyExpectFailed.store(anyExpectFailed)
     }
 
     // Determine if the test passed, not taking XFAILs into account.
     var testPassed = false
     switch (childTerminationStatus, expectCrash) {
     case (.none, false):
-      testPassed = !_anyExpectFailed
+      testPassed = !_anyExpectFailed.load()
 
     case (.none, true):
       testPassed = false
@@ -1124,7 +1332,7 @@ struct _ParentProcess {
       print("the test crashed unexpectedly")
 
     case (.some, true):
-      testPassed = !_anyExpectFailed
+      testPassed = !_anyExpectFailed.load()
     }
     if testPassed && t.crashOutputMatches.count > 0 {
       // If we still think that the test passed, check if the crash
@@ -1161,7 +1369,101 @@ struct _ParentProcess {
     }
   }
 
-  mutating func run() {
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+  internal func runOneTestAsync(
+    fullTestName: String,
+    testSuite: TestSuite,
+    test t: TestSuite._Test,
+    testParameter: Int?
+  ) async -> _TestStatus {
+    let activeSkips = t.getActiveSkipPredicates()
+    if !activeSkips.isEmpty {
+      return .skip(activeSkips)
+    }
+
+    let activeXFails = t.getActiveXFailPredicates()
+    let expectXFail = !activeXFails.isEmpty
+    let activeXFailsText = expectXFail ? " (XFAIL: \(activeXFails))" : ""
+    print("[ RUN      ] \(fullTestName)\(activeXFailsText)")
+
+    var expectCrash = false
+    var childTerminationStatus: ProcessTerminationStatus?
+    var crashStdout: [Substring] = []
+    var crashStderr: [Substring] = []
+    if _runTestsInProcess {
+      if t.stdinText != nil {
+        print("The test \(fullTestName) requires stdin input and can't be run in-process, marking as failed")
+        _anyExpectFailed.store(true)
+      } else if t.requiresOwnProcess {
+        print("The test \(fullTestName) requires running in a child process and can't be run in-process, marking as failed.")
+        _anyExpectFailed.store(true)
+      } else {
+        _anyExpectFailed.store(false)
+        await testSuite._runTestAsync(name: t.name, parameter: testParameter)
+      }
+    } else {
+      var anyExpectFailed = false
+      (anyExpectFailed, expectCrash, childTerminationStatus, crashStdout,
+       crashStderr) =
+        _runTestInChild(testSuite, t.name, parameter: testParameter)
+      _anyExpectFailed.store(anyExpectFailed)
+    }
+
+    // Determine if the test passed, not taking XFAILs into account.
+    var testPassed = false
+    switch (childTerminationStatus, expectCrash) {
+    case (.none, false):
+      testPassed = !_anyExpectFailed.load()
+
+    case (.none, true):
+      testPassed = false
+      print("expecting a crash, but the test did not crash")
+
+    case (.some, false):
+      testPassed = false
+      print("the test crashed unexpectedly")
+
+    case (.some, true):
+      testPassed = !_anyExpectFailed.load()
+    }
+    if testPassed && t.crashOutputMatches.count > 0 {
+      // If we still think that the test passed, check if the crash
+      // output matches our expectations.
+      let crashOutput = crashStdout + crashStderr
+      for expectedSubstring in t.crashOutputMatches {
+        var found = false
+        for s in crashOutput {
+          if findSubstring(s, expectedSubstring) != nil {
+            found = true
+            break
+          }
+        }
+        if !found {
+          print("did not find expected string after crash: \(expectedSubstring.debugDescription)")
+          testPassed = false
+        }
+      }
+    }
+
+    // Apply XFAILs.
+    switch (testPassed, expectXFail) {
+    case (true, false):
+      return .pass
+
+    case (true, true):
+      return .uxPass
+
+    case (false, false):
+      return .fail
+
+    case (false, true):
+      return .xFail
+    }
+  }
+#endif
+
+
+  func run() {
     if let filter = _filter {
       print("StdlibUnittest: using filter: \(filter)")
     }
@@ -1232,6 +1534,81 @@ struct _ParentProcess {
       _testSuiteFailedCallback()
     }
   }
+
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+  func runAsync() async {
+    if let filter = _filter {
+      print("StdlibUnittest: using filter: \(filter)")
+    }
+    for testSuite in _allTestSuites {
+      var uxpassedTests: [String] = []
+      var failedTests: [String] = []
+      var skippedTests: [String] = []
+      for t in testSuite._tests {
+        for testParameter in t.parameterValues {
+          var testName = t.name
+          if let testParameter = testParameter {
+            testName += "/"
+            testName += String(testParameter)
+          }
+          let fullTestName = "\(testSuite.name).\(testName)"
+          if let filter = _filter,
+             findSubstring(fullTestName, filter) == nil {
+
+            continue
+          }
+
+          switch runOneTest(
+            fullTestName: fullTestName,
+            testSuite: testSuite,
+            test: t,
+            testParameter: testParameter
+          ) {
+          case .skip(let activeSkips):
+            skippedTests.append(testName)
+            print("[ SKIP     ] \(fullTestName) (skip: \(activeSkips))")
+
+          case .pass:
+            print("[       OK ] \(fullTestName)")
+
+          case .uxPass:
+            uxpassedTests.append(testName)
+            print("[   UXPASS ] \(fullTestName)")
+
+          case .fail:
+            failedTests.append(testName)
+            print("[     FAIL ] \(fullTestName)")
+
+          case .xFail:
+            print("[    XFAIL ] \(fullTestName)")
+          }
+        }
+      }
+
+      if !uxpassedTests.isEmpty || !failedTests.isEmpty {
+        print("\(testSuite.name): Some tests failed, aborting")
+        print("UXPASS: \(uxpassedTests)")
+        print("FAIL: \(failedTests)")
+        print("SKIP: \(skippedTests)")
+        if !uxpassedTests.isEmpty {
+          _printDebuggingAdvice(uxpassedTests[0])
+        }
+        if !failedTests.isEmpty {
+          _printDebuggingAdvice(failedTests[0])
+        }
+        _testSuiteFailedCallback()
+      } else {
+        print("\(testSuite.name): All tests passed")
+      }
+    }
+    let (failed: failedOnShutdown, ()) = _shutdownChild()
+    if failedOnShutdown {
+      print("The child process failed during shutdown, aborting.")
+      _testSuiteFailedCallback()
+    }
+  }
+#endif
+
 }
 
 // Track repeated calls to runAllTests() and/or runNoTests().
@@ -1336,11 +1713,81 @@ public func runAllTests() {
       i += 1
     }
 
-    var parent = _ParentProcess(
+    let parent = _ParentProcess(
       runTestsInProcess: runTestsInProcess, args: args, filter: filter)
     parent.run()
   }
 }
+
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+public func runAllTestsAsync() async {
+  if PersistentState.runNoTestsWasCalled {
+    print("runAllTests() called after runNoTests(). Aborting.")
+    _testSuiteFailedCallback()
+    return
+  }
+  if PersistentState.runAllTestsWasCalled {
+    print("runAllTests() called twice. Aborting.")
+    _testSuiteFailedCallback()
+    return
+  }
+  PersistentState.runAllTestsWasCalled = true
+  PersistentState.ranSomething = true
+
+#if _runtime(_ObjC)
+  autoreleasepool {
+    _stdlib_initializeReturnAutoreleased()
+  }
+#endif
+
+  let _isChildProcess: Bool =
+    CommandLine.arguments.contains("--stdlib-unittest-run-child")
+
+  if _isChildProcess {
+    await _childProcessAsync()
+  } else {
+    var runTestsInProcess: Bool = false
+    var filter: String?
+    var args = [String]()
+    var i = 0
+    i += 1 // Skip the name of the executable.
+    while i < CommandLine.arguments.count {
+      let arg = CommandLine.arguments[i]
+      if arg == "--stdlib-unittest-in-process" {
+        runTestsInProcess = true
+        i += 1
+        continue
+      }
+      if arg == "--stdlib-unittest-filter" {
+        filter = CommandLine.arguments[i + 1]
+        i += 2
+        continue
+      }
+      if arg == "--help" {
+        let message =
+"optional arguments:\n" +
+"--stdlib-unittest-in-process\n" +
+"                        run tests in-process without intercepting crashes.\n" +
+"                        Useful for running under a debugger.\n" +
+"--stdlib-unittest-filter FILTER-STRING\n" +
+"                        only run tests whose names contain FILTER-STRING as\n" +
+"                        a substring."
+        print(message)
+        return
+      }
+
+      // Pass through unparsed arguments to the child process.
+      args.append(CommandLine.arguments[i])
+
+      i += 1
+    }
+
+    let parent = _ParentProcess(
+      runTestsInProcess: runTestsInProcess, args: args, filter: filter)
+    await parent.runAsync()
+  }
+}
+#endif
 
 #if SWIFT_RUNTIME_ENABLE_LEAK_CHECKER
 
@@ -1376,6 +1823,23 @@ public final class TestSuite {
     _TestBuilder(testSuite: self, name: name, loc: SourceLoc(file, line))
     .code(testFunction)
   }
+
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+  // This method is prohibited from inlining because inlining the test harness
+  // into the test is not interesting from the runtime performance perspective.
+  // And it does not really make the test cases more effectively at testing the
+  // optimizer from a correctness prospective. On the contrary, it sometimes
+  // severely affects the compile time of the test code.
+  @inline(never)
+  public func test(
+    _ name: String,
+    file: String = #file, line: UInt = #line,
+    _ testFunction: @escaping () async -> Void
+  ) {
+    _TestBuilder(testSuite: self, name: name, loc: SourceLoc(file, line))
+    .code(testFunction)
+  }
+#endif
 
   // This method is prohibited from inlining because inlining the test harness
   // into the test is not interesting from the runtime performance perspective.
@@ -1422,6 +1886,12 @@ public final class TestSuite {
       code()
     case .parameterized(code: let code, _):
       code(parameter!)
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+    case .singleAsync(_):
+      fatalError("Cannot call async code, use `runAllTestsAsync`")
+    case .parameterizedAsync(code: _, _):
+      fatalError("Cannot call async code, use `runAllTestsAsync`")
+#endif
     }
 
 #if SWIFT_RUNTIME_ENABLE_LEAK_CHECKER
@@ -1436,13 +1906,76 @@ public final class TestSuite {
       file: test.testLoc.file, line: test.testLoc.line)
   }
 
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+  func _runTestAsync(name testName: String, parameter: Int?) async {
+    PersistentState.ranSomething = true
+    for r in _allResettables {
+      r.reset()
+    }
+    LifetimeTracked.instances = 0
+    if let f = _testSetUpCode {
+      f()
+    }
+    let test = _testByName(testName)
+
+#if SWIFT_RUNTIME_ENABLE_LEAK_CHECKER
+    startTrackingObjects(name)
+#endif
+
+    switch test.code {
+    case .single(let code):
+      precondition(
+        parameter == nil,
+        "can't pass parameters to non-parameterized tests")
+      code()
+    case .parameterized(code: let code, _):
+      code(parameter!)
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+    case .singleAsync(let code):
+      precondition(
+        parameter == nil,
+        "can't pass parameters to non-parameterized tests")
+      await code()
+    case .parameterizedAsync(code: let code, _):
+      await code(parameter!)
+#endif
+    }
+
+#if SWIFT_RUNTIME_ENABLE_LEAK_CHECKER
+    _ = stopTrackingObjects(name)
+#endif
+
+    if let f = _testTearDownCode {
+      f()
+    }
+    expectEqual(
+      0, LifetimeTracked.instances, "Found leaked LifetimeTracked instances.",
+      file: test.testLoc.file, line: test.testLoc.line)
+  }
+#endif
+
   func _testByName(_ testName: String) -> _Test {
     return _tests[_testNameToIndex[testName]!]
+  }
+
+  /// Determines if we should shut down the current test process, i.e. if this
+  /// test or the next test requires executing in its own process.
+  func _shouldShutDownChildProcess(forTestNamed testName: String) -> Bool {
+    let index = _testNameToIndex[testName]!
+    if index == _tests.count - 1 { return false }
+    let currentTest = _tests[index]
+    let nextTest = _tests[index + 1]
+    if !currentTest.canReuseChildProcessAfterTest { return true }
+    return currentTest.requiresOwnProcess || nextTest.requiresOwnProcess
   }
 
   internal enum _TestCode {
     case single(code: () -> Void)
     case parameterized(code: (Int) -> Void, count: Int)
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+    case singleAsync(code: () async -> Void)
+    case parameterizedAsync(code: (Int) async -> Void, count: Int)
+#endif
   }
 
   internal struct _Test {
@@ -1454,6 +1987,7 @@ public final class TestSuite {
     let stdinEndsWithEOF: Bool
     let crashOutputMatches: [String]
     let code: _TestCode
+    let requiresOwnProcess: Bool
 
     /// Whether the test harness should stop reusing the child process after
     /// running this test.
@@ -1475,6 +2009,12 @@ public final class TestSuite {
         return [nil]
       case .parameterized(code: _, count: let count):
         return Array(0..<count)
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+      case .singleAsync:
+        return [nil]
+      case .parameterizedAsync(code: _, count: let count):
+        return Array(0..<count)
+#endif
       }
     }
   }
@@ -1491,6 +2031,7 @@ public final class TestSuite {
       var _stdinEndsWithEOF: Bool = false
       var _crashOutputMatches: [String] = []
       var _testLoc: SourceLoc?
+      var _requiresOwnProcess: Bool = false
     }
 
     init(testSuite: TestSuite, name: String, loc: SourceLoc) {
@@ -1520,6 +2061,11 @@ public final class TestSuite {
       return self
     }
 
+    public func requireOwnProcess() -> _TestBuilder {
+      _data._requiresOwnProcess = true
+      return self
+    }
+
     internal func _build(_ testCode: _TestCode) {
       _testSuite._tests.append(
         _Test(
@@ -1528,13 +2074,20 @@ public final class TestSuite {
           stdinText: _data._stdinText,
           stdinEndsWithEOF: _data._stdinEndsWithEOF,
           crashOutputMatches: _data._crashOutputMatches,
-          code: testCode))
+          code: testCode,
+          requiresOwnProcess: _data._requiresOwnProcess))
       _testSuite._testNameToIndex[_name] = _testSuite._tests.count - 1
     }
 
     public func code(_ testFunction: @escaping () -> Void) {
       _build(.single(code: testFunction))
     }
+
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+    public func code(_ testFunction: @escaping () async -> Void) {
+      _build(.singleAsync(code: testFunction))
+    }
+#endif
 
     public func forEach<Data>(
       in parameterSets: [Data],
@@ -1544,6 +2097,18 @@ public final class TestSuite {
         code: { (i: Int) in testFunction(parameterSets[i]) },
         count: parameterSets.count))
     }
+
+#if SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY
+    public func forEach<Data>(
+      in parameterSets: [Data],
+      testFunction: @escaping (Data) async -> Void
+    ) {
+      _build(.parameterizedAsync(
+        code: { (i: Int) in await testFunction(parameterSets[i]) },
+        count: parameterSets.count))
+    }
+#endif
+
   }
 
   var name: String
@@ -1559,15 +2124,20 @@ public final class TestSuite {
   var _testNameToIndex: [String : Int] = [:]
 }
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
-@_silgen_name("getSystemVersionPlistProperty")
-func _getSystemVersionPlistPropertyImpl(
-  _ propertyName: UnsafePointer<CChar>) -> UnsafePointer<CChar>?
-
+#if canImport(Darwin)
+#if _runtime(_ObjC)
 func _getSystemVersionPlistProperty(_ propertyName: String) -> String? {
-  let cs = _getSystemVersionPlistPropertyImpl(propertyName)
-  return cs.map(String.init(cString:))
+  return NSDictionary(contentsOfFile: "/System/Library/CoreServices/SystemVersion.plist")?[propertyName] as? String
 }
+#else
+func _getSystemVersionPlistProperty(_ propertyName: String) -> String? {
+  var count = 0
+  sysctlbyname("kern.osproductversion", nil, &count, nil, 0)
+  var s = [CChar](repeating: 0, count: count)
+  sysctlbyname("kern.osproductversion", &s, &count, nil, 0)
+  return String(cString: &s)
+}
+#endif
 #endif
 
 public enum OSVersion : CustomStringConvertible {
@@ -1580,11 +2150,13 @@ public enum OSVersion : CustomStringConvertible {
   case watchOSSimulator
   case linux
   case freeBSD
+  case openBSD
   case android
   case ps4
   case windowsCygnus
   case windows
   case haiku
+  case wasi
 
   public var description: String {
     switch self {
@@ -1606,6 +2178,8 @@ public enum OSVersion : CustomStringConvertible {
       return "Linux"
     case .freeBSD:
       return "FreeBSD"
+    case .openBSD:
+      return "OpenBSD"
     case .ps4:
       return "PS4"
     case .android:
@@ -1616,6 +2190,8 @@ public enum OSVersion : CustomStringConvertible {
       return "Windows"
     case .haiku:
       return "Haiku"
+    case .wasi:
+      return "WASI"
     }
   }
 }
@@ -1625,7 +2201,7 @@ func _parseDottedVersion(_ s: String) -> [Int] {
 }
 
 public func _parseDottedVersionTriple(_ s: String) -> (Int, Int, Int) {
-  var array = _parseDottedVersion(s)
+  let array = _parseDottedVersion(s)
   if array.count >= 4 {
     fatalError("unexpected version")
   }
@@ -1650,6 +2226,8 @@ func _getOSVersion() -> OSVersion {
   return .linux
 #elseif os(FreeBSD)
   return .freeBSD
+#elseif os(OpenBSD)
+  return .openBSD
 #elseif os(PS4)
   return .ps4
 #elseif os(Android)
@@ -1660,6 +2238,8 @@ func _getOSVersion() -> OSVersion {
   return .windows
 #elseif os(Haiku)
   return .haiku
+#elseif os(WASI)
+  return .wasi
 #else
   let productVersion = _getSystemVersionPlistProperty("ProductVersion")!
   let (major, minor, bugFix) = _parseDottedVersionTriple(productVersion)
@@ -1705,6 +2285,7 @@ public enum TestRunPredicate : CustomStringConvertible {
 
   case iOSAny(/*reason:*/ String)
   case iOSMajor(Int, reason: String)
+  case iOSMajorRange(ClosedRange<Int>, reason: String)
   case iOSMinor(Int, Int, reason: String)
   case iOSMinorRange(Int, ClosedRange<Int>, reason: String)
   case iOSBugFix(Int, Int, Int, reason: String)
@@ -1714,6 +2295,7 @@ public enum TestRunPredicate : CustomStringConvertible {
 
   case tvOSAny(/*reason:*/ String)
   case tvOSMajor(Int, reason: String)
+  case tvOSMajorRange(ClosedRange<Int>, reason: String)
   case tvOSMinor(Int, Int, reason: String)
   case tvOSMinorRange(Int, ClosedRange<Int>, reason: String)
   case tvOSBugFix(Int, Int, Int, reason: String)
@@ -1723,6 +2305,7 @@ public enum TestRunPredicate : CustomStringConvertible {
 
   case watchOSAny(/*reason:*/ String)
   case watchOSMajor(Int, reason: String)
+  case watchOSMajorRange(ClosedRange<Int>, reason: String)
   case watchOSMinor(Int, Int, reason: String)
   case watchOSMinorRange(Int, ClosedRange<Int>, reason: String)
   case watchOSBugFix(Int, Int, Int, reason: String)
@@ -1774,6 +2357,8 @@ public enum TestRunPredicate : CustomStringConvertible {
       return "iOS(*, reason: \(reason))"
     case .iOSMajor(let major, let reason):
       return "iOS(\(major).*, reason: \(reason))"
+    case .iOSMajorRange(let range, let reason):
+      return "iOS([\(range)], reason: \(reason))"
     case .iOSMinor(let major, let minor, let reason):
       return "iOS(\(major).\(minor), reason: \(reason))"
     case .iOSMinorRange(let major, let minorRange, let reason):
@@ -1790,6 +2375,8 @@ public enum TestRunPredicate : CustomStringConvertible {
       return "tvOS(*, reason: \(reason))"
     case .tvOSMajor(let major, let reason):
       return "tvOS(\(major).*, reason: \(reason))"
+    case .tvOSMajorRange(let range, let reason):
+      return "tvOS([\(range)], reason: \(reason))"
     case .tvOSMinor(let major, let minor, let reason):
       return "tvOS(\(major).\(minor), reason: \(reason))"
     case .tvOSMinorRange(let major, let minorRange, let reason):
@@ -1806,6 +2393,8 @@ public enum TestRunPredicate : CustomStringConvertible {
       return "watchOS(*, reason: \(reason))"
     case .watchOSMajor(let major, let reason):
       return "watchOS(\(major).*, reason: \(reason))"
+    case .watchOSMajorRange(let range, let reason):
+      return "watchOS([\(range)], reason: \(reason))"
     case .watchOSMinor(let major, let minor, let reason):
       return "watchOS(\(major).\(minor), reason: \(reason))"
     case .watchOSMinorRange(let major, let minorRange, let reason):
@@ -1920,6 +2509,14 @@ public enum TestRunPredicate : CustomStringConvertible {
         return false
       }
 
+    case .iOSMajorRange(let range, _):
+      switch _getRunningOSVersion() {
+      case .iOS(let major, _, _):
+        return range.contains(major)
+      default:
+        return false
+      }
+
     case .iOSMinor(let major, let minor, _):
       switch _getRunningOSVersion() {
       case .iOS(major, minor, _):
@@ -1976,6 +2573,14 @@ public enum TestRunPredicate : CustomStringConvertible {
         return false
       }
 
+    case .tvOSMajorRange(let range, _):
+      switch _getRunningOSVersion() {
+      case .tvOS(let major, _, _):
+        return range.contains(major)
+      default:
+        return false
+      }
+
     case .tvOSMinor(let major, let minor, _):
       switch _getRunningOSVersion() {
       case .tvOS(major, minor, _):
@@ -2028,6 +2633,14 @@ public enum TestRunPredicate : CustomStringConvertible {
       switch _getRunningOSVersion() {
       case .watchOS(major, _, _):
         return true
+      default:
+        return false
+      }
+
+    case .watchOSMajorRange(let range, _):
+      switch _getRunningOSVersion() {
+      case .watchOS(let major, _, _):
+        return range.contains(major)
       default:
         return false
       }
@@ -2210,17 +2823,22 @@ internal func _checkEquatableImpl<Instance : Equatable>(
       let isEqualXY = x == y
       expectEqual(
         predictedXY, isEqualXY,
-        (predictedXY
-           ? "expected equal, found not equal\n"
-           : "expected not equal, found equal\n") +
-        "lhs (at index \(i)): \(String(reflecting: x))\n" +
-        "rhs (at index \(j)): \(String(reflecting: y))",
+        """
+        \((predictedXY
+           ? "expected equal, found not equal"
+           : "expected not equal, found equal"))
+        lhs (at index \(i)): \(String(reflecting: x))
+        rhs (at index \(j)): \(String(reflecting: y))
+        """,
         stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
 
       // Not-equal is an inverse of equal.
       expectNotEqual(
         isEqualXY, x != y,
-        "lhs (at index \(i)): \(String(reflecting: x))\nrhs (at index \(j)): \(String(reflecting: y))",
+        """
+        lhs (at index \(i)): \(String(reflecting: x))
+        rhs (at index \(j)): \(String(reflecting: y))
+        """,
         stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
 
       if !allowBrokenTransitivity {
@@ -2262,6 +2880,10 @@ public func checkEquatable<T : Equatable>(
     showFrame: false)
 }
 
+/// Produce an integer hash value for `value` by feeding it to a dedicated
+/// `Hasher`. This is always done by calling the `hash(into:)` method.
+/// If a non-nil `seed` is given, it is used to perturb the hasher state;
+/// this is useful for resolving accidental hash collisions.
 internal func hash<H: Hashable>(_ value: H, seed: Int? = nil) -> Int {
   var hasher = Hasher()
   if let seed = seed {
@@ -2277,6 +2899,7 @@ internal func hash<H: Hashable>(_ value: H, seed: Int? = nil) -> Int {
 public func checkHashableGroups<Groups: Collection>(
   _ groups: Groups,
   _ message: @autoclosure () -> String = "",
+  allowIncompleteHashing: Bool = false,
   stackTrace: SourceLocStack = SourceLocStack(),
   showFrame: Bool = true,
   file: String = #file, line: UInt = #line
@@ -2294,6 +2917,7 @@ public func checkHashableGroups<Groups: Collection>(
     equalityOracle: equalityOracle,
     hashEqualityOracle: equalityOracle,
     allowBrokenTransitivity: false,
+    allowIncompleteHashing: allowIncompleteHashing,
     stackTrace: stackTrace.pushIf(showFrame, file: file, line: line),
     showFrame: false)
 }
@@ -2305,6 +2929,7 @@ public func checkHashable<Instances: Collection>(
   _ instances: Instances,
   equalityOracle: (Instances.Index, Instances.Index) -> Bool,
   allowBrokenTransitivity: Bool = false,
+  allowIncompleteHashing: Bool = false,
   _ message: @autoclosure () -> String = "",
   stackTrace: SourceLocStack = SourceLocStack(),
   showFrame: Bool = true,
@@ -2315,6 +2940,7 @@ public func checkHashable<Instances: Collection>(
     equalityOracle: equalityOracle,
     hashEqualityOracle: equalityOracle,
     allowBrokenTransitivity: allowBrokenTransitivity,
+    allowIncompleteHashing: allowIncompleteHashing,
     stackTrace: stackTrace.pushIf(showFrame, file: file, line: line),
     showFrame: false)
 }
@@ -2328,6 +2954,7 @@ public func checkHashable<Instances: Collection>(
   equalityOracle: (Instances.Index, Instances.Index) -> Bool,
   hashEqualityOracle: (Instances.Index, Instances.Index) -> Bool,
   allowBrokenTransitivity: Bool = false,
+  allowIncompleteHashing: Bool = false,
   _ message: @autoclosure () -> String = "",
   stackTrace: SourceLocStack = SourceLocStack(),
   showFrame: Bool = true,
@@ -2380,12 +3007,12 @@ public func checkHashable<Instances: Collection>(
         expectEqual(
           x._rawHashValue(seed: 0), y._rawHashValue(seed: 0),
           """
-          _rawHashValue expected to match, found to differ
+          _rawHashValue(seed:) expected to match, found to differ
           lhs (at index \(i)): \(x)
           rhs (at index \(j)): \(y)
           """,
           stackTrace: stackTrace.pushIf(showFrame, file: file, line: line))
-      } else {
+      } else if !allowIncompleteHashing {
         // Try a few different seeds; at least one of them should discriminate
         // between the hashes. It is extremely unlikely this check will fail
         // all ten attempts, unless the type's hash encoding is not unique,
@@ -2643,7 +3270,7 @@ public func checkLosslessStringConvertible<Instance>(
 }
 
 public func nthIndex<C: Collection>(_ x: C, _ n: Int) -> C.Index {
-  return x.index(x.startIndex, offsetBy: numericCast(n))
+  return x.index(x.startIndex, offsetBy: n)
 }
 
 public func nth<C: Collection>(_ x: C, _ n: Int) -> C.Element {
@@ -2801,15 +3428,15 @@ struct Pair<T : Comparable> : Comparable {
 
   var first: T
   var second: T
-}
 
-func == <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
-  return lhs.first == rhs.first && lhs.second == rhs.second
-}
+  static func == <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
+    return lhs.first == rhs.first && lhs.second == rhs.second
+  }
 
-func < <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
-  return [lhs.first, lhs.second].lexicographicallyPrecedes(
-    [rhs.first, rhs.second])
+  static func < <T>(lhs: Pair<T>, rhs: Pair<T>) -> Bool {
+    return [lhs.first, lhs.second].lexicographicallyPrecedes(
+      [rhs.first, rhs.second])
+  }
 }
 
 public func expectEqualsUnordered<

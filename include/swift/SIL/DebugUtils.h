@@ -42,14 +42,22 @@
 namespace swift {
 
 class SILInstruction;
-  
-/// Deletes all of the debug instructions that use \p Inst.
-inline void deleteAllDebugUses(ValueBase *Inst) {
-  for (auto UI = Inst->use_begin(), E = Inst->use_end(); UI != E;) {
-    auto *Inst = UI->getUser();
-    UI++;
-    if (Inst->isDebugInstruction())
-      Inst->eraseFromParent();
+
+/// Deletes all of the debug instructions that use \p value.
+inline void deleteAllDebugUses(SILValue value) {
+  for (auto ui = value->use_begin(), ue = value->use_end(); ui != ue;) {
+    auto *inst = ui->getUser();
+    ++ui;
+    if (inst->isDebugInstruction()) {
+      inst->eraseFromParent();
+    }
+  }
+}
+
+/// Deletes all of the debug uses of any result of \p inst.
+inline void deleteAllDebugUses(SILInstruction *inst) {
+  for (SILValue v : inst->getResults()) {
+    deleteAllDebugUses(v);
   }
 }
 
@@ -171,8 +179,18 @@ inline SILInstruction *getSingleNonDebugUser(SILValue V) {
 /// Precondition: The instruction may only have debug instructions as uses.
 /// If the iterator \p InstIter references any deleted instruction, it is
 /// incremented.
-inline void eraseFromParentWithDebugInsts(SILInstruction *I,
-                                          SILBasicBlock::iterator &InstIter) {
+///
+/// \p callBack will be invoked before each instruction is deleted. \p callBack
+/// is not responsible for deleting the instruction because this utility
+/// unconditionally deletes the \p I and its debug users.
+///
+/// Returns an iterator to the next non-deleted instruction after \p I.
+inline SILBasicBlock::iterator eraseFromParentWithDebugInsts(
+    SILInstruction *I, llvm::function_ref<void(SILInstruction *)> callBack =
+                           [](SILInstruction *) {}) {
+
+  auto nextII = std::next(I->getIterator());
+
   auto results = I->getResults();
 
   bool foundAny;
@@ -183,26 +201,16 @@ inline void eraseFromParentWithDebugInsts(SILInstruction *I,
         foundAny = true;
         auto *User = result->use_begin()->getUser();
         assert(User->isDebugInstruction());
-        if (InstIter == User->getIterator())
-          InstIter++;
-
+        if (nextII == User->getIterator())
+          nextII++;
+        callBack(User);
         User->eraseFromParent();
       }
     }
   } while (foundAny);
 
-  if (InstIter == I->getIterator())
-    ++InstIter;
-
   I->eraseFromParent();
-}
-
-/// Erases the instruction \p I from it's parent block and deletes it, including
-/// all debug instructions which use \p I.
-/// Precondition: The instruction may only have debug instructions as uses.
-inline void eraseFromParentWithDebugInsts(SILInstruction *I) {
-  SILBasicBlock::iterator nullIter;
-  eraseFromParentWithDebugInsts(I, nullIter);
+  return nextII;
 }
 
 /// Return true if the def-use graph rooted at \p V contains any non-debug,
@@ -210,6 +218,96 @@ inline void eraseFromParentWithDebugInsts(SILInstruction *I) {
 bool hasNonTrivialNonDebugTransitiveUsers(
     PointerUnion<SILInstruction *, SILArgument *> V);
 
+/// A light weight abstraction on top of an instruction that carries within it
+/// information about a debug variable. This allows one to write high level code
+/// over the set of such instructions with greater correctness by using
+/// exhaustive switches, methods, and keeping it light weight by using *, ->
+/// operators to access functionality from the underlying instruction when
+/// needed.
+struct DebugVarCarryingInst {
+  enum class Kind {
+    Invalid = 0,
+    DebugValue,
+    DebugValueAddr,
+    AllocStack,
+    AllocBox,
+  };
+
+  Kind kind;
+  SILInstruction *inst;
+
+  DebugVarCarryingInst() : kind(Kind::Invalid), inst(nullptr) {}
+  DebugVarCarryingInst(DebugValueInst *dvi)
+      : kind(Kind::DebugValue), inst(dvi) {}
+  DebugVarCarryingInst(DebugValueAddrInst *dvai)
+      : kind(Kind::DebugValueAddr), inst(dvai) {}
+  DebugVarCarryingInst(AllocStackInst *asi)
+      : kind(Kind::AllocStack), inst(asi) {}
+  DebugVarCarryingInst(AllocBoxInst *abi) : kind(Kind::AllocBox), inst(abi) {}
+  DebugVarCarryingInst(SILInstruction *newInst)
+      : kind(Kind::Invalid), inst(nullptr) {
+    switch (newInst->getKind()) {
+    default:
+      return;
+    case SILInstructionKind::DebugValueInst:
+      kind = Kind::DebugValue;
+      break;
+    case SILInstructionKind::DebugValueAddrInst:
+      kind = Kind::DebugValueAddr;
+      break;
+    case SILInstructionKind::AllocStackInst:
+      kind = Kind::AllocStack;
+      break;
+    case SILInstructionKind::AllocBoxInst:
+      kind = Kind::AllocBox;
+      break;
+    }
+    inst = newInst;
+  }
+
+  /// Enable the composition struct to be used as an instruction easily. We use
+  /// a '*' so that in the source it is easily visible to the eye that something
+  /// is happening here.
+  SILInstruction *operator*() const { return inst; }
+
+  /// Enable one to access the methods of the wrapped instruction using
+  /// '->'. This keeps the wrapper light weight.
+  SILInstruction *operator->() const { return inst; }
+
+  /// Add support for this struct in `if` statement.
+  explicit operator bool() const { return bool(kind); }
+
+  VarDecl *getDecl() const {
+    switch (kind) {
+    case Kind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case Kind::DebugValue:
+      return cast<DebugValueInst>(inst)->getDecl();
+    case Kind::DebugValueAddr:
+      return cast<DebugValueAddrInst>(inst)->getDecl();
+    case Kind::AllocStack:
+      return cast<AllocStackInst>(inst)->getDecl();
+    case Kind::AllocBox:
+      return cast<AllocBoxInst>(inst)->getDecl();
+    }
+  }
+
+  Optional<SILDebugVariable> getVarInfo() const {
+    switch (kind) {
+    case Kind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case Kind::DebugValue:
+      return cast<DebugValueInst>(inst)->getVarInfo();
+    case Kind::DebugValueAddr:
+      return cast<DebugValueAddrInst>(inst)->getVarInfo();
+    case Kind::AllocStack:
+      return cast<AllocStackInst>(inst)->getVarInfo();
+    case Kind::AllocBox:
+      return cast<AllocBoxInst>(inst)->getVarInfo();
+    }
+  }
+};
+
 } // end namespace swift
 
-#endif /* SWIFT_SIL_DEBUGUTILS_H */
+#endif // SWIFT_SIL_DEBUGUTILS_H

@@ -3,8 +3,9 @@
 // Verify that we don't emit any debug info by default.
 // RUN: %target-swift-frontend %s -emit-ir -o - \
 // RUN:   | %FileCheck %s --check-prefix NDEBUG
+// NDEBUG: source_filename
 // NDEBUG-NOT: !dbg
-// NDEBUG-NOT: DW_TAG
+// NDEBUG-NOT: DICompileUnit
 // --------------------------------------------------------------------
 // Verify that we don't emit any debug info with -gnone.
 // RUN: %target-swift-frontend %s -emit-ir -gnone -o - \
@@ -14,23 +15,23 @@
 // RUN: %target-swift-frontend %s -emit-ir -gline-tables-only -o - \
 // RUN:   | %FileCheck %s --check-prefix CHECK-LINETABLES
 // CHECK: !dbg
-// CHECK-LINETABLES-NOT: DW_TAG_{{.*}}variable
+// CHECK-LINETABLES-NOT: DI{{.*}}Variable
 // CHECK-LINETABLES-NOT: DW_TAG_structure_type
-// CHECK-LINETABLES-NOT: DW_TAG_basic_type
+// CHECK-LINETABLES-NOT: DIBasicType
 // --------------------------------------------------------------------
 // Now check that we do generate line+scope info with -g.
-// RUN: %target-swift-frontend %s -emit-ir -g -o - \
+// RUN: %target-swift-frontend %/s -emit-ir -g -o - \
 // RUN:   | %FileCheck %s --check-prefixes CHECK,DWARF-CHECK
 // --------------------------------------------------------------------
 // Currently -gdwarf-types should give the same results as -g.
-// RUN: %target-swift-frontend %s -emit-ir -gdwarf-types -o - \
+// RUN: %target-swift-frontend %/s -emit-ir -gdwarf-types -o - \
 // RUN:   | %FileCheck %s --check-prefixes CHECK,DWARF-CHECK
 // --------------------------------------------------------------------
 // Verify that -g -debug-info-format=dwarf gives the same results as -g.
-// RUN: %target-swift-frontend %s -emit-ir -g -debug-info-format=dwarf -o - \
+// RUN: %target-swift-frontend %/s -emit-ir -g -debug-info-format=dwarf -o - \
 // RUN:   | %FileCheck %s --check-prefixes CHECK,DWARF-CHECK
 // --------------------------------------------------------------------
-// RUN: %target-swift-frontend %s -emit-ir -g -debug-info-format=codeview -o - \
+// RUN: %target-swift-frontend %/s -emit-ir -g -debug-info-format=codeview -o - \
 // RUN:   | %FileCheck %s --check-prefixes CHECK,CV-CHECK
 // --------------------------------------------------------------------
 //
@@ -41,14 +42,13 @@ public
 func foo(_ a: Int64, _ b: Int64) -> Int64 {
      var a = a
      var b = b
-     // CHECK-DAG: !DILexicalBlock(scope: ![[FOO]],{{.*}} line: [[@LINE-3]]
-     // CHECK-DAG: ![[ASCOPE:.*]] = !DILocation(line: [[@LINE-4]],{{.*}} scope: ![[FOO]])
+     // CHECK-DAG: ![[ALOC:.*]] = !DILocation(line: [[@LINE-3]],{{.*}} scope: ![[FOO]])
      // Check that a is the first and b is the second argument.
      // CHECK-DAG: store i64 %0, i64* [[AADDR:.*]], align
      // CHECK-DAG: store i64 %1, i64* [[BADDR:.*]], align
      // CHECK-DAG: [[AVAL:%.*]] = getelementptr inbounds {{.*}}, [[AMEM:.*]], i32 0, i32 0
      // CHECK-DAG: [[BVAL:%.*]] = getelementptr inbounds {{.*}}, [[BMEM:.*]], i32 0, i32 0
-     // CHECK-DAG: call void @llvm.dbg.declare(metadata i64* [[AADDR]], metadata ![[AARG:.*]], metadata !DIExpression()), !dbg ![[ASCOPE]]
+     // CHECK-DAG: call void @llvm.dbg.declare(metadata i64* [[AADDR]], metadata ![[AARG:.*]], metadata !DIExpression()), !dbg ![[ALOC]]
      // CHECK-DAG: call void @llvm.dbg.declare(metadata i64* [[BADDR]], metadata ![[BARG:.*]], metadata !DIExpression())
      // CHECK-DAG: ![[AARG]] = !DILocalVariable(name: "a", arg: 1
      // CHECK-DAG: ![[BARG]] = !DILocalVariable(name: "b", arg: 2
@@ -71,9 +71,8 @@ func foo(_ a: Int64, _ b: Int64) -> Int64 {
      }
 }
 
-// CHECK-DAG: ![[FILE_CWD:[0-9]+]] = !DIFile(filename: "{{.*}}DebugInfo/basic.swift", directory: "{{.*}}")
-// CHECK-DAG: ![[MAINFILE:[0-9]+]] = !DIFile(filename: "basic.swift", directory: "{{.*}}DebugInfo")
-// CHECK-DAG: !DICompileUnit(language: DW_LANG_Swift, file: ![[FILE_CWD]],{{.*}} producer: "{{.*}}Swift version{{.*}},{{.*}}
+// CHECK-DAG: ![[MAINFILE:[0-9]+]] = !DIFile(filename: "{{.*}}DebugInfo/basic.swift", directory: "{{.*}}")
+// CHECK-DAG: !DICompileUnit(language: DW_LANG_Swift, file: ![[MAINFILE]],{{.*}} producer: "{{.*}}Swift version{{.*}},{{.*}}
 // CHECK-DAG: !DISubprogram(name: "main", {{.*}}file: ![[MAINFILE]],
 
 // Function type for foo.
@@ -85,7 +84,7 @@ func foo(_ a: Int64, _ b: Int64) -> Int64 {
 // CHECK-DAG: ![[MAINMODULE]] = !DIModule({{.*}}, name: "basic"
 
 // DWARF Version
-// DWARF-CHECK-DAG:  i32 2, !"Dwarf Version", i32 4}
+// DWARF-CHECK-DAG:  i32 7, !"Dwarf Version", i32 4}
 // CV-CHECK-DAG: i32 2, !"CodeView", i32 1}
 
 // Debug Info Version

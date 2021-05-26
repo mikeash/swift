@@ -11,6 +11,9 @@ public enum CodingKeys : String, CodingKey {
 // CodingKey enums during member type lookup.
 struct SynthesizedStruct : Codable {
   let value: String = "foo"
+  // expected-warning@-1 {{immutable property will not be decoded because it is declared with an initial value which cannot be overwritten}}
+  // expected-note@-2 {{set the initial value via the initializer or explicitly define a CodingKeys enum including a 'value' case to silence this warning}}
+  // expected-note@-3 {{make the property mutable instead}}{{3-6=var}}
 
   // Qualified type lookup should always be unambiguous.
   public func qualifiedFoo(_ key: SynthesizedStruct.CodingKeys) {} // expected-error {{method cannot be declared public because its parameter uses a private type}}
@@ -174,17 +177,17 @@ struct SynthesizedStruct : Codable {
 
 // Structs which don't get synthesized Codable implementations should expose the
 // appropriate CodingKeys type.
-struct NonSynthesizedStruct : Codable {
+struct NonSynthesizedStruct : Codable { // expected-note 4 {{'NonSynthesizedStruct' declared here}}
   // No synthesized type since we implemented both methods.
   init(from decoder: Decoder) throws {}
   func encode(to encoder: Encoder) throws {}
 
   // Qualified type lookup should clearly fail -- we shouldn't get a synthesized
   // type here.
-  public func qualifiedFoo(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedStruct'}}
-  internal func qualifiedBar(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedStruct'}}
-  fileprivate func qualfiedBaz(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedStruct'}}
-  private func qualifiedQux(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of 'NonSynthesizedStruct'}}
+  public func qualifiedFoo(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'struct_codable_member_type_lookup.NonSynthesizedStruct'}}
+  internal func qualifiedBar(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'struct_codable_member_type_lookup.NonSynthesizedStruct'}}
+  fileprivate func qualfiedBaz(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'struct_codable_member_type_lookup.NonSynthesizedStruct'}}
+  private func qualifiedQux(_ key: NonSynthesizedStruct.CodingKeys) {} // expected-error {{'CodingKeys' is not a member type of struct 'struct_codable_member_type_lookup.NonSynthesizedStruct'}}
 
   // Unqualified lookups should find the public top-level CodingKeys type.
   public func unqualifiedFoo(_ key: CodingKeys) { print(CodingKeys.topLevel) }
@@ -660,4 +663,7 @@ struct sr6886 {
 struct StaticInstanceNameDisambiguation : Codable {
   static let version: Float = 0.42
   let version: Int = 42
+  // expected-warning@-1 {{immutable property will not be decoded because it is declared with an initial value which cannot be overwritten}}
+  // expected-note@-2 {{set the initial value via the initializer or explicitly define a CodingKeys enum including a 'version' case to silence this warning}}
+  // expected-note@-3 {{make the property mutable instead}}{{3-6=var}}
 }

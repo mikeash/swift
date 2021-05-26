@@ -32,7 +32,7 @@ using namespace sourcekitd;
 
 static xpc_connection_t MainConnection = nullptr;
 
-void sourcekitd::postNotification(sourcekitd_response_t Notification) {
+static void postNotification(sourcekitd_response_t Notification) {
   xpc_connection_t peer = MainConnection;
   if (!peer)
     goto done;
@@ -57,7 +57,7 @@ done:
 }
 
 namespace {
-/// \brief Associates sourcekitd_uid_t to a UIdent.
+/// Associates sourcekitd_uid_t to a UIdent.
 class SKUIDToUIDMap {
   typedef llvm::DenseMap<void *, UIdent> MapTy;
   MapTy Map;
@@ -71,7 +71,7 @@ public:
 
 static SKUIDToUIDMap UIDMap;
 
-sourcekitd_uid_t sourcekitd::SKDUIDFromUIdent(UIdent UID) {
+static sourcekitd_uid_t xpcSKDUIDFromUIdent(UIdent UID) {
   if (void *Tag = UID.getTag())
     return reinterpret_cast<sourcekitd_uid_t>(Tag);
 
@@ -108,7 +108,7 @@ sourcekitd_uid_t sourcekitd::SKDUIDFromUIdent(UIdent UID) {
   return skduid;
 }
 
-UIdent sourcekitd::UIdentFromSKDUID(sourcekitd_uid_t SKDUID) {
+static UIdent xpcUIdentFromSKDUID(sourcekitd_uid_t SKDUID) {
   // This should be used only for debugging/logging purposes.
 
   UIdent UID = UIDMap.get(SKDUID);
@@ -187,25 +187,42 @@ public:
 };
 }
 
-std::string sourcekitd::getRuntimeLibPath() {
-  std::string MainExePath = llvm::sys::fs::getMainExecutable("sourcekit",
-             reinterpret_cast<void *>(&anchorForGetMainExecutableInXPCService));
+static void getToolchainPrefixPath(llvm::SmallVectorImpl<char> &Path) {
+  std::string executablePath = llvm::sys::fs::getMainExecutable(
+      "sourcekit",
+      reinterpret_cast<void *>(&anchorForGetMainExecutableInXPCService));
+  Path.append(executablePath.begin(), executablePath.end());
 #ifdef SOURCEKIT_UNVERSIONED_FRAMEWORK_BUNDLE
-  // MainExePath points to "lib/sourcekitd.framework/XPCServices/
+  // Path points to e.g. "usr/lib/sourcekitd.framework/XPCServices/
   //                       SourceKitService.xpc/SourceKitService"
-  const unsigned MainExeLibNestingLevel = 4;
+  const unsigned MainExeLibNestingLevel = 5;
 #else
-  // MainExePath points to "lib/sourcekitd.framework/Versions/Current/XPCServices/
+  // Path points to e.g.
+  // "usr/lib/sourcekitd.framework/Versions/Current/XPCServices/
   //                       SourceKitService.xpc/Contents/MacOS/SourceKitService"
-  const unsigned MainExeLibNestingLevel = 8;
+  const unsigned MainExeLibNestingLevel = 9;
 #endif
 
-  // Get it to lib.
-  StringRef Path = MainExePath;
+  // Get it to usr.
   for (unsigned i = 0; i < MainExeLibNestingLevel; ++i)
-    Path = llvm::sys::path::parent_path(Path);
-  return Path;
+    llvm::sys::path::remove_filename(Path);
 }
+
+static std::string getRuntimeLibPath() {
+  llvm::SmallString<128> path;
+  getToolchainPrefixPath(path);
+  llvm::sys::path::append(path, "lib");
+  return path.str().str();
+}
+
+static std::string getDiagnosticDocumentationPath() {
+  llvm::SmallString<128> path;
+  getToolchainPrefixPath(path);
+  llvm::sys::path::append(path, "share", "doc", "swift", "diagnostics");
+  return path.str().str();
+}
+
+static dispatch_queue_t msgHandlingQueue;
 
 static void sourcekitdServer_peer_event_handler(xpc_connection_t peer,
                                                 xpc_object_t event) {
@@ -230,8 +247,7 @@ static void sourcekitdServer_peer_event_handler(xpc_connection_t peer,
     assert(type == XPC_TYPE_DICTIONARY);
     // Handle the message
     xpc_retain(event);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0),
-    ^{
+    dispatch_async(msgHandlingQueue, ^{
       xpc_object_t contents = xpc_dictionary_get_value(event, "msg");
 
       if (!contents) {
@@ -309,7 +325,7 @@ static void sourcekitdServer_event_handler(xpc_connection_t peer) {
   // you can defer this call until after that initialization is done.
   xpc_connection_resume(peer);
 
-  dispatch_async(dispatch_get_main_queue(), ^{
+  dispatch_barrier_async(msgHandlingQueue, ^{
     getInitializationInfo(MainConnection);
   });
 }
@@ -326,7 +342,15 @@ static void fatal_error_handler(void *user_data, const std::string& reason,
 int main(int argc, const char *argv[]) {
   llvm::install_fatal_error_handler(fatal_error_handler, 0);
   sourcekitd::enableLogging("sourcekit-serv");
-  sourcekitd::initialize();
+  sourcekitd_set_uid_handlers(
+      ^sourcekitd_uid_t(const char *uidStr) {
+        return xpcSKDUIDFromUIdent(UIdent(uidStr));
+      },
+      ^const char *(sourcekitd_uid_t uid) {
+        return xpcUIdentFromSKDUID(uid).c_str();
+      });
+  sourcekitd::initializeService(
+      getRuntimeLibPath(), getDiagnosticDocumentationPath(), postNotification);
 
   // Increase the file descriptor limit.
   // FIXME: Portability ?
@@ -344,6 +368,10 @@ int main(int argc, const char *argv[]) {
   } else {
     LOG_WARN_FUNC("getrlimit failed: " << llvm::sys::StrError());
   }
+
+  auto attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT,
+                                                      QOS_CLASS_DEFAULT, 0);
+  msgHandlingQueue = dispatch_queue_create("request-handling", attr);
 
   xpc_main(sourcekitdServer_event_handler);
   return 0;

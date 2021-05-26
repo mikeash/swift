@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -primary-file %s -emit-ir -o - | %FileCheck %s
+// RUN: %target-swift-frontend -Xllvm -sil-disable-pass=SILGenCleanup -primary-file %s -emit-ir -o - | %FileCheck %s
 
 func f() -> Bool? { return nil }
 
@@ -9,7 +9,7 @@ func f() -> Bool? { return nil }
 })()
 
 // CHECK-LABEL: @"$s9alloc_boxyyXEfU_"
-// CHECK: <label>:9:
 // CHECK-NOT: call void @swift_setDeallocating
 // CHECK: call void @swift_deallocUninitializedObject
-
+// CHECK-NOT: call void @swift_setDeallocating
+// CHECK: ret void

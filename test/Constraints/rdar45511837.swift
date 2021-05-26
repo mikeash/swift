@@ -18,6 +18,8 @@ class Foo<Bar: NSObject> {
 
   lazy var foo: () -> Void = {
     // TODO: improve diagnostic message
-    _ = self.foobar + nil // expected-error {{'Foo<Bar>' requires that 'Bar' inherit from 'NSObject'}}
+    _ = self.foobar + nil // expected-error {{'Bar' is not convertible to 'String'}}
+    // expected-note@-1 {{did you mean to use 'as!' to force downcast?}}
+    // expected-error@-2 {{'nil' is not compatible with expected argument type 'String'}}
   }
 }

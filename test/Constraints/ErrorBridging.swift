@@ -37,7 +37,8 @@ var ns4 = compo as NSError
 ns4 = compo // expected-error{{cannot assign value of type 'HairyError & Runcible' to type 'NSError'}}
 
 let e1 = ns1 as? FooError
-let e1fix = ns1 as FooError // expected-error{{did you mean to use 'as!'}} {{17-19=as!}}
+let e1fix = ns1 as FooError // expected-error {{'NSError' is not convertible to 'FooError'}}
+// expected-note@-1{{did you mean to use 'as!' to force downcast?}} {{17-19=as!}}
 
 let esub = ns1 as Error
 let esub2 = ns1 as? Error // expected-warning{{conditional cast from 'NSError' to 'Error' always succeeds}}
@@ -72,4 +73,25 @@ extension Error {
 // rdar://problem/27543121
 func throwErrorCode() throws {
   throw FictionalServerError.meltedDown // expected-error{{thrown error code type 'FictionalServerError.Code' does not conform to 'Error'; construct an 'FictionalServerError' instance}}{{29-29=(}}{{40-40=)}}
+}
+
+class MyErrorClass { }
+extension MyErrorClass: Error { }
+
+class MyClass { }
+
+func testUnknownErrorBridge(cond: Bool, mc: MyClass) -> NSObject? {
+  if cond {
+    return mc as? NSError // okay
+  }
+
+  return mc as? NSObject // okay
+}
+
+func testAlwaysErrorBridge(cond: Bool, mec: MyErrorClass) -> NSObject? {
+  if cond {
+    return mec as? NSError // expected-warning{{conditional cast from 'MyErrorClass}}' to 'NSError' always succeeds
+  }
+
+  return mec as? NSObject // expected-warning{{conditional cast from 'MyErrorClass}}' to 'NSObject' always succeeds
 }

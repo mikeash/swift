@@ -20,7 +20,7 @@
 #define SWIFT_ABI_HEAP_OBJECT_HEADER_SIZE_64 16
 #define SWIFT_ABI_HEAP_OBJECT_HEADER_SIZE_32 8
 
-#ifdef __cplusplus
+#ifndef __swift__
 #include <type_traits>
 #include "swift/Basic/type_traits.h"
 
@@ -35,6 +35,13 @@ typedef struct HeapMetadata HeapMetadata;
 typedef struct HeapObject HeapObject;
 #endif
 
+#if !defined(__swift__) && __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
+#ifndef __ptrauth_objc_isa_pointer
+#define __ptrauth_objc_isa_pointer
+#endif
+
 // The members of the HeapObject header that are not shared by a
 // standard Objective-C instance
 #define SWIFT_HEAPOBJECT_NON_OBJC_MEMBERS       \
@@ -44,11 +51,11 @@ typedef struct HeapObject HeapObject;
 /// This must match RefCountedStructTy in IRGen.
 struct HeapObject {
   /// This is always a valid pointer to a metadata object.
-  HeapMetadata const *metadata;
+  HeapMetadata const *__ptrauth_objc_isa_pointer metadata;
 
   SWIFT_HEAPOBJECT_NON_OBJC_MEMBERS;
 
-#ifdef __cplusplus
+#ifndef __swift__
   HeapObject() = default;
 
   // Initialize a HeapObject header as appropriate for a newly-allocated object.
@@ -56,12 +63,19 @@ struct HeapObject {
     : metadata(newMetadata)
     , refCounts(InlineRefCounts::Initialized)
   { }
+  
+  // Initialize a HeapObject header for an immortal object
+  constexpr HeapObject(HeapMetadata const *newMetadata,
+                       InlineRefCounts::Immortal_t immortal)
+  : metadata(newMetadata)
+  , refCounts(InlineRefCounts::Immortal)
+  { }
 
 #ifndef NDEBUG
-  void dump() const LLVM_ATTRIBUTE_USED;
+  void dump() const SWIFT_USED;
 #endif
 
-#endif // __cplusplus
+#endif // __swift__
 };
 
 #ifdef __cplusplus
@@ -85,9 +99,7 @@ __swift_size_t swift_weakRetainCount(HeapObject *obj);
 } // extern "C"
 #endif
 
-#ifdef __cplusplus
-static_assert(swift::IsTriviallyConstructible<HeapObject>::value,
-              "HeapObject must be trivially initializable");
+#ifndef __swift__
 static_assert(std::is_trivially_destructible<HeapObject>::value,
               "HeapObject must be trivially destructible");
 
@@ -133,7 +145,8 @@ static_assert(alignof(HeapObject) == alignof(void*),
 #define _swift_BridgeObject_TaggedPointerBits                                  \
   (__swift_uintptr_t) SWIFT_ABI_DEFAULT_BRIDGEOBJECT_TAG_64
 
-#elif defined(__arm64__) || defined(__aarch64__) || defined(_M_ARM64)
+#elif (defined(__arm64__) || defined(__aarch64__) || defined(_M_ARM64)) &&     \
+      (__POINTER_WIDTH__ == 64)
 
 #ifdef __APPLE__
 #define _swift_abi_LeastValidPointerValue                                      \
@@ -185,7 +198,8 @@ static_assert(alignof(HeapObject) == alignof(void*),
 #if defined(__i386__)
 #define _swift_abi_SwiftSpareBitsMask                                          \
   (__swift_uintptr_t) SWIFT_ABI_I386_SWIFT_SPARE_BITS_MASK
-#elif defined(__arm__) || defined(_M_ARM)
+#elif defined(__arm__) || defined(_M_ARM) ||                                   \
+      (defined(__arm64__) && (__POINTER_WIDTH__ == 32))
 #define _swift_abi_SwiftSpareBitsMask                                          \
   (__swift_uintptr_t) SWIFT_ABI_ARM_SWIFT_SPARE_BITS_MASK
 #else

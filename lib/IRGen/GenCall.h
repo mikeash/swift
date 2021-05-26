@@ -20,9 +20,14 @@
 
 #include <stdint.h>
 
-#include "swift/Basic/LLVM.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/LLVM.h"
+#include "swift/SIL/ApplySite.h"
 #include "llvm/IR/CallingConv.h"
+
+#include "Callee.h"
+#include "GenHeap.h"
+#include "IRGenModule.h"
 
 namespace llvm {
   class AttributeList;
@@ -49,6 +54,7 @@ namespace irgen {
   class IRGenFunction;
   class IRGenModule;
   class LoadableTypeInfo;
+  class NativeCCEntryPointArgumentEmission;
   class Size;
   class TypeInfo;
 
@@ -60,8 +66,84 @@ namespace irgen {
     return TranslationDirection(!bool(direction));
   }
 
+  // struct SwiftContext {
+  //   SwiftContext * __ptrauth(...) callerContext;
+  //   SwiftPartialFunction * __ptrauth(...) returnToCaller;
+  //   SwiftActor * __ptrauth(...) callerActor;
+  //   SwiftPartialFunction * __ptrauth(...) yieldToCaller?;
+  // };
+  struct AsyncContextLayout : StructLayout {
+    struct ArgumentInfo {
+      SILType type;
+      ParameterConvention convention;
+    };
+    struct TrailingWitnessInfo {};
+
+  private:
+    enum class FixedIndex : unsigned {
+      Parent = 0,
+      ResumeParent = 1,
+      Flags = 2,
+    };
+    enum class FixedCount : unsigned {
+      Parent = 1,
+      ResumeParent = 1,
+    };
+    CanSILFunctionType originalType;
+    CanSILFunctionType substitutedType;
+    SubstitutionMap substitutionMap;
+  
+    unsigned getParentIndex() { return (unsigned)FixedIndex::Parent; }
+    unsigned getResumeParentIndex() {
+      return (unsigned)FixedIndex::ResumeParent;
+    }
+    unsigned getFlagsIndex() { return (unsigned)FixedIndex::Flags; }
+
+  public:
+    ElementLayout getParentLayout() { return getElement(getParentIndex()); }
+    ElementLayout getResumeParentLayout() {
+      return getElement(getResumeParentIndex());
+    }
+    ElementLayout getFlagsLayout() { return getElement(getFlagsIndex()); }
+
+    AsyncContextLayout(
+        IRGenModule &IGM, LayoutStrategy strategy, ArrayRef<SILType> fieldTypes,
+        ArrayRef<const TypeInfo *> fieldTypeInfos,
+        CanSILFunctionType originalType, CanSILFunctionType substitutedType,
+        SubstitutionMap substitutionMap);
+  };
+
+  AsyncContextLayout getAsyncContextLayout(IRGenModule &IGM,
+                                           SILFunction *function);
+
+  AsyncContextLayout getAsyncContextLayout(IRGenModule &IGM,
+                                           CanSILFunctionType originalType,
+                                           CanSILFunctionType substitutedType,
+                                           SubstitutionMap substitutionMap,
+                                           bool suppressGenerics,
+                                           FunctionPointer::Kind kind);
+
+  /// Given an async function, get the pointer to the function to be called and
+  /// the size of the context to be allocated.
+  ///
+  /// \param values Whether any code should be emitted to retrieve the function
+  ///               pointer and the size, respectively.  If false is passed, no
+  ///               code will be emitted to generate that value and null will
+  ///               be returned for it.
+  ///
+  /// \return {function, size}
+  std::pair<llvm::Value *, llvm::Value *> getAsyncFunctionAndSize(
+      IRGenFunction &IGF, SILFunctionTypeRepresentation representation,
+      FunctionPointer functionPointer, llvm::Value *thickContext,
+      std::pair<bool, bool> values = {true, true},
+      Size initialContextSize = Size(0));
   llvm::CallingConv::ID expandCallingConv(IRGenModule &IGM,
-                                     SILFunctionTypeRepresentation convention);
+                                     SILFunctionTypeRepresentation convention,
+                                     bool isAsync);
+
+  Signature emitCastOfFunctionPointer(IRGenFunction &IGF, llvm::Value *&fnPtr,
+                                      CanSILFunctionType fnType,
+                                      bool forAsyncReturn = false);
 
   /// Does the given function have a self parameter that should be given
   /// the special treatment for self parameters?
@@ -71,7 +153,8 @@ namespace irgen {
   void addByvalArgumentAttributes(IRGenModule &IGM,
                                   llvm::AttributeList &attrs,
                                   unsigned argIndex,
-                                  Alignment align);
+                                  Alignment align,
+                                  llvm::Type *storageType);
 
   /// Add signext or zeroext attribute set for an argument that needs
   /// extending.
@@ -96,7 +179,9 @@ namespace irgen {
                                   SILType swiftType,
                                   const LoadableTypeInfo &swiftTI);
 
-  bool addNativeArgument(IRGenFunction &IGF, Explosion &in,
+  bool addNativeArgument(IRGenFunction &IGF,
+                         Explosion &in,
+                         CanSILFunctionType fnTy,
                          SILParameterInfo origParamInfo, Explosion &args,
                          bool isOutlined);
 
@@ -125,15 +210,40 @@ namespace irgen {
 
   Address emitAllocYieldOnceCoroutineBuffer(IRGenFunction &IGF);
   void emitDeallocYieldOnceCoroutineBuffer(IRGenFunction &IGF, Address buffer);
-  void emitYieldOnceCoroutineEntry(IRGenFunction &IGF,
-                                   CanSILFunctionType coroutineType,
-                                   Explosion &allParams);
+  void
+  emitYieldOnceCoroutineEntry(IRGenFunction &IGF,
+                              CanSILFunctionType coroutineType,
+                              NativeCCEntryPointArgumentEmission &emission);
 
   Address emitAllocYieldManyCoroutineBuffer(IRGenFunction &IGF);
   void emitDeallocYieldManyCoroutineBuffer(IRGenFunction &IGF, Address buffer);
-  void emitYieldManyCoroutineEntry(IRGenFunction &IGF,
-                                   CanSILFunctionType coroutineType,
-                                   Explosion &allParams);
+  void
+  emitYieldManyCoroutineEntry(IRGenFunction &IGF,
+                              CanSILFunctionType coroutineType,
+                              NativeCCEntryPointArgumentEmission &emission);
+
+  void emitTaskCancel(IRGenFunction &IGF, llvm::Value *task);
+
+  /// Emit a class to swift_task_create[_f] or swift_task_create_future[__f]
+  /// with the given flags, parent task, and task function.
+  ///
+  /// When \c futureResultType is non-null, calls the future variant to create
+  /// a future.
+  llvm::Value *emitTaskCreate(
+    IRGenFunction &IGF, llvm::Value *flags,
+    llvm::Value *taskGroup,
+    llvm::Value *futureResultType,
+    llvm::Value *taskFunction, llvm::Value *localContextInfo,
+    SubstitutionMap subs);
+
+  /// Allocate task local storage for the provided dynamic size.
+  Address emitAllocAsyncContext(IRGenFunction &IGF, llvm::Value *sizeValue);
+  void emitDeallocAsyncContext(IRGenFunction &IGF, Address context);
+
+  void emitAsyncFunctionEntry(IRGenFunction &IGF,
+                              const AsyncContextLayout &layout,
+                              LinkEntity asyncFunction,
+                              unsigned asyncContextIndex);
 
   /// Yield the given values from the current continuation.
   ///
@@ -142,6 +252,31 @@ namespace irgen {
   llvm::Value *emitYield(IRGenFunction &IGF,
                          CanSILFunctionType coroutineType,
                          Explosion &yieldedValues);
+
+  enum class AsyncFunctionArgumentIndex : unsigned {
+    Context = 0,
+  };
+
+  void emitAsyncReturn(
+      IRGenFunction &IGF, AsyncContextLayout &layout, CanSILFunctionType fnType,
+      Optional<ArrayRef<llvm::Value *>> nativeResultArgs = llvm::None);
+
+  void emitAsyncReturn(IRGenFunction &IGF, AsyncContextLayout &layout,
+                       SILType funcResultTypeInContext,
+                       CanSILFunctionType fnType, Explosion &result,
+                       Explosion &error);
+
+  Address emitAutoDiffCreateLinearMapContext(
+      IRGenFunction &IGF, llvm::Value *topLevelSubcontextSize);
+  Address emitAutoDiffProjectTopLevelSubcontext(
+      IRGenFunction &IGF, Address context);
+  Address emitAutoDiffAllocateSubcontext(
+      IRGenFunction &IGF, Address context, llvm::Value *size);
+
+  FunctionPointer getFunctionPointerForDispatchCall(IRGenModule &IGM,
+                                                    const FunctionPointer &fn);
+  void forwardAsyncCallResult(IRGenFunction &IGF, CanSILFunctionType fnType,
+                              AsyncContextLayout &layout, llvm::CallInst *call);
 
 } // end namespace irgen
 } // end namespace swift

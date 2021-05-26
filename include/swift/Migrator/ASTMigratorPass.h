@@ -19,6 +19,7 @@
 #define SWIFT_MIGRATOR_ASTMIGRATORPASS_H
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Migrator/EditorAdapter.h"
 
 namespace swift {
@@ -50,6 +51,12 @@ void runAPIDiffMigratorPass(EditorAdapter &Editor,
                             SourceFile *SF,
                             const MigratorOptions &Opts);
 
+/// Run a pass to fix up the new type of 'try?' in Swift 4
+void runOptionalTryMigratorPass(EditorAdapter &Editor,
+                                SourceFile *SF,
+                                const MigratorOptions &Opts);
+  
+  
 } // end namespace migrator
 } // end namespace swift
 

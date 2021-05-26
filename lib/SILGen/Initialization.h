@@ -148,6 +148,9 @@ public:
                                    ManagedValue explodedElement,
                                    bool isInit) = 0;
 
+  /// Whether to emit a debug value during initialization.
+  void setEmitDebugValueOnInit(bool emit) { EmitDebugValueOnInit = emit; }
+
   /// Perform post-initialization bookkeeping for this initialization.
   virtual void finishInitialization(SILGenFunction &SGF) {}
 
@@ -157,6 +160,9 @@ public:
     llvm_unreachable("Initialization subclass does not support being left "
                      "uninitialized");
   }
+
+protected:
+  bool EmitDebugValueOnInit = true;
 
 private:
   Initialization(const Initialization &) = delete;
@@ -299,6 +305,39 @@ public:
   //     of the sub-initializations.
 
   void finishUninitialized(SILGenFunction &SGF) override;
+};
+
+/// A "null" initialization that indicates that any value being initialized
+/// into this initialization should be discarded. This represents AnyPatterns
+/// (that is, 'var (_)') that bind to values without storing them.
+class BlackHoleInitialization : public Initialization {
+public:
+  BlackHoleInitialization() {}
+
+  bool canSplitIntoTupleElements() const override {
+    return true;
+  }
+  
+  MutableArrayRef<InitializationPtr>
+  splitIntoTupleElements(SILGenFunction &SGF, SILLocation loc,
+                         CanType type,
+                         SmallVectorImpl<InitializationPtr> &buf) override {
+    // "Destructure" an ignored binding into multiple ignored bindings.
+    for (auto fieldType : cast<TupleType>(type)->getElementTypes()) {
+      (void) fieldType;
+      buf.push_back(InitializationPtr(new BlackHoleInitialization()));
+    }
+    return buf;
+  }
+
+  void copyOrInitValueInto(SILGenFunction &SGF, SILLocation loc,
+                           ManagedValue value, bool isInit) override {
+    /// This just ignores the provided value.
+  }
+
+  void finishUninitialized(SILGenFunction &SGF) override {
+    // do nothing
+  }
 };
 
 } // end namespace Lowering

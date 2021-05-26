@@ -30,6 +30,8 @@ public protocol ProtocolWithRequirements {
 
 public struct Wrapper<T>: OtherResilientProtocol { }
 
+public struct ConcreteWrapper: OtherResilientProtocol { }
+
 public protocol ProtocolWithAssocTypeDefaults {
   associatedtype T1 = Self
   associatedtype T2: OtherResilientProtocol = Wrapper<T1>
@@ -37,4 +39,8 @@ public protocol ProtocolWithAssocTypeDefaults {
 
 public protocol ResilientSelfDefault : ResilientBaseProtocol {
   associatedtype AssocType: ResilientBaseProtocol = Self
+}
+
+@_fixed_layout public protocol OtherFrozenProtocol {
+  func protocolMethod()
 }

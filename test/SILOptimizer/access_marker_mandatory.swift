@@ -1,5 +1,4 @@
-
-// RUN: %target-swift-frontend -module-name access_marker_mandatory -enable-sil-ownership -parse-as-library -Xllvm -sil-full-demangle -emit-sil -Onone -enforce-exclusivity=checked %s | %FileCheck %s
+// RUN: %target-swift-frontend -module-name access_marker_mandatory -parse-as-library -Xllvm -sil-full-demangle -emit-sil -Onone -enforce-exclusivity=checked %s | %FileCheck %s
 
 public struct S {
   var i: Int
@@ -50,8 +49,6 @@ func takeS(_ s: S) {}
 // CHECK: [[ADDRI:%.*]] = struct_element_addr [[WRITE]] : $*S, #S.i
 // CHECK: store %{{.*}} to [[ADDRI]] : $*Int
 // CHECK: end_access [[WRITE]]
-// CHECK: [[READ:%.*]] = begin_access [read] [static] [[STK]] : $*S
-// CHECK: end_access [[READ]]
 // CHECK: [[FTAKE:%.*]] = function_ref @$s23access_marker_mandatory5takeSyyAA1SVF : $@convention(thin) (@guaranteed S) -> ()
 // CHECK: apply [[FTAKE]](%{{.*}}) : $@convention(thin) (@guaranteed S) -> ()
 // CHECK-LABEL: } // end sil function '$s23access_marker_mandatory14modifyAndReadS1oyyXl_tF'

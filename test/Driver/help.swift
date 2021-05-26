@@ -1,3 +1,6 @@
+// REQUIRES: cplusplus_driver
+// swift-driver has swift-help with its own tests and the output has evolved.
+
 // Check that options printed with -help respect whether the driver is invoked
 // as 'swift' or as 'swiftc'.
 
@@ -21,3 +24,8 @@
 
 // Options marked "help-hidden" should not show up here.
 // NEGATIVE-NOT: -parse-stdlib
+
+// CHECK-SWIFTC: SEE ALSO: swift build, swift run, swift package, swift test
+// NEGATIVE-SWIFTC-NOT: SEE ALSO - PACKAGE MANAGER COMMANDS:
+// CHECK-SWIFT: SEE ALSO - PACKAGE MANAGER COMMANDS:
+// NEGATIVE-SWIFT-NOT: SEE ALSO: swift build, swift run, swift package, swift test

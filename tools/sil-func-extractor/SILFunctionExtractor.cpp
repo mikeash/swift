@@ -101,25 +101,20 @@ static llvm::cl::opt<std::string> Triple("target",
                                          llvm::cl::desc("target triple"));
 
 static llvm::cl::opt<bool>
-EnableSILSortOutput("emit-sorted-sil", llvm::cl::Hidden,
-                    llvm::cl::init(false),
-                    llvm::cl::desc("Sort Functions, VTables, Globals, "
-                                   "WitnessTables by name to ease diffing."));
+    EmitSortedSIL("emit-sorted-sil", llvm::cl::Hidden, llvm::cl::init(false),
+                  llvm::cl::desc("Sort Functions, VTables, Globals, "
+                                 "WitnessTables by name to ease diffing."));
 
 static llvm::cl::opt<bool>
 DisableASTDump("sil-disable-ast-dump", llvm::cl::Hidden,
                llvm::cl::init(false),
                llvm::cl::desc("Do not dump AST."));
 
-static llvm::cl::opt<bool> AssumeUnqualifiedOwnershipWhenParsing(
-    "assume-parsing-unqualified-ownership-sil", llvm::cl::Hidden,
-    llvm::cl::init(false),
-    llvm::cl::desc("Assume all parsed functions have unqualified ownership"));
-
-static llvm::cl::opt<bool>
-DisableSILLinking("disable-sil-linking",
-                  llvm::cl::init(true),
-                  llvm::cl::desc("Disable SIL linking"));
+static llvm::cl::opt<bool> EnableOSSAModules(
+    "enable-ossa-modules",
+    llvm::cl::desc("Do we always serialize SIL in OSSA form? If "
+                   "this is disabled we do not serialize in OSSA "
+                   "form when optimizing."));
 
 // This function isn't referenced outside its translation unit, but it
 // can't use the "static" keyword because its address is used for
@@ -147,7 +142,7 @@ static void getFunctionNames(std::vector<std::string> &Names) {
       if (Token.empty()) {
         break;
       }
-      Names.push_back(Token);
+      Names.push_back(Token.str());
       Buffer = NewBuffer;
     }
   }
@@ -158,12 +153,12 @@ static bool stringInSortedArray(
     llvm::function_ref<bool(const std::string &, const std::string &)> &&cmp) {
   if (list.empty())
     return false;
-  auto iter = std::lower_bound(list.begin(), list.end(), str, cmp);
+  auto iter = std::lower_bound(list.begin(), list.end(), str.str(), cmp);
   // If we didn't find str, return false.
   if (list.end() == iter)
     return false;
 
-  return !cmp(str, *iter);
+  return !cmp(str.str(), *iter);
 }
 
 void removeUnwantedFunctions(SILModule *M, ArrayRef<std::string> MangledNames,
@@ -217,7 +212,7 @@ void removeUnwantedFunctions(SILModule *M, ArrayRef<std::string> MangledNames,
   // Now mark all of these functions as public and remove their bodies.
   for (auto &F : DeadFunctions) {
     F->setLinkage(SILLinkage::PublicExternal);
-    F->getBlocks().clear();
+    F->clear();
   }
 
   // Remove dead functions.
@@ -255,6 +250,11 @@ int main(int argc, char **argv) {
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
 
+  SILOptions &Opts = Invocation.getSILOptions();
+  Opts.EmitVerboseSIL = EmitVerboseSIL;
+  Opts.EmitSortedSIL = EmitSortedSIL;
+  Opts.EnableOSSAModules = EnableOSSAModules;
+
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
       Invocation.setUpInputForSILTool(InputFilename, ModuleName,
@@ -264,10 +264,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Error! Failed to open file: %s\n", InputFilename.c_str());
     exit(-1);
   }
-
-  SILOptions &SILOpts = Invocation.getSILOptions();
-  SILOpts.AssumeUnqualifiedOwnershipWhenParsing =
-      AssumeUnqualifiedOwnershipWhenParsing;
 
   CompilerInstance CI;
   PrintingDiagnosticConsumer PrintDiags;
@@ -281,21 +277,8 @@ int main(int argc, char **argv) {
   if (CI.getASTContext().hadError())
     return 1;
 
-  // Load the SIL if we have a module. We have to do this after SILParse
-  // creating the unfortunate double if statement.
-  if (Invocation.hasSerializedAST()) {
-    assert(!CI.hasSILModule() &&
-           "performSema() should not create a SILModule.");
-    CI.setSILModule(
-        SILModule::createEmptyModule(CI.getMainModule(), CI.getSILOptions()));
-    std::unique_ptr<SerializedSILLoader> SL = SerializedSILLoader::create(
-        CI.getASTContext(), CI.getSILModule(), nullptr);
-
-    if (extendedInfo.isSIB() || DisableSILLinking)
-      SL->getAllForModule(CI.getMainModule()->getName(), nullptr);
-    else
-      SL->getAll();
-  }
+  auto SILMod = performASTLowering(CI.getMainModule(), CI.getSILTypes(),
+                                   CI.getSILOptions());
 
   if (CommandLineFunctionNames.empty() && FunctionNameFile.empty())
     return CI.getASTContext().hadError();
@@ -339,7 +322,7 @@ int main(int argc, char **argv) {
                              llvm::errs() << "    " << str << '\n';
                            }));
 
-  removeUnwantedFunctions(CI.getSILModule(), MangledNames, DemangledNames);
+  removeUnwantedFunctions(SILMod.get(), MangledNames, DemangledNames);
 
   if (EmitSIB) {
     llvm::SmallString<128> OutputFile;
@@ -360,14 +343,17 @@ int main(int argc, char **argv) {
     serializationOpts.SerializeAllSIL = true;
     serializationOpts.IsSIB = true;
 
-    serialize(CI.getMainModule(), serializationOpts, CI.getSILModule());
+    serialize(CI.getMainModule(), serializationOpts, SILMod.get());
   } else {
     const StringRef OutputFile =
         OutputFilename.size() ? StringRef(OutputFilename) : "-";
 
+    auto SILOpts = SILOptions();
+    SILOpts.EmitVerboseSIL = EmitVerboseSIL;
+    SILOpts.EmitSortedSIL = EmitSortedSIL;
+
     if (OutputFile == "-") {
-      CI.getSILModule()->print(llvm::outs(), EmitVerboseSIL, CI.getMainModule(),
-                               EnableSILSortOutput, !DisableASTDump);
+      SILMod->print(llvm::outs(), CI.getMainModule(), SILOpts, !DisableASTDump);
     } else {
       std::error_code EC;
       llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::F_None);
@@ -376,8 +362,7 @@ int main(int argc, char **argv) {
                      << '\n';
         return 1;
       }
-      CI.getSILModule()->print(OS, EmitVerboseSIL, CI.getMainModule(),
-                               EnableSILSortOutput, !DisableASTDump);
+      SILMod->print(OS, CI.getMainModule(), SILOpts, !DisableASTDump);
     }
   }
 }

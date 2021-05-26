@@ -14,18 +14,14 @@
 # Utility code for later in this template
 #
 
+from __future__ import division
 from SwiftIntTypes import all_integer_types, int_max_bits, should_define_truncating_bit_pattern_init
 from SwiftFloatingPointTypes import getFtoIBounds
 
-from string import maketrans, capitalize
 from itertools import chain
 
 # Number of bits in the Builtin.Word type
 word_bits = int(CMAKE_SIZEOF_VOID_P) * 8
-
-# Number of bits in integer literals.
-builtinIntLiteralBits = 2048
-IntLiteral = 'Int%s' % builtinIntLiteralBits
 
 class struct(object):
   def __init__(self, **kw):
@@ -34,12 +30,12 @@ class struct(object):
     return 'struct(%r)' % self.__dict__
 
 binaryArithmetic = {
-  'Numeric' : [
+  'Numeric': [
     struct(operator='+', name='adding',      firstArg='_',  llvmName='add', kind='+'),
     struct(operator='-', name='subtracting', firstArg='_',  llvmName='sub', kind='-'),
     struct(operator='*', name='multiplied',  firstArg='by', llvmName='mul', kind='*'),
   ],
-  'BinaryInteger' : [
+  'BinaryInteger': [
     struct(operator='/', name='divided',     firstArg='by', llvmName='div', kind='/'),
     struct(operator='%', name='remainder',   firstArg='dividingBy', llvmName='rem', kind='/'),
   ],
@@ -62,19 +58,6 @@ maskingShifts = [
       llvmName=lambda _: 'shl'),
 ]
 
-IntMax = 'Int%s' % int_max_bits
-UIntMax = 'UInt%s' % int_max_bits
-}%
-
-// FIXME(integers): remove these two aliases
-/// The largest native signed integer type.
-@available(swift, obsoleted: 4.0, renamed: "${IntMax}")
-public typealias IntMax = ${IntMax}
-/// The largest native unsigned integer type.
-@available(swift, obsoleted: 4.0, renamed: "${UIntMax}")
-public typealias UIntMax = ${UIntMax}
-
-%{
 #===-----------------------------------------------------------------------===//
 #===--- Operator Documentation --------------------------------------------===//
 #===-----------------------------------------------------------------------===//
@@ -1102,7 +1085,7 @@ def unsafeOperationComment(operator):
 /// ${Article} ${bits}-bit ${'' if signed else 'un'}signed integer value
 /// type.
 %   end
-@_fixed_layout
+@frozen
 public struct ${Self}
   : FixedWidthInteger, ${Unsigned}Integer,
     _ExpressibleByBuiltinIntegerLiteral {
@@ -1112,8 +1095,8 @@ public struct ${Self}
 
 
   @_transparent
-  public init(_builtinIntegerLiteral x: _MaxBuiltinIntegerType) {
-    _value = Builtin.s_to_${u}_checked_trunc_${IntLiteral}_${BuiltinName}(x).0
+  public init(_builtinIntegerLiteral x: Builtin.IntLiteral) {
+    _value = Builtin.s_to_${u}_checked_trunc_IntLiteral_${BuiltinName}(x).0
   }
 
   /// Creates a new instance with the same memory representation as the given
@@ -1132,7 +1115,7 @@ public struct ${Self}
   }
 
 %   if Self in ['Int32', 'Int64']:
-%     Floating = {32 : 'Float', 64 : 'Double'}[bits]
+%     Floating = {32: 'Float', 64: 'Double'}[bits]
   @available(*, unavailable,
     message: "Please use ${Self}(bitPattern: ${OtherSelf}) in combination with ${Floating}.bitPattern property.")
   public init(bitPattern x: ${Floating}) {
@@ -1141,11 +1124,13 @@ public struct ${Self}
 %   end
 
 %   for (FloatType, FloatBits) in [
-%     ('Float', 32), ('Double', 64), ('Float80', 80)]:
+%     ('Float16', 16), ('Float', 32), ('Double', 64), ('Float80', 80)]:
 %     (lower, upper) = getFtoIBounds(floatBits=FloatBits, intBits=int(bits), signed=signed)
 
 %     if FloatType == 'Float80':
-#if !os(Windows) && (arch(i386) || arch(x86_64))
+#if !(os(Windows) || os(Android)) && (arch(i386) || arch(x86_64))
+%     elif FloatType == 'Float16':
+#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
 %     end
 
   /// Creates an integer from the given floating-point value, rounding toward
@@ -1168,14 +1153,27 @@ public struct ${Self}
   /// - Parameter source: A floating-point value to convert to an integer.
   ///   `source` must be representable in this type after rounding toward
   ///   zero.
+%     if FloatType == 'Float16':
+  @available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
+%     end
   @_transparent
   public init(_ source: ${FloatType}) {
     _precondition(source.isFinite,
       "${FloatType} value cannot be converted to ${Self} because it is either infinite or NaN")
+%     if FloatBits == 16 and signed and bits >= 32:
+    // A Float16 value, if finite, is always in-range for 32- and 64-bit signed
+    // integer types.
+%     else:
     _precondition(source > ${str(lower)}.0,
       "${FloatType} value cannot be converted to ${Self} because the result would be less than ${Self}.min")
+%       if FloatBits == 16 and not signed and bits >= 16:
+    // A Float16 value, if greater than -1 and finite, is always in-range for
+    // 16-, 32-, and 64-bit unsigned integer types.
+%       else:
     _precondition(source < ${str(upper)}.0,
       "${FloatType} value cannot be converted to ${Self} because the result would be greater than ${Self}.max")
+%       end
+%     end
     self._value = Builtin.fpto${u}i_FPIEEE${FloatBits}_${BuiltinName}(source._value)
   }
 
@@ -1193,12 +1191,25 @@ public struct ${Self}
   ///     // y == nil
   ///
   /// - Parameter source: A floating-point value to convert to an integer.
+%     if FloatType == 'Float16':
+  @available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
+%     end
   @_transparent
   public init?(exactly source: ${FloatType}) {
     // The value passed as `source` must not be infinite, NaN, or exceed the
     // bounds of the integer type; the result of `fptosi` or `fptoui` is
     // undefined if it overflows.
+%     if FloatBits == 16 and signed and bits >= 32:
+    // A Float16 value, if finite, is always in-range for 32- and 64-bit signed
+    // integer types.
+    guard source.isFinite else {
+%     elif FloatBits == 16 and not signed and bits >= 16:
+    // A Float16 value, if greater than -1 and finite, is always in-range for
+    // 16-, 32-, and 64-bit unsigned integer types.
+    guard source > ${str(lower)}.0 && source.isFinite else {
+%     else:
     guard source > ${str(lower)}.0 && source < ${str(upper)}.0 else {
+%     end
       return nil
     }
     guard source == source.rounded(.towardZero) else {
@@ -1207,7 +1218,7 @@ public struct ${Self}
     self._value = Builtin.fpto${u}i_FPIEEE${FloatBits}_${BuiltinName}(source._value)
   }
 
-%     if FloatType == 'Float80':
+%     if FloatType in ['Float16', 'Float80']:
 #endif
 %     end
 
@@ -1251,7 +1262,8 @@ ${assignmentOperatorComment(x.operator, True)}
       Builtin.${u}${x.llvmName}_with_overflow_Int${bits}(
         lhs._value, rhs._value, true._value)
 %   end
-    Builtin.condfail(overflow)
+    Builtin.condfail_message(overflow,
+      StaticString("arithmetic overflow").unsafeRawPointer)
     lhs = ${Self}(result)
   }
 %       end
@@ -1350,7 +1362,7 @@ ${assignmentOperatorComment(x.operator, True)}
   /// The bit width of ${Article.lower()} `${Self}` instance is ${bits}.
 %   end
   @_transparent
-  public static var bitWidth : Int { return ${bits} }
+  public static var bitWidth: Int { return ${bits} }
 
   /// The number of leading zeros in this value's binary representation.
   ///
@@ -1400,8 +1412,8 @@ ${assignmentOperatorComment(x.operator, True)}
   }
 
   /// A type that represents the words of this integer.
-  @_fixed_layout
-  public struct Words : RandomAccessCollection {
+  @frozen
+  public struct Words: RandomAccessCollection, Sendable {
     public typealias Indices = Range<Int>
     public typealias SubSequence = Slice<${Self}.Words>
 
@@ -1439,7 +1451,7 @@ ${assignmentOperatorComment(x.operator, True)}
         _precondition(position >= 0, "Negative word index")
         _precondition(position < endIndex, "Word index out of range")
         let shift = UInt(position._value) &* ${word_bits}
-        _sanityCheck(shift < UInt(_value.bitWidth._value))
+        _internalInvariant(shift < UInt(_value.bitWidth._value))
         return (_value &>> ${Self}(_truncatingBits: shift))._lowWord
       }
     }
@@ -1502,6 +1514,7 @@ ${assignmentOperatorComment(x.operator, True)}
 % end
 
 %   dbits = bits*2
+%   if bits <= word_bits:
   /// Returns a tuple containing the high and low parts of the result of
   /// multiplying this value by the given value.
   ///
@@ -1534,11 +1547,6 @@ ${assignmentOperatorComment(x.operator, True)}
   public func multipliedFullWidth(by other: ${Self})
     -> (high: ${Self}, low: ${Self}.Magnitude) {
     // FIXME(integers): tests
-%   # 128 bit types are not provided by the 32-bit LLVM
-%   if word_bits == 32 and bits == 64:
-    // FIXME(integers): implement
-    fatalError("Operation is not supported")
-%   else:
     let lhs_ = Builtin.${z}ext_Int${bits}_Int${dbits}(self._value)
     let rhs_ = Builtin.${z}ext_Int${bits}_Int${dbits}(other._value)
 
@@ -1548,8 +1556,8 @@ ${assignmentOperatorComment(x.operator, True)}
     let shifted = Builtin.ashr_Int${dbits}(res, shift)
     let high = ${Self}(Builtin.truncOrBitCast_Int${dbits}_Int${bits}(shifted))
     return (high: high, low: low)
-%   end
   }
+%   end
 
   /// Returns a tuple containing the quotient and remainder of dividing the
   /// given value by this value.
@@ -1632,17 +1640,6 @@ ${assignmentOperatorComment(x.operator, True)}
   }
 % end
 
-  @available(swift, obsoleted: 4.0, message: "Use initializers instead")
-  public func to${U}IntMax() -> ${U}Int64 {
-    return numericCast(self)
-  }
-
-  @available(swift, obsoleted: 4, message: "Use bitWidth instead.")
-  public static var _sizeInBits: ${Self} { return ${bits} }
-
-  @available(swift, obsoleted: 4)
-  public static var _sizeInBytes: ${Self} { return ${bits}/8 }
-
   /// Returns `-1` if this value is negative and `1` if it's positive;
   /// otherwise, `0`.
   ///
@@ -1658,7 +1655,7 @@ ${assignmentOperatorComment(x.operator, True)}
 }
 %# end of concrete type: ${Self}
 
-extension ${Self} : Hashable {
+extension ${Self}: Hashable {
   /// Hashes the essential components of this value by feeding them into the
   /// given hasher.
   ///
@@ -1679,47 +1676,17 @@ extension ${Self} : Hashable {
     return Hasher._hash(
       seed: seed,
       bytes: UInt64(truncatingIfNeeded: ${U}${Self}(_value)),
-      count: ${bits / 8})
+      count: ${bits // 8})
     % end
   }
 }
 
-extension ${Self} : _HasCustomAnyHashableRepresentation {
+extension ${Self}: _HasCustomAnyHashableRepresentation {
   // Not @inlinable
   public func _toCustomAnyHashable() -> AnyHashable? {
     return AnyHashable(_box: _IntegerAnyHashableBox(self))
   }
 }
-
-% for src_type in all_integer_types(word_bits):
-%   srcBits = src_type.bits
-%   srcSigned = src_type.is_signed
-%   Src = src_type.stdlib_name
-%   if should_define_truncating_bit_pattern_init(src_ty=src_type, dst_ty=self_type):
-extension ${Self} {
-  /// Creates a new instance with the same bitwise representation as the least
-  /// significant bits of the given value.
-  ///
-  /// This initializer performs no range or overflow checking. The resulting
-  /// instance may have a different numeric value from `source`.
-  ///
-  /// - Parameter source: An integer to use as the source of the new value's
-  ///   bit pattern.
-  @available(swift, obsoleted: 4.0, renamed: "init(truncatingIfNeeded:)")
-  @_transparent
-  public init(truncatingBitPattern source: ${Src}) {
-    let src = source._value
-%     if self_type.bits == src_type.bits:
-    let dstNotWord = src
-%     else:
-    let dstNotWord = Builtin.trunc_Int${srcBits}_Int${bits}(src)
-%     end
-    self._value = dstNotWord
-  }
-}
-%   end
-% end
-
 
 // FIXME(integers): this section here is to help the typechecker,
 // as it seems to have problems with a pattern where the nonmutating operation
@@ -1735,32 +1702,6 @@ ${operatorComment(x.operator, True)}
     var lhs = lhs
     lhs ${x.operator}= rhs
     return lhs
-  }
-
-%   end
-
-%   for op in maskingShifts:
-
-${operatorComment(x.operator, True)}
-  @available(swift, obsoleted: 4)
-  @_semantics("optimize.sil.specialize.generic.partial.never")
-  @_transparent
-  public static func ${op.nonMaskingOperator}(
-    lhs: ${Self}, rhs: ${Self}
-  ) -> ${Self} {
-    var lhs = lhs
-    ${op.helper}Generic(&lhs, rhs)
-    return lhs
-  }
-
-${assignmentOperatorComment(x.operator, True)}
-  @available(swift, obsoleted: 4)
-  @_semantics("optimize.sil.specialize.generic.partial.never")
-  @_transparent
-  public static func ${op.nonMaskingOperator}=(
-    lhs: inout ${Self}, rhs: ${Self}
-  ) {
-    ${op.helper}Generic(&lhs, rhs)
   }
 
 %   end
@@ -1782,13 +1723,15 @@ ${assignmentOperatorComment(x.operator, True)}
 }
 
 
+extension ${Self}: Sendable { }
+
 % if signed:
 // TODO: Consider removing the underscore.
 /// Returns the argument and specifies that the value is not negative.
 /// It has only an effect if the argument is a load or call.
 @_transparent
 public func _assumeNonNegative(_ x: ${Self}) -> ${Self} {
-  _sanityCheck(x >= (0 as ${Self}))
+  _internalInvariant(x >= (0 as ${Self}))
   return ${Self}(Builtin.assumeNonNegative_${BuiltinName}(x._value))
 }
 % end
@@ -1885,19 +1828,19 @@ internal struct _IntegerAnyHashableBox<
   }
 
   internal var _hashValue: Int {
-    _sanityCheck(Base.self == UInt64.self || Base.self == Int64.self,
+    _internalInvariant(Base.self == UInt64.self || Base.self == Int64.self,
       "self isn't canonical")
     return _value.hashValue
   }
 
   internal func _hash(into hasher: inout Hasher) {
-    _sanityCheck(Base.self == UInt64.self || Base.self == Int64.self,
+    _internalInvariant(Base.self == UInt64.self || Base.self == Int64.self,
       "self isn't canonical")
     _value.hash(into: &hasher)
   }
 
   internal func _rawHashValue(_seed: Int) -> Int {
-    _sanityCheck(Base.self == UInt64.self || Base.self == Int64.self,
+    _internalInvariant(Base.self == UInt64.self || Base.self == Int64.self,
       "self isn't canonical")
     return _value._rawHashValue(seed: _seed)
   }

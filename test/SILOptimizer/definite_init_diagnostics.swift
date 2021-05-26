@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-sil -enable-sil-ownership -primary-file %s -o /dev/null -verify
+// RUN: %target-swift-frontend -emit-sil -primary-file %s -o /dev/null -verify
 
 import Swift
 
@@ -106,6 +106,7 @@ func test2() {
   weak var w1 : SomeClass?
   _ = w1                // ok: default-initialized
 
+  // expected-warning@+4 {{weak reference will always be nil because the referenced object is deallocated here}}
   // expected-warning@+3 {{instance will be immediately deallocated because variable 'w2' is 'weak'}}
   // expected-note@+2 {{a strong reference is required to prevent the instance from being deallocated}}
   // expected-note@+1 {{'w2' declared here}}
@@ -1002,7 +1003,7 @@ enum MyAwesomeEnum {
 
   init?() {
 
-  } // expected-error {{'self' used before 'self.init' call or assignment to 'self'}}
+  } // expected-error {{'self.init' isn't called on all paths before returning from initializer}}
 }
 
 // <rdar://problem/20679379> DI crashes on initializers on protocol extensions
@@ -1203,7 +1204,7 @@ enum SR1469_Enum1 {
     }
     // many lines later
     self = .A
-  } // expected-error {{'self' used before 'self.init' call or assignment to 'self'}}
+  } // expected-error {{'self.init' isn't called on all paths before returning from initializer}}
 }
 
 enum SR1469_Enum2 {
@@ -1211,7 +1212,7 @@ enum SR1469_Enum2 {
   
   init?() {
     return
-  } // expected-error {{'self' used before 'self.init' call or assignment to 'self'}}
+  } // expected-error {{'self.init' isn't called on all paths before returning from initializer}}
 }
 enum SR1469_Enum3 {
   case A, B
@@ -1221,7 +1222,7 @@ enum SR1469_Enum3 {
       self = .A
       return
     }
-  } // expected-error {{'self' used before 'self.init' call or assignment to 'self'}}
+  } // expected-error {{'self.init' isn't called on all paths before returning from initializer}}
 }
 
 class BadFooSuper {
@@ -1335,7 +1336,7 @@ func testDontDiagnoseUnownedImmediateDeallocationThroughStrong() {
   weak var c1: SomeClass?
   do {
     let tmp = SomeClass()
-    c1 = tmp
+    c1 = tmp // expected-warning {{weak reference will always be nil because the referenced object is deallocated here}}
   }
 
   unowned let c2: SomeClass
@@ -1346,7 +1347,7 @@ func testDontDiagnoseUnownedImmediateDeallocationThroughStrong() {
 
   weak var c3: SomeClass?
   let c3Tmp = SomeClass()
-  c3 = c3Tmp
+  c3 = c3Tmp // expected-warning {{weak reference will always be nil because the referenced object is deallocated here}}
 
   unowned let c4: SomeClass
   let c4Tmp = SomeClass()
@@ -1550,4 +1551,83 @@ func testOptionalUnwrapNoError() -> Int? {
   let x: Int?
   x = 0
   return x!
+}
+
+// <https://bugs.swift.org/browse/SR-9451>
+class StrongCycle {
+  var c: StrongCycle
+  var d: Int
+  init(first: ()) {
+    self.d = 10
+    self.c = self // expected-error {{variable 'self.c' used before being initialized}}
+  }
+
+  init(second: ()) {
+    self.c = self // expected-error {{variable 'self.c' used before being initialized}}
+    self.d = 10
+  }
+}
+
+class WeakCycle {
+  weak var c: WeakCycle?
+  var d: Int
+  init(first: ()) { // FIXME: This is inconsistent with the strong reference behavior above
+    self.d = 10
+    self.c = self
+  }
+  init(second: ()) {
+    self.c = self // expected-error {{variable 'self.d' used before being initialized}}
+    self.d = 10
+  }
+}
+
+// <rdar://51198592> DI was crashing as it wrongly detected a `type(of: self)`
+// use in a delegating initializer, when there was none.
+class DelegatingInitTest {
+  convenience init(x: Int) {
+    self // expected-warning {{expression of type 'DelegatingInitTest' is unused}}
+      // expected-error@-1 {{'self' used before 'self.init' call or assignment to 'self'}}
+  } // expected-error {{'self.init' isn't called on all paths before returning from initializer}}
+}
+
+class A {
+  var a: Int
+
+  init(x: Int) {
+    self.a = x
+  }
+
+  convenience init(i: Int) {
+    if i > 0 {
+      self.init(x: i)
+    }
+    if i > -100 {
+      self.init(x: i)
+    }
+  } // expected-error {{'self.init' isn't called on all paths before returning from initializer}}
+}
+
+@propertyWrapper
+struct Wrapper<T> {
+  var wrappedValue: T
+
+  init(wrappedValue initialValue: T) {
+    self.wrappedValue = initialValue
+  }
+}
+
+func foo(_ d: DerivedWrappedProperty) {
+  print(d)
+}
+
+class DerivedWrappedProperty : SomeClass {
+  @Wrapper var y: String
+  var z : String
+
+  init(s: String) {
+    y = s
+    z = s
+    foo(self)  // expected-error {{'self' used in method call 'foo' before 'super.init' call}}
+  }  // expected-error {{'super.init' isn't called on all paths before returning from initializer}}
+
 }

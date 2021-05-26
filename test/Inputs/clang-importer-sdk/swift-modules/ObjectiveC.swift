@@ -2,9 +2,23 @@
 
 // The iOS/arm64 target uses _Bool for Objective-C's BOOL.  We include
 // x86_64 here as well because the iOS simulator also uses _Bool.
-#if ((os(iOS) || os(tvOS)) && (arch(arm64) || arch(x86_64))) || os(watchOS)
 public struct ObjCBool {
-  private var value : Bool
+#if (os(macOS) && arch(x86_64)) || (os(iOS) && (arch(i386) || arch(arm) || targetEnvironment(macCatalyst)))
+
+  // On macOS and 32-bit iOS, Objective-C's BOOL type is a "signed char".
+  private var value: UInt8
+
+  public init(_ value: Bool) {
+    self.value = value ? 1 : 0
+  }
+
+  /// Allow use in a Boolean context.
+  public var boolValue: Bool {
+    return value != 0
+  }
+#else
+  // Everywhere else it is C/C++'s "Bool"
+  private var value: Bool
 
   public init(_ value: Bool) {
     self.value = value
@@ -13,27 +27,8 @@ public struct ObjCBool {
   public var boolValue: Bool {
     return value
   }
-}
-
-#else
-
-public struct ObjCBool {
-  private var value : UInt8
-
-  public init(_ value: Bool) {
-    self.value = value ? 1 : 0
-  }
-
-  public init(_ value: UInt8) {
-    self.value = value
-  }
-
-  public var boolValue: Bool {
-    if value == 0 { return false }
-    return true
-  }
-}
 #endif
+}
 
 extension ObjCBool : ExpressibleByBooleanLiteral {
   public init(booleanLiteral: Bool) {
@@ -60,8 +55,8 @@ public struct Selector : ExpressibleByStringLiteral {
     self = sel_registerName(value)
   }
 
-  public var hashValue: Int {
-    return ptr.hashValue
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(ptr)
   }
 }
 
@@ -88,12 +83,16 @@ public func ~=(x: NSObject, y: NSObject) -> Bool {
 }
 
 extension NSObject : Equatable, Hashable {
-  @objc open var hashValue: Int {
+  public static func == (lhs: NSObject, rhs: NSObject) -> Bool {
+    return lhs.isEqual(rhs)
+  }
+
+  public var hashValue: Int {
     return hash
   }
 
-  public static func == (lhs: NSObject, rhs: NSObject) -> Bool {
-    return lhs.isEqual(rhs)
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(hash)
   }
 }
 

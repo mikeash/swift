@@ -15,14 +15,15 @@
 
 #include "swift/Basic/Compiler.h"
 #include "swift/SIL/SILArgumentConvention.h"
-#include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILValue.h"
+#include "swift/SIL/SILFunctionConventions.h"
 
 namespace swift {
 
 class SILBasicBlock;
 class SILModule;
 class SILUndef;
+class TermInst;
 
 // Map an argument index onto a SILArgumentConvention.
 inline SILArgumentConvention
@@ -62,63 +63,90 @@ struct SILArgumentKind {
 };
 
 class SILArgument : public ValueBase {
-  void operator=(const SILArgument &) = delete;
-  void operator delete(void *Ptr, size_t) SWIFT_DELETE_OPERATOR_DELETED
+  friend class SILBasicBlock;
 
-  SILBasicBlock *ParentBB;
-  const ValueDecl *Decl;
+  SILBasicBlock *parentBlock;
+  const ValueDecl *decl;
+
+protected:
+  SILArgument(ValueKind subClassKind, SILBasicBlock *inputParentBlock,
+              SILType type, ValueOwnershipKind ownershipKind,
+              const ValueDecl *inputDecl = nullptr);
+
+  // A special constructor, only intended for use in
+  // SILBasicBlock::replacePHIArg and replaceFunctionArg.
+  explicit SILArgument(ValueKind subClassKind, SILType type,
+                       ValueOwnershipKind ownershipKind,
+                       const ValueDecl *inputDecl = nullptr)
+      : ValueBase(subClassKind, type),
+        parentBlock(nullptr), decl(inputDecl) {
+    Bits.SILArgument.VOKind = static_cast<unsigned>(ownershipKind);
+  }
 
 public:
+  void operator=(const SILArgument &) = delete;
+  void operator delete(void *, size_t) = delete;
+
   ValueOwnershipKind getOwnershipKind() const {
     return static_cast<ValueOwnershipKind>(Bits.SILArgument.VOKind);
   }
-  void setOwnershipKind(ValueOwnershipKind NewKind) {
-    Bits.SILArgument.VOKind = static_cast<unsigned>(NewKind);
+
+  void setOwnershipKind(ValueOwnershipKind newKind) {
+    Bits.SILArgument.VOKind = static_cast<unsigned>(newKind);
   }
 
-  SILBasicBlock *getParent() { return ParentBB; }
-  const SILBasicBlock *getParent() const { return ParentBB; }
+  SILBasicBlock *getParent() const { return parentBlock; }
 
   SILFunction *getFunction();
   const SILFunction *getFunction() const;
 
   SILModule &getModule() const;
 
-  const ValueDecl *getDecl() const { return Decl; }
+  const ValueDecl *getDecl() const { return decl; }
 
   static bool classof(const SILInstruction *) = delete;
   static bool classof(const SILUndef *) = delete;
-  static bool classof(const SILNode *node) {
+  static bool classof(SILNodePointer node) {
     return node->getKind() >= SILNodeKind::First_SILArgument &&
            node->getKind() <= SILNodeKind::Last_SILArgument;
   }
 
-  unsigned getIndex() const {
-    ArrayRef<SILArgument *> Args = getParent()->getArguments();
-    for (unsigned i = 0, e = Args.size(); i != e; ++i)
-      if (Args[i] == this)
-        return i;
-    llvm_unreachable("SILArgument not argument of its parent BB");
-  }
+  unsigned getIndex() const;
 
   /// Return true if this block argument is actually a phi argument as
   /// opposed to a cast or projection.
-  bool isPhiArgument();
+  bool isPhiArgument() const;
+
+  /// Return true if this block argument is a terminator result.
+  bool isTerminatorResult() const;
 
   /// If this argument is a phi, return the incoming phi value for the given
   /// predecessor BB. If this argument is not a phi, return an invalid SILValue.
-  SILValue getIncomingPhiValue(SILBasicBlock *predBB);
+  SILValue getIncomingPhiValue(SILBasicBlock *predBlock) const;
 
   /// If this argument is a phi, populate `OutArray` with the incoming phi
   /// values for each predecessor BB. If this argument is not a phi, return
   /// false.
-  bool getIncomingPhiValues(llvm::SmallVectorImpl<SILValue> &ReturnedPhiValues);
+  bool getIncomingPhiValues(SmallVectorImpl<SILValue> &returnedPhiValues) const;
 
   /// If this argument is a phi, populate `OutArray` with each predecessor block
   /// and its incoming phi value. If this argument is not a phi, return false.
-  bool getIncomingPhiValues(
-      llvm::SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
-          &ReturnedPredAndPhiValuePairs);
+  bool
+  getIncomingPhiValues(SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
+                           &returnedPredAndPhiValuePairs) const;
+
+  /// If this argument is a true phi, populate `OutArray` with the operand in
+  /// each predecessor block associated with an incoming value.
+  bool
+  getIncomingPhiOperands(SmallVectorImpl<Operand *> &returnedPhiOperands) const;
+
+  /// If this argument is a true phi, for each operand in each predecessor block
+  /// associated with an incoming value, call visitor(op). Visitor must return
+  /// true for iteration to continue. False to stop it.
+  ///
+  /// Returns false if this is not a true phi or that a visitor signaled error
+  /// by returning false.
+  bool visitIncomingPhiOperands(function_ref<bool(Operand *)> visitor) const;
 
   /// Returns true if we were able to find a single terminator operand value for
   /// each predecessor of this arguments basic block. The found values are
@@ -127,7 +155,8 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(llvm::SmallVectorImpl<SILValue> &OutArray);
+  bool getSingleTerminatorOperands(
+      SmallVectorImpl<SILValue> &returnedSingleTermOperands) const;
 
   /// Returns true if we were able to find single terminator operand values for
   /// each predecessor of this arguments basic block. The found values are
@@ -137,7 +166,8 @@ public:
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
   bool getSingleTerminatorOperands(
-      llvm::SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>> &OutArray);
+      SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
+          &returnedSingleTermOperands) const;
 
   /// If this SILArgument's parent block has a single predecessor whose
   /// terminator has a single operand, return the incoming operand of the
@@ -146,6 +176,14 @@ public:
   /// argument value. E.g. the incoming value for a switch_enum payload argument
   /// is the enum itself (the operand of the switch_enum).
   SILValue getSingleTerminatorOperand() const;
+
+  /// If this SILArgument's parent block has a single predecessor whose
+  /// terminator has a single operand, return that terminator.
+  TermInst *getSingleTerminator() const;
+
+  /// Return the terminator instruction for which this argument is a result,
+  /// otherwise return nullptr.
+  TermInst *getTerminatorForResultArg() const;
 
   /// Return the SILArgumentKind of this argument.
   SILArgumentKind getKind() const {
@@ -153,40 +191,45 @@ public:
   }
 
 protected:
-  SILArgument(ValueKind SubClassKind, SILBasicBlock *ParentBB, SILType Ty,
-              ValueOwnershipKind OwnershipKind,
-              const ValueDecl *D = nullptr);
-  SILArgument(ValueKind SubClassKind, SILBasicBlock *ParentBB,
-              SILBasicBlock::arg_iterator Pos, SILType Ty,
-              ValueOwnershipKind OwnershipKind,
-              const ValueDecl *D = nullptr);
-
-  // A special constructor, only intended for use in
-  // SILBasicBlock::replacePHIArg and replaceFunctionArg.
-  explicit SILArgument(ValueKind SubClassKind, SILType Ty,
-                       ValueOwnershipKind OwnershipKind,
-                       const ValueDecl *D = nullptr)
-      : ValueBase(SubClassKind, Ty, IsRepresentative::Yes), ParentBB(nullptr),
-        Decl(D) {
-    Bits.SILArgument.VOKind = static_cast<unsigned>(OwnershipKind);
+  void setParent(SILBasicBlock *newParentBlock) {
+    parentBlock = newParentBlock;
   }
-  void setParent(SILBasicBlock *P) { ParentBB = P; }
-
-  friend SILBasicBlock;
 };
 
 class SILPhiArgument : public SILArgument {
+  friend class SILBasicBlock;
+
+  SILPhiArgument(SILBasicBlock *parentBlock, SILType type,
+                 ValueOwnershipKind ownershipKind,
+                 const ValueDecl *decl = nullptr)
+      : SILArgument(ValueKind::SILPhiArgument, parentBlock, type, ownershipKind,
+                    decl) {}
+  // A special constructor, only intended for use in
+  // SILBasicBlock::replacePHIArg.
+  explicit SILPhiArgument(SILType type, ValueOwnershipKind ownershipKind,
+                          const ValueDecl *decl = nullptr)
+      : SILArgument(ValueKind::SILPhiArgument, type, ownershipKind, decl) {}
+
 public:
   /// Return true if this is block argument is actually a phi argument as
   /// opposed to a cast or projection.
-  bool isPhiArgument();
+  bool isPhiArgument() const;
+
+  /// Return true if this block argument is a terminator result.
+  bool isTerminatorResult() const { return !isPhiArgument(); }
 
   /// If this argument is a phi, return the incoming phi value for the given
   /// predecessor BB. If this argument is not a phi, return an invalid SILValue.
   ///
   /// FIXME: Once SILPhiArgument actually implies that it is a phi argument,
   /// this will be guaranteed to return a valid SILValue.
-  SILValue getIncomingPhiValue(SILBasicBlock *BB);
+  SILValue getIncomingPhiValue(SILBasicBlock *predBlock) const;
+
+  /// If this argument is a true phi, return the operand in the \p predBLock
+  /// associated with an incoming value.
+  ///
+  /// \returns the operand or nullptr if this is not a true phi.
+  Operand *getIncomingPhiOperand(SILBasicBlock *predBlock) const;
 
   /// If this argument is a phi, populate `OutArray` with the incoming phi
   /// values for each predecessor BB. If this argument is not a phi, return
@@ -194,15 +237,28 @@ public:
   ///
   /// FIXME: Once SILPhiArgument actually implies that it is a phi argument,
   /// this will always succeed.
-  bool getIncomingPhiValues(llvm::SmallVectorImpl<SILValue> &OutArray);
+  bool getIncomingPhiValues(SmallVectorImpl<SILValue> &returnedPhiValues) const;
 
   /// If this argument is a phi, populate `OutArray` with each predecessor block
   /// and its incoming phi value. If this argument is not a phi, return false.
   ///
   /// FIXME: Once SILPhiArgument actually implies that it is a phi argument,
   /// this will always succeed.
-  bool getIncomingPhiValues(
-      llvm::SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>> &OutArray);
+  bool
+  getIncomingPhiValues(SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
+                           &returnedPredAndPhiValuePairs) const;
+
+  /// If this argument is a true phi, populate `OutArray` with the operand in
+  /// each predecessor block associated with an incoming value.
+  bool
+  getIncomingPhiOperands(SmallVectorImpl<Operand *> &returnedPhiOperands) const;
+
+  /// If this argument is a phi, call visitor for each passing the operand for
+  /// each incoming phi values for each predecessor BB. If this argument is not
+  /// a phi, return false.
+  ///
+  /// If visitor returns false, iteration is stopped and we return false.
+  bool visitIncomingPhiOperands(function_ref<bool(Operand *)> visitor) const;
 
   /// Returns true if we were able to find a single terminator operand value for
   /// each predecessor of this arguments basic block. The found values are
@@ -211,7 +267,8 @@ public:
   /// Note: this peeks through any projections or cast implied by the
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
-  bool getSingleTerminatorOperands(llvm::SmallVectorImpl<SILValue> &OutArray);
+  bool getSingleTerminatorOperands(
+      SmallVectorImpl<SILValue> &returnedSingleTermOperands) const;
 
   /// Returns true if we were able to find single terminator operand values for
   /// each predecessor of this arguments basic block. The found values are
@@ -221,7 +278,8 @@ public:
   /// terminator. e.g. the incoming value for a switch_enum payload argument is
   /// the enum itself (the operand of the switch_enum).
   bool getSingleTerminatorOperands(
-      llvm::SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>> &OutArray);
+      SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
+          &returnedSingleTermOperands) const;
 
   /// If this SILArgument's parent block has a single predecessor whose
   /// terminator has a single operand, return the incoming operand of the
@@ -231,47 +289,45 @@ public:
   /// is the enum itself (the operand of the switch_enum).
   SILValue getSingleTerminatorOperand() const;
 
+  /// If this SILArgument's parent block has a single predecessor whose
+  /// terminator has a single operand, return that terminator.
+  TermInst *getSingleTerminator() const;
+
+  /// Return the terminator instruction for which this argument is a result,
+  /// otherwise return nullptr.
+  TermInst *getTerminatorForResultArg() const;
+
   static bool classof(const SILInstruction *) = delete;
   static bool classof(const SILUndef *) = delete;
-  static bool classof(const SILNode *node) {
+  static bool classof(SILNodePointer node) {
     return node->getKind() == SILNodeKind::SILPhiArgument;
   }
-
-private:
-  friend SILBasicBlock;
-  SILPhiArgument(SILBasicBlock *ParentBB, SILType Ty, ValueOwnershipKind OwnershipKind,
-                 const ValueDecl *D = nullptr)
-      : SILArgument(ValueKind::SILPhiArgument, ParentBB, Ty, OwnershipKind, D) {}
-  SILPhiArgument(SILBasicBlock *ParentBB, SILBasicBlock::arg_iterator Pos,
-                 SILType Ty, ValueOwnershipKind OwnershipKind,
-                 const ValueDecl *D = nullptr)
-      : SILArgument(ValueKind::SILPhiArgument, ParentBB, Pos, Ty, OwnershipKind, D) {}
-
-  // A special constructor, only intended for use in
-  // SILBasicBlock::replacePHIArg.
-  explicit SILPhiArgument(SILType Ty, ValueOwnershipKind OwnershipKind,
-                          const ValueDecl *D = nullptr)
-      : SILArgument(ValueKind::SILPhiArgument, Ty, OwnershipKind, D) {}
 };
 
 class SILFunctionArgument : public SILArgument {
-public:
-  bool isIndirectResult() const {
-    auto numIndirectResults =
-        getFunction()->getConventions().getNumIndirectSILResults();
-    return (getIndex() < numIndirectResults);
+  friend class SILBasicBlock;
+
+  SILFunctionArgument(SILBasicBlock *parentBlock, SILType type,
+                      ValueOwnershipKind ownershipKind,
+                      const ValueDecl *decl = nullptr)
+      : SILArgument(ValueKind::SILFunctionArgument, parentBlock, type,
+                    ownershipKind, decl) {}
+  // A special constructor, only intended for use in
+  // SILBasicBlock::replaceFunctionArg.
+  explicit SILFunctionArgument(SILType type, ValueOwnershipKind ownershipKind,
+                               const ValueDecl *decl = nullptr)
+      : SILArgument(ValueKind::SILFunctionArgument, type, ownershipKind, decl) {
   }
 
-  SILArgumentConvention getArgumentConvention() const {
-    return getFunction()->getConventions().getSILArgumentConvention(getIndex());
-  }
+public:
+  bool isIndirectResult() const;
+
+  SILArgumentConvention getArgumentConvention() const;
 
   /// Given that this is an entry block argument, and given that it does
   /// not correspond to an indirect result, return the corresponding
   /// SILParameterInfo.
-  SILParameterInfo getKnownParameterInfo() const {
-    return getFunction()->getConventions().getParamInfoForSILArg(getIndex());
-  }
+  SILParameterInfo getKnownParameterInfo() const;
 
   /// Returns true if this SILArgument is the self argument of its
   /// function. This means that this will return false always for SILArguments
@@ -280,76 +336,142 @@ public:
   bool isSelf() const;
 
   /// Returns true if this SILArgument is passed via the given convention.
-  bool hasConvention(SILArgumentConvention P) const {
-    return getArgumentConvention() == P;
+  bool hasConvention(SILArgumentConvention convention) const {
+    return getArgumentConvention() == convention;
   }
 
   static bool classof(const SILInstruction *) = delete;
   static bool classof(const SILUndef *) = delete;
-  static bool classof(const SILNode *node) {
+  static bool classof(SILNodePointer node) {
     return node->getKind() == SILNodeKind::SILFunctionArgument;
   }
-
-private:
-  friend SILBasicBlock;
-
-  SILFunctionArgument(SILBasicBlock *ParentBB, SILType Ty, ValueOwnershipKind OwnershipKind,
-                      const ValueDecl *D = nullptr)
-      : SILArgument(ValueKind::SILFunctionArgument, ParentBB, Ty, OwnershipKind, D) {}
-  SILFunctionArgument(SILBasicBlock *ParentBB, SILBasicBlock::arg_iterator Pos,
-                      SILType Ty, ValueOwnershipKind OwnershipKind, const ValueDecl *D = nullptr)
-      : SILArgument(ValueKind::SILFunctionArgument, ParentBB, Pos, Ty, OwnershipKind, D) {}
-
-  // A special constructor, only intended for use in
-  // SILBasicBlock::replaceFunctionArg.
-  explicit SILFunctionArgument(SILType Ty, ValueOwnershipKind OwnershipKind,
-                               const ValueDecl *D = nullptr)
-      : SILArgument(ValueKind::SILFunctionArgument, Ty, OwnershipKind, D) {}
 };
 
 //===----------------------------------------------------------------------===//
 // Out of line Definitions for SILArgument to avoid Forward Decl issues
 //===----------------------------------------------------------------------===//
 
-inline bool SILArgument::isPhiArgument() {
-  if (auto *phiArg = dyn_cast<SILPhiArgument>(this))
-    return phiArg->isPhiArgument();
-
-  return false;
-}
-
-inline SILValue SILArgument::getIncomingPhiValue(SILBasicBlock *BB) {
-  if (isa<SILFunctionArgument>(this))
-    return SILValue();
-  return cast<SILPhiArgument>(this)->getIncomingPhiValue(BB);
-}
-
-inline bool
-SILArgument::getIncomingPhiValues(llvm::SmallVectorImpl<SILValue> &OutArray) {
-  if (isa<SILFunctionArgument>(this))
+inline bool SILArgument::isPhiArgument() const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->isPhiArgument();
+  case SILArgumentKind::SILFunctionArgument:
     return false;
-  return cast<SILPhiArgument>(this)->getIncomingPhiValues(OutArray);
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline bool SILArgument::isTerminatorResult() const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->isTerminatorResult();
+  case SILArgumentKind::SILFunctionArgument:
+    return false;
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline SILValue
+SILArgument::getIncomingPhiValue(SILBasicBlock *predBlock) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getIncomingPhiValue(predBlock);
+  case SILArgumentKind::SILFunctionArgument:
+    return SILValue();
+  }
+  llvm_unreachable("Covered switch is not covered?!");
 }
 
 inline bool SILArgument::getIncomingPhiValues(
-    llvm::SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>> &OutArray) {
-  if (isa<SILFunctionArgument>(this))
+    SmallVectorImpl<SILValue> &returnedPhiValues) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getIncomingPhiValues(returnedPhiValues);
+  case SILArgumentKind::SILFunctionArgument:
     return false;
-  return cast<SILPhiArgument>(this)->getIncomingPhiValues(OutArray);
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline bool SILArgument::getIncomingPhiValues(
+    SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
+        &returnedPredAndPhiValuePairs) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getIncomingPhiValues(
+        returnedPredAndPhiValuePairs);
+  case SILArgumentKind::SILFunctionArgument:
+    return false;
+  }
+  llvm_unreachable("Covered switch is not covered?!");
 }
 
 inline bool SILArgument::getSingleTerminatorOperands(
-    llvm::SmallVectorImpl<SILValue> &OutArray) {
-  if (isa<SILFunctionArgument>(this))
+    SmallVectorImpl<SILValue> &returnedSingleTermOperands) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getSingleTerminatorOperands(
+        returnedSingleTermOperands);
+  case SILArgumentKind::SILFunctionArgument:
     return false;
-  return cast<SILPhiArgument>(this)->getSingleTerminatorOperands(OutArray);
+  }
+  llvm_unreachable("Covered switch is not covered?!");
 }
 
 inline bool SILArgument::getSingleTerminatorOperands(
-    llvm::SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>> &OutArray) {
-  if (isa<SILFunctionArgument>(this))
+    SmallVectorImpl<std::pair<SILBasicBlock *, SILValue>>
+        &returnedSingleTermOperands) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getSingleTerminatorOperands(
+        returnedSingleTermOperands);
+  case SILArgumentKind::SILFunctionArgument:
     return false;
-  return cast<SILPhiArgument>(this)->getSingleTerminatorOperands(OutArray);
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline TermInst *SILArgument::getSingleTerminator() const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getSingleTerminator();
+  case SILArgumentKind::SILFunctionArgument:
+    return nullptr;
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline TermInst *SILArgument::getTerminatorForResultArg() const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getTerminatorForResultArg();
+  case SILArgumentKind::SILFunctionArgument:
+    return nullptr;
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline bool SILArgument::getIncomingPhiOperands(
+    SmallVectorImpl<Operand *> &returnedPhiOperands) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->getIncomingPhiOperands(
+        returnedPhiOperands);
+  case SILArgumentKind::SILFunctionArgument:
+    return false;
+  }
+  llvm_unreachable("Covered switch is not covered?!");
+}
+
+inline bool SILArgument::visitIncomingPhiOperands(
+    function_ref<bool(Operand *)> visitor) const {
+  switch (getKind()) {
+  case SILArgumentKind::SILPhiArgument:
+    return cast<SILPhiArgument>(this)->visitIncomingPhiOperands(visitor);
+  case SILArgumentKind::SILFunctionArgument:
+    return false;
+  }
+  llvm_unreachable("Covered switch is not covered?!");
 }
 
 } // end swift namespace

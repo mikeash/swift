@@ -1,5 +1,5 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -enable-loop-arc=0 -arc-sequence-opts %s -module-name Swift | %FileCheck %s
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -enable-loop-arc=1 -arc-sequence-opts %s -module-name Swift | %FileCheck %s
+// RUN: %target-sil-opt -enable-sil-verify-all -enable-loop-arc=0 -arc-sequence-opts %s -module-name Swift | %FileCheck %s
+// RUN: %target-sil-opt -enable-sil-verify-all -enable-loop-arc=1 -arc-sequence-opts %s -module-name Swift | %FileCheck %s
 
 sil_stage canonical
 
@@ -91,7 +91,7 @@ enum FakeCasesOptional<T> {
 // CHECK-NOT: release
 sil @silargument_strip_single_payload_case_enum1 : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   br bb3(%0 : $FakeOptional<Builtin.NativeObject>)
@@ -111,7 +111,7 @@ bb3(%1 : $FakeOptional<Builtin.NativeObject>):
 // CHECK-NOT: release
 sil @silargument_strip_single_payload_case_enum2 : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   br bb3(%0 : $FakeOptional<Builtin.NativeObject>)
@@ -134,7 +134,7 @@ bb3(%2 : $FakeOptional<Builtin.NativeObject>):
 // CHECK: release
 sil @silargument_strip_single_payload_case_enum3 : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   %1 = enum $FakeOptional<Builtin.NativeObject>, #FakeOptional.none!enumelt
@@ -156,7 +156,7 @@ bb3(%2 : $FakeOptional<Builtin.NativeObject>):
 // CHECK: release_value
 sil @silargument_strip_single_payload_case_enum4 : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   %1 = enum $FakeOptional<Builtin.NativeObject>, #FakeOptional.none!enumelt
@@ -180,7 +180,7 @@ bb3(%3 : $FakeOptional<Builtin.NativeObject>):
 // CHECK-NOT: release
 sil @silargument_strip_multipayload_with_fake_nopayload_cases : $@convention(thin) (FakeCasesOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeCasesOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeCasesOptional<Builtin.NativeObject>, case #FakeCasesOptional.none!enumelt: bb1, case #FakeCasesOptional.none1!enumelt: bb2, case #FakeCasesOptional.some!enumelt.1: bb3, case #FakeCasesOptional.none2!enumelt: bb4, case #FakeCasesOptional.some2!enumelt.1: bb5, case #FakeCasesOptional.none3!enumelt: bb6
+  switch_enum %0 : $FakeCasesOptional<Builtin.NativeObject>, case #FakeCasesOptional.none!enumelt: bb1, case #FakeCasesOptional.none1!enumelt: bb2, case #FakeCasesOptional.some!enumelt: bb3, case #FakeCasesOptional.none2!enumelt: bb4, case #FakeCasesOptional.some2!enumelt: bb5, case #FakeCasesOptional.none3!enumelt: bb6
 
 bb1:
   %1 = enum $FakeCasesOptional<Builtin.NativeObject>, #FakeCasesOptional.none!enumelt
@@ -225,7 +225,7 @@ bb1:
   br bb3(%1 : $FakeOptional<Builtin.NativeObject>)
 
 bb2:
-  %2 = enum $FakeOptional<Builtin.NativeObject>, #FakeOptional.some!enumelt.1, %0 : $Builtin.NativeObject
+  %2 = enum $FakeOptional<Builtin.NativeObject>, #FakeOptional.some!enumelt, %0 : $Builtin.NativeObject
   br bb3(%2 : $FakeOptional<Builtin.NativeObject>)
 
 bb3(%3 : $FakeOptional<Builtin.NativeObject>):
@@ -242,7 +242,7 @@ bb3(%3 : $FakeOptional<Builtin.NativeObject>):
 // CHECK-NOT: release_value
 sil @silargument_iterated_silargument_strips : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   br bb3(%0 : $FakeOptional<Builtin.NativeObject>)
@@ -252,7 +252,7 @@ bb2:
   br bb3(%1 : $FakeOptional<Builtin.NativeObject>)
 
 bb3(%2 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %2 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb4, case #FakeOptional.none!enumelt: bb5
+  switch_enum %2 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb4, case #FakeOptional.none!enumelt: bb5
 
 bb4:
   br bb6(%2 : $FakeOptional<Builtin.NativeObject>)
@@ -279,7 +279,7 @@ bb6(%4 : $FakeOptional<Builtin.NativeObject>):
 // CHECK: release_value
 sil @silargument_iterated_silargument_strips_too_far_up_domtree : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   br bb3(%0 : $FakeOptional<Builtin.NativeObject>)
@@ -310,7 +310,7 @@ bb6(%4 : $FakeOptional<Builtin.NativeObject>):
 // CHECK: release_value
 sil @silargument_dont_strip_over_relevant_loop : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   br bb3(%0 : $FakeOptional<Builtin.NativeObject>)
@@ -320,9 +320,12 @@ bb2:
   br bb3(%1 : $FakeOptional<Builtin.NativeObject>)
 
 bb3(%2 : $FakeOptional<Builtin.NativeObject>):
-  cond_br undef, bb3(%2 : $FakeOptional<Builtin.NativeObject>), bb4
+  cond_br undef, bb4(%2 : $FakeOptional<Builtin.NativeObject>), bb5
 
-bb4:
+bb4(%3 : $FakeOptional<Builtin.NativeObject>):
+  br bb3(%3 : $FakeOptional<Builtin.NativeObject>)
+
+bb5:
   retain_value %0 : $FakeOptional<Builtin.NativeObject>
   release_value %2 : $FakeOptional<Builtin.NativeObject>
   %9999 = tuple()
@@ -337,7 +340,7 @@ bb4:
 // CHECK-NOT: release_value
 sil @silargument_do_strip_over_irrelevant_loop : $@convention(thin) (FakeOptional<Builtin.NativeObject>) -> () {
 bb0(%0 : $FakeOptional<Builtin.NativeObject>):
-  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt.1: bb1, case #FakeOptional.none!enumelt: bb2
+  switch_enum %0 : $FakeOptional<Builtin.NativeObject>, case #FakeOptional.some!enumelt: bb1, case #FakeOptional.none!enumelt: bb2
 
 bb1:
   br bb3(%0 : $FakeOptional<Builtin.NativeObject>)
@@ -347,12 +350,24 @@ bb2:
   br bb3(%1 : $FakeOptional<Builtin.NativeObject>)
 
 bb3(%2 : $FakeOptional<Builtin.NativeObject>):
-  cond_br undef, bb4, bb5
+  cond_br undef, bb4, bb7
 
 bb4:
-  cond_br undef, bb4, bb5
+  br bb5
 
 bb5:
+  cond_br undef, bb6, bb8
+
+bb6:
+  br bb5
+
+bb7:
+  br bb9
+
+bb8:
+  br bb9
+
+bb9:
   retain_value %0 : $FakeOptional<Builtin.NativeObject>
   release_value %2 : $FakeOptional<Builtin.NativeObject>
   %9999 = tuple()
@@ -421,12 +436,15 @@ bb1(%1 : $FakeOptional<Cls>):
   %2 = alloc_ref $Cls
   retain_value %2 : $Cls
   release_value %1 : $FakeOptional<Cls>
-  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt.1, %2 : $Cls
-  cond_br undef, bb1(%3 : $FakeOptional<Cls>), bb2
+  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt, %2 : $Cls
+  cond_br undef, bb2(%3 : $FakeOptional<Cls>), bb3
 
-bb2:
-  %4 = tuple()
-  return %4 : $()
+bb2(%4 : $FakeOptional<Cls>):
+  br bb1(%4 : $FakeOptional<Cls>)
+
+bb3:
+  %5 = tuple()
+  return %5 : $()
 }
 
 // CHECK-LABEL: sil @dont_strip_phi_nodes_over_backedges_multibb1 : $@convention(thin) () -> () {
@@ -444,15 +462,18 @@ bb1(%1 : $FakeOptional<Cls>):
 
 bb2:
   release_value %1 : $FakeOptional<Cls>
-  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt.1, %2 : $Cls
+  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt, %2 : $Cls
   br bb3
 
 bb3:
-  cond_br undef, bb1(%3 : $FakeOptional<Cls>), bb4
+  cond_br undef, bb4(%3 : $FakeOptional<Cls>), bb5
 
-bb4:
-  %4 = tuple()
-  return %4 : $()
+bb4(%4 : $FakeOptional<Cls>):
+  br bb1(%4 : $FakeOptional<Cls>)
+
+bb5:
+  %5 = tuple()
+  return %5 : $()
 }
 
 // CHECK-LABEL: sil @dont_strip_phi_nodes_over_backedges_multibb2 : $@convention(thin) () -> () {
@@ -470,15 +491,18 @@ bb2:
   %2 = alloc_ref $Cls
   retain_value %2 : $Cls
   release_value %1 : $FakeOptional<Cls>
-  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt.1, %2 : $Cls
+  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt, %2 : $Cls
   br bb3
 
 bb3:
-  cond_br undef, bb1(%3 : $FakeOptional<Cls>), bb4
+  cond_br undef, bb4(%3 : $FakeOptional<Cls>), bb5
 
-bb4:
-  %4 = tuple()
-  return %4 : $()
+bb4(%4 : $FakeOptional<Cls>):
+  br bb1(%4 : $FakeOptional<Cls>)
+
+bb5:
+  %5 = tuple()
+  return %5 : $()
 }
 
 // CHECK-LABEL: sil @dont_strip_phi_nodes_over_backedges_multibb3 : $@convention(thin) () -> () {
@@ -499,12 +523,15 @@ bb2:
 
 bb3:
   release_value %1 : $FakeOptional<Cls>
-  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt.1, %2 : $Cls
-  cond_br undef, bb1(%3 : $FakeOptional<Cls>), bb4
+  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt, %2 : $Cls
+  cond_br undef, bb4(%3 : $FakeOptional<Cls>), bb5
 
-bb4:
-  %4 = tuple()
-  return %4 : $()
+bb4(%4 : $FakeOptional<Cls>):
+  br bb1(%4 : $FakeOptional<Cls>)
+
+bb5:
+  %5 = tuple()
+  return %5 : $()
 }
 
 // CHECK-LABEL: sil @dont_strip_phi_nodes_over_backedges_multibb4 : $@convention(thin) () -> () {
@@ -525,12 +552,15 @@ bb3:
   %2 = alloc_ref $Cls
   retain_value %2 : $Cls
   release_value %1 : $FakeOptional<Cls>
-  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt.1, %2 : $Cls
-  cond_br undef, bb1(%3 : $FakeOptional<Cls>), bb4
+  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt, %2 : $Cls
+  cond_br undef, bb4(%3 : $FakeOptional<Cls>), bb5
 
-bb4:
-  %4 = tuple()
-  return %4 : $()
+bb4(%4 : $FakeOptional<Cls>):
+  br bb1(%4 : $FakeOptional<Cls>)
+
+bb5:
+  %5 = tuple()
+  return %5 : $()
 }
 
 // CHECK-LABEL: sil @dont_strip_phi_nodes_over_backedges_multibb5 : $@convention(thin) () -> () {
@@ -551,12 +581,15 @@ bb2:
 
 bb3:
   release_value %1 : $FakeOptional<Cls>
-  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt.1, %2 : $Cls
-  cond_br undef, bb1(%3 : $FakeOptional<Cls>), bb4
+  %3 = enum $FakeOptional<Cls>, #FakeOptional.some!enumelt, %2 : $Cls
+  cond_br undef, bb4(%3 : $FakeOptional<Cls>), bb5
 
-bb4:
-  %4 = tuple()
-  return %4 : $()
+bb4(%4 : $FakeOptional<Cls>):
+  br bb1(%4 : $FakeOptional<Cls>)
+
+bb5:
+  %5 = tuple()
+  return %5 : $()
 }
 
 // CHECK-LABEL: sil @strip_off_structs_tuples_tuple_extracts : $@convention(thin) (Builtin.NativeObject, (Builtin.Int32, Builtin.NativeObject, Builtin.Int32)) -> () {

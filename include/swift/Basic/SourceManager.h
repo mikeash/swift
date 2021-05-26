@@ -17,16 +17,27 @@
 #include "swift/Basic/SourceLoc.h"
 #include "clang/Basic/FileManager.h"
 #include "llvm/ADT/Optional.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/SourceMgr.h"
 #include <map>
 
 namespace swift {
 
-/// \brief This class manages and owns source buffers.
+/// This class manages and owns source buffers.
 class SourceManager {
+public:
+  /// A \c #sourceLocation-defined virtual file region, representing the source
+  /// source after a \c #sourceLocation (or between two). It provides a
+  /// filename and line offset to be applied to \c SourceLoc's within its
+  /// \c Range.
+  struct VirtualFile {
+    CharSourceRange Range;
+    std::string Name;
+    int LineOffset;
+  };
+
+private:
   llvm::SourceMgr LLVMSourceMgr;
-  llvm::IntrusiveRefCntPtr<clang::vfs::FileSystem> FileSystem;
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem;
   unsigned CodeCompletionBufferID = 0U;
   unsigned CodeCompletionOffset;
 
@@ -37,20 +48,29 @@ class SourceManager {
   ///
   /// This is as much a hack to prolong the lifetime of status objects as it is
   /// to speed up stats.
-  mutable llvm::DenseMap<StringRef, clang::vfs::Status> StatusCache;
+  mutable llvm::DenseMap<StringRef, llvm::vfs::Status> StatusCache;
 
-  // \c #sourceLocation directive handling.
-  struct VirtualFile {
-    CharSourceRange Range;
-    std::string Name;
-    int LineOffset;
+  struct ReplacedRangeType {
+    SourceRange Original;
+    SourceRange New;
+    ReplacedRangeType() {}
+    ReplacedRangeType(NoneType) {}
+    ReplacedRangeType(SourceRange Original, SourceRange New)
+        : Original(Original), New(New) {
+      assert(Original.isValid() && New.isValid());
+    }
+
+    explicit operator bool() const { return Original.isValid(); }
   };
+  ReplacedRangeType ReplacedRange;
+
   std::map<const char *, VirtualFile> VirtualFiles;
   mutable std::pair<const char *, const VirtualFile*> CachedVFile = {nullptr, nullptr};
 
+  Optional<unsigned> findBufferContainingLocInternal(SourceLoc Loc) const;
 public:
-  SourceManager(llvm::IntrusiveRefCntPtr<clang::vfs::FileSystem> FS =
-                    clang::vfs::getRealFileSystem())
+  SourceManager(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS =
+                    llvm::vfs::getRealFileSystem())
     : FileSystem(FS) {}
 
   llvm::SourceMgr &getLLVMSourceMgr() {
@@ -60,11 +80,11 @@ public:
     return LLVMSourceMgr;
   }
 
-  void setFileSystem(llvm::IntrusiveRefCntPtr<clang::vfs::FileSystem> FS) {
+  void setFileSystem(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS) {
     FileSystem = FS;
   }
 
-  llvm::IntrusiveRefCntPtr<clang::vfs::FileSystem> getFileSystem() {
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> getFileSystem() const {
     return FileSystem;
   }
 
@@ -73,6 +93,10 @@ public:
 
     CodeCompletionBufferID = BufferID;
     CodeCompletionOffset = Offset;
+  }
+
+  bool hasCodeCompletionBuffer() const {
+    return CodeCompletionBufferID != 0U;
   }
 
   unsigned getCodeCompletionBufferID() const {
@@ -84,6 +108,9 @@ public:
   }
 
   SourceLoc getCodeCompletionLoc() const;
+
+  const ReplacedRangeType &getReplacedRange() const { return ReplacedRange; }
+  void setReplacedRange(const ReplacedRangeType &val) { ReplacedRange = val; }
 
   /// Returns true if \c LHS is before \c RHS in the source buffer.
   bool isBeforeInBuffer(SourceLoc LHS, SourceLoc RHS) const {
@@ -103,14 +130,28 @@ public:
            rangeContainsTokenLoc(Enclosing, Inner.End);
   }
 
+  /// Returns true if range \p R contains the code-completion location, if any.
+  bool rangeContainsCodeCompletionLoc(SourceRange R) const {
+    return CodeCompletionBufferID
+               ? rangeContainsTokenLoc(R, getCodeCompletionLoc())
+               : false;
+  }
+
   /// Returns the buffer ID for the specified *valid* location.
   ///
   /// Because a valid source location always corresponds to a source buffer,
   /// this routine always returns a valid buffer ID.
   unsigned findBufferContainingLoc(SourceLoc Loc) const;
 
+  /// Whether the source location is pointing to any buffer owned by the SourceManager.
+  bool isOwning(SourceLoc Loc) const;
+
   /// Adds a memory buffer to the SourceManager, taking ownership of it.
   unsigned addNewSourceBuffer(std::unique_ptr<llvm::MemoryBuffer> Buffer);
+
+  /// Add a \c #sourceLocation-defined virtual file region of \p Length.
+  void createVirtualFile(SourceLoc Loc, StringRef Name, int LineOffset,
+                         unsigned Length);
 
   /// Add a \c #sourceLocation-defined virtual file region.
   ///
@@ -138,7 +179,7 @@ public:
 
   /// Returns a buffer ID for a previously added buffer with the given
   /// buffer identifier, or None if there is no such buffer.
-  Optional<unsigned> getIDForBufferIdentifier(StringRef BufIdentifier);
+  Optional<unsigned> getIDForBufferIdentifier(StringRef BufIdentifier) const;
 
   /// Returns the identifier for the buffer with the given ID.
   ///
@@ -150,7 +191,7 @@ public:
   /// in that case.
   StringRef getIdentifierForBuffer(unsigned BufferID) const;
 
-  /// \brief Returns a SourceRange covering the entire specified buffer.
+  /// Returns a SourceRange covering the entire specified buffer.
   ///
   /// Note that the start location might not point at the first token: it
   /// might point at whitespace or a comment.
@@ -165,10 +206,10 @@ public:
     return getRangeForBuffer(BufferID).getStart();
   }
 
-  /// \brief Returns the offset in bytes for the given valid source location.
+  /// Returns the offset in bytes for the given valid source location.
   unsigned getLocOffsetInBuffer(SourceLoc Loc, unsigned BufferID) const;
 
-  /// \brief Returns the distance in bytes between the given valid source
+  /// Returns the distance in bytes between the given valid source
   /// locations.
   unsigned getByteDistance(SourceLoc Start, SourceLoc End) const;
 
@@ -191,7 +232,7 @@ public:
   ///
   /// This respects \c #sourceLocation directives.
   std::pair<unsigned, unsigned>
-  getLineAndColumn(SourceLoc Loc, unsigned BufferID = 0) const {
+  getPresumedLineAndColumnForLoc(SourceLoc Loc, unsigned BufferID = 0) const {
     assert(Loc.isValid());
     int LineOffset = getLineOffset(Loc);
     int l, c;
@@ -200,14 +241,15 @@ public:
     return { LineOffset + l, c };
   }
 
-  /// Returns the real line number for a source location.
+  /// Returns the real line and column for a source location.
   ///
   /// If \p BufferID is provided, \p Loc must come from that source buffer.
   ///
   /// This does not respect \c #sourceLocation directives.
-  unsigned getLineNumber(SourceLoc Loc, unsigned BufferID = 0) const {
+  std::pair<unsigned, unsigned>
+  getLineAndColumnInBuffer(SourceLoc Loc, unsigned BufferID = 0) const {
     assert(Loc.isValid());
-    return LLVMSourceMgr.FindLineNumber(Loc.Value, BufferID);
+    return LLVMSourceMgr.getLineAndColumn(Loc.Value, BufferID);
   }
 
   StringRef getEntireTextForBuffer(unsigned BufferID) const;
@@ -224,8 +266,16 @@ public:
   void verifyAllBuffers() const;
 
   /// Translate line and column pair to the offset.
+  /// If the column number is the maximum unsinged int, return the offset of the end of the line.
   llvm::Optional<unsigned> resolveFromLineCol(unsigned BufferId, unsigned Line,
                                               unsigned Col) const;
+
+  /// Translate the end position of the given line to the offset.
+  llvm::Optional<unsigned> resolveOffsetForEndOfLine(unsigned BufferId,
+                                                     unsigned Line) const;
+
+  /// Get the length of the line
+  llvm::Optional<unsigned> getLineLength(unsigned BufferId, unsigned Line) const;
 
   SourceLoc getLocForLineCol(unsigned BufferId, unsigned Line, unsigned Col) const {
     auto Offset = resolveFromLineCol(BufferId, Line, Col);
@@ -233,9 +283,29 @@ public:
                                SourceLoc();
   }
 
-private:
+  std::string getLineString(unsigned BufferID, unsigned LineNumber);
+
+  /// Retrieve the buffer ID for \p Path, loading if necessary.
+  unsigned getExternalSourceBufferID(StringRef Path);
+
+  SourceLoc getLocFromExternalSource(StringRef Path, unsigned Line, unsigned Col);
+
+  /// Retrieve the virtual file for the given \p Loc, or nullptr if none exists.
   const VirtualFile *getVirtualFile(SourceLoc Loc) const;
 
+  /// Whether or not \p Loc is after a \c #sourceLocation directive, ie. its
+  /// file, line, and column should be reported using the information in the
+  /// directive.
+  bool isLocInVirtualFile(SourceLoc Loc) const {
+    return getVirtualFile(Loc) != nullptr;
+  }
+
+  /// Return a SourceLoc in \c this corresponding to \p otherLoc, which must be
+  /// owned by \p otherManager. Returns an invalid SourceLoc if it cannot be
+  /// translated.
+  SourceLoc getLocForForeignLoc(SourceLoc otherLoc, SourceManager &otherMgr);
+
+private:
   int getLineOffset(SourceLoc Loc) const {
     if (auto VFile = getVirtualFile(Loc))
       return VFile->LineOffset;

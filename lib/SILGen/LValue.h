@@ -51,22 +51,20 @@ struct LValueTypeData {
   CanType SubstFormalType;
 
   /// The lowered type of value that should be stored in the l-value.
-  /// Always an object type.
   ///
   /// On physical path components, projection yields an address of
   /// this type.  On logical path components, materialize yields an
   /// address of this type, set expects a value of this type, and
-  /// get yields a value of this type.
-  SILType TypeOfRValue;
+  /// get yields an object of this type.
+  CanType TypeOfRValue;
 
   SGFAccessKind AccessKind;
 
   LValueTypeData() = default;
   LValueTypeData(SGFAccessKind accessKind, AbstractionPattern origFormalType,
-                 CanType substFormalType, SILType typeOfRValue)
+                 CanType substFormalType, CanType typeOfRValue)
     : OrigFormalType(origFormalType), SubstFormalType(substFormalType),
       TypeOfRValue(typeOfRValue), AccessKind(accessKind) {
-    assert(typeOfRValue.isObject());
     assert(substFormalType->isMaterializable());
   }
 
@@ -106,7 +104,7 @@ public:
     AddressorKind,              // var/subscript addressor
     CoroutineAccessorKind,      // coroutine accessor
     ValueKind,                  // random base pointer as an lvalue
-    KeyPathApplicationKind,     // applying a key path
+    PhysicalKeyPathApplicationKind, // applying a key path
 
     // Logical LValue kinds
     GetterSetterKind,           // property or subscript getter/setter
@@ -115,6 +113,7 @@ public:
     AutoreleasingWritebackKind, // autorelease pointer on set
     WritebackPseudoKind,        // a fake component to customize writeback
     OpenNonOpaqueExistentialKind,  // opened class or metatype existential
+    LogicalKeyPathApplicationKind, // applying a key path
     // Translation LValue kinds (a subtype of logical)
     OrigToSubstKind,            // generic type substitution
     SubstToOrigKind,            // generic type substitution
@@ -184,7 +183,9 @@ public:
 
   /// Returns the logical type-as-rvalue of the value addressed by the
   /// component.  This is always an object type, never an address.
-  SILType getTypeOfRValue() const { return TypeData.TypeOfRValue; }
+  SILType getTypeOfRValue() const {
+    return SILType::getPrimitiveObjectType(TypeData.TypeOfRValue);
+  }
   AbstractionPattern getOrigFormalType() const {
     return TypeData.OrigFormalType;
   }
@@ -208,10 +209,16 @@ class PhysicalPathComponent : public PathComponent {
   virtual void _anchor() override;
 
 protected:
-  PhysicalPathComponent(LValueTypeData typeData, KindTy Kind)
-    : PathComponent(typeData, Kind) {
+  Optional<ActorIsolation> ActorIso;
+  PhysicalPathComponent(LValueTypeData typeData, KindTy Kind,
+                        Optional<ActorIsolation> actorIso = None)
+    : PathComponent(typeData, Kind), ActorIso(actorIso) {
     assert(isPhysical() && "PhysicalPathComponent Kind isn't physical");
   }
+
+public:
+  // Obtains the actor-isolation required for any loads of this component.
+  Optional<ActorIsolation> getActorIsolation() const { return ActorIso; }
 };
 
 inline PhysicalPathComponent &PathComponent::asPhysical() {
@@ -404,19 +411,35 @@ public:
     assert(&component == Path.back().get());
     Path.pop_back();
   }
-  
+
+  /// Pop the last component off this LValue unsafely. Validates that the
+  /// component is of kind \p kind as a sanity check.
+  ///
+  /// Please be careful when using this!
+  void unsafelyDropLastComponent(PathComponent::KindTy kind) & {
+    assert(kind == Path.back()->getKind());
+    Path.pop_back();
+  }
+
   /// Add a new component at the end of the access path of this lvalue.
   template <class T, class... As>
   void add(As &&... args) {
     Path.emplace_back(new T(std::forward<As>(args)...));
   }
 
+  // NOTE: Optional<ActorIsolation> inside of LValues
+  // Some path components carry an ActorIsolation value, which is an indicator
+  // that the access to that component must be performed by switching to the
+  // given actor's isolation domain. If the indicator is not present, that
+  // only means that a switch does not need to be emitted during the access.
+
   void addNonMemberVarComponent(SILGenFunction &SGF, SILLocation loc,
-                                VarDecl *var, Optional<SubstitutionMap> subs,
+                                VarDecl *var, SubstitutionMap subs,
                                 LValueOptions options,
                                 SGFAccessKind accessKind,
                                 AccessStrategy strategy,
-                                CanType formalRValueType);
+                                CanType formalRValueType,
+                                Optional<ActorIsolation> actorIso = None);
 
   /// Add a member component to the access path of this lvalue.
   void addMemberComponent(SILGenFunction &SGF, SILLocation loc,
@@ -437,7 +460,9 @@ public:
                              bool isSuper,
                              SGFAccessKind accessKind,
                              AccessStrategy accessStrategy,
-                             CanType formalRValueType);
+                             CanType formalRValueType,
+                             bool isOnSelf = false,
+                             Optional<ActorIsolation> actorIso = None);
 
   void addMemberSubscriptComponent(SILGenFunction &SGF, SILLocation loc,
                                    SubscriptDecl *subscript,
@@ -448,7 +473,9 @@ public:
                                    AccessStrategy accessStrategy,
                                    CanType formalRValueType,
                                    PreparedArguments &&indices,
-                                   Expr *indexExprForDiagnostics);
+                                   Expr *indexExprForDiagnostics,
+                                   bool isOnSelfParameter = false,
+                                   Optional<ActorIsolation> actorIso = None);
 
   /// Add a subst-to-orig reabstraction component.  That is, given
   /// that this l-value trafficks in values following the substituted
@@ -482,7 +509,9 @@ public:
   /// Returns the type-of-rvalue of the logical object referenced by
   /// this l-value.  Note that this may differ significantly from the
   /// type of l-value.
-  SILType getTypeOfRValue() const { return getTypeData().TypeOfRValue; }
+  SILType getTypeOfRValue() const {
+    return SILType::getPrimitiveObjectType(getTypeData().TypeOfRValue);
+  }
   CanType getSubstFormalType() const { return getTypeData().SubstFormalType; }
   AbstractionPattern getOrigFormalType() const {
     return getTypeData().OrigFormalType;
@@ -521,7 +550,6 @@ struct LLVM_LIBRARY_VISIBILITY ExclusiveBorrowFormalAccess : FormalAccess {
   ExclusiveBorrowFormalAccess &
   operator=(ExclusiveBorrowFormalAccess &&) = default;
 
-  ExclusiveBorrowFormalAccess() = default;
   ExclusiveBorrowFormalAccess(SILLocation loc,
                               std::unique_ptr<LogicalPathComponent> &&comp,
                               ManagedValue base,
@@ -534,7 +562,7 @@ struct LLVM_LIBRARY_VISIBILITY ExclusiveBorrowFormalAccess : FormalAccess {
                         SILGenFunction &SGF) const;
 
   void performWriteback(SILGenFunction &SGF, bool isFinal) {
-    Scope S(SGF.Cleanups, CleanupLocation::get(loc));
+    Scope S(SGF.Cleanups, CleanupLocation(loc));
     component->writeback(SGF, loc, base, materialized, isFinal);
   }
 

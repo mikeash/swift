@@ -219,6 +219,29 @@ FunctionSideEffects::getMemBehavior(RetainObserveKind ScanKind) const {
   return Behavior;
 }
 
+MemoryBehavior
+FunctionSideEffects::getArgumentBehavior(FullApplySite applySite,
+                                         unsigned argIdx) {
+  // The overall argument effect is the combination of the argument and the
+  // global effects.
+  MemoryBehavior behavior =
+    GlobalEffects.getMemBehavior(RetainObserveKind::IgnoreRetains);
+  MemoryBehavior argBehavior =
+    ParamEffects[argIdx].getMemBehavior(RetainObserveKind::IgnoreRetains);
+
+  behavior = combineMemoryBehavior(behavior, argBehavior);
+
+  if (behavior > MemoryBehavior::MayRead &&
+      applySite.getArgumentConvention(applySite.getArgumentRef(argIdx)) ==
+        SILArgumentConvention::Indirect_In_Guaranteed) {
+    // Even if side-effect analysis doesn't know anything about the called
+    // called function, the in_guaranteed convention guarantees that the
+    // argument is never written to.
+    return MemoryBehavior::MayRead;
+  }
+  return behavior;
+}
+
 bool FunctionSideEffects::mergeFrom(const FunctionSideEffects &RHS) {
   bool Changed = mergeFlags(RHS);
   Changed |= GlobalEffects.mergeFrom(RHS.GlobalEffects);
@@ -353,6 +376,14 @@ bool FunctionSideEffects::setDefinedEffects(SILFunction *F) {
 // FunctionSideEffects object without visiting its body.
 bool FunctionSideEffects::summarizeFunction(SILFunction *F) {
   assert(ParamEffects.empty() && "Expect uninitialized effects.");
+
+  if (F->isDynamicallyReplaceable()) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "  -- is dynamically_replaceable " << F->getName() << '\n');
+    setWorstEffects();
+    return true;
+  }
+
   if (!F->empty())
     ParamEffects.resize(F->getArguments().size());
 
@@ -463,7 +494,7 @@ bool FunctionSideEffects::summarizeCall(FullApplySite fullApply) {
     }
   }
 
-  if (SILFunction *SingleCallee = fullApply.getReferencedFunction()) {
+  if (SILFunction *SingleCallee = fullApply.getReferencedFunctionOrNull()) {
     // Does the function have any @_effects?
     if (setDefinedEffects(SingleCallee))
       return true;
@@ -482,15 +513,20 @@ void FunctionSideEffects::analyzeInstruction(SILInstruction *I) {
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::DeallocStackInst:
     return;
-#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
-  case SILInstructionKind::Name##RetainInst: \
-  case SILInstructionKind::StrongRetain##Name##Inst: \
-  case SILInstructionKind::Copy##Name##ValueInst:
+#define UNCHECKED_REF_CAST(Name, ...)                                          \
+  case SILInstructionKind::Name##RetainValueInst:                              \
+  case SILInstructionKind::StrongCopy##Name##ValueInst:
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
+  case SILInstructionKind::Name##RetainInst:                                   \
+  case SILInstructionKind::StrongRetain##Name##Inst:                           \
+  case SILInstructionKind::StrongCopy##Name##ValueInst:
 #include "swift/AST/ReferenceStorage.def"
   case SILInstructionKind::StrongRetainInst:
   case SILInstructionKind::RetainValueInst:
     getEffectsOn(I->getOperand(0))->Retains = true;
     return;
+#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
+  case SILInstructionKind::Name##ReleaseValueInst:
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
   case SILInstructionKind::Name##ReleaseInst:
 #include "swift/AST/ReferenceStorage.def"
@@ -503,12 +539,29 @@ void FunctionSideEffects::analyzeInstruction(SILInstruction *I) {
         true;
     Traps = true;
     return;
-  case SILInstructionKind::LoadInst:
-    getEffectsOn(cast<LoadInst>(I)->getOperand())->Reads = true;
+  case SILInstructionKind::LoadBorrowInst: {
+    auto *effects = getEffectsOn(cast<LoadBorrowInst>(I)->getOperand());
+    effects->Reads = true;
     return;
-  case SILInstructionKind::StoreInst:
-    getEffectsOn(cast<StoreInst>(I)->getDest())->Writes = true;
+  }
+  case SILInstructionKind::LoadInst: {
+    auto *li = cast<LoadInst>(I);
+    auto *effects = getEffectsOn(cast<LoadInst>(I)->getOperand());
+    effects->Reads = true;
+    if (li->getOwnershipQualifier() == LoadOwnershipQualifier::Take)
+      effects->Writes = true;
+    if (li->getOwnershipQualifier() == LoadOwnershipQualifier::Copy)
+      effects->Retains = true;
     return;
+  }
+  case SILInstructionKind::StoreInst: {
+    auto *si = cast<StoreInst>(I);
+    auto *effects = getEffectsOn(si->getDest());
+    effects->Writes = true;
+    if (si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign)
+      effects->Releases = true;
+    return;
+  }
   case SILInstructionKind::CondFailInst:
     Traps = true;
     return;

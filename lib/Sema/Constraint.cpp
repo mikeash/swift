@@ -15,13 +15,12 @@
 // constraint that must be solved.
 //
 //===----------------------------------------------------------------------===//
-#include "Constraint.h"
-#include "ConstraintSystem.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Compiler.h"
+#include "swift/Sema/Constraint.h"
+#include "swift/Sema/ConstraintSystem.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
 
 using namespace swift;
@@ -29,9 +28,9 @@ using namespace constraints;
 
 Constraint::Constraint(ConstraintKind kind, ArrayRef<Constraint *> constraints,
                        ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
     : Kind(kind), HasRestriction(false), IsActive(false), IsDisabled(false),
-      RememberChoice(false), IsFavored(false),
+      IsDisabledForPerformance(false), RememberChoice(false), IsFavored(false),
       NumTypeVariables(typeVars.size()), Nested(constraints), Locator(locator) {
   assert(kind == ConstraintKind::Disjunction);
   std::uninitialized_copy(typeVars.begin(), typeVars.end(),
@@ -40,9 +39,9 @@ Constraint::Constraint(ConstraintKind kind, ArrayRef<Constraint *> constraints,
 
 Constraint::Constraint(ConstraintKind Kind, Type First, Type Second,
                        ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
     : Kind(Kind), HasRestriction(false), IsActive(false), IsDisabled(false),
-      RememberChoice(false), IsFavored(false),
+      IsDisabledForPerformance(false), RememberChoice(false), IsFavored(false),
       NumTypeVariables(typeVars.size()), Types{First, Second, Type()},
       Locator(locator) {
   switch (Kind) {
@@ -57,6 +56,7 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second,
   case ConstraintKind::OperatorArgumentConversion:
   case ConstraintKind::ConformsTo:
   case ConstraintKind::LiteralConformsTo:
+  case ConstraintKind::TransitivelyConformsTo:
   case ConstraintKind::CheckedCast:
   case ConstraintKind::SelfObjectOfProtocol:
   case ConstraintKind::DynamicTypeOf:
@@ -65,19 +65,28 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second,
   case ConstraintKind::OptionalObject:
   case ConstraintKind::FunctionInput:
   case ConstraintKind::FunctionResult:
+  case ConstraintKind::OpaqueUnderlyingType:
+  case ConstraintKind::OneWayEqual:
+  case ConstraintKind::OneWayBindParam:
+  case ConstraintKind::UnresolvedMemberChainBase:
+  case ConstraintKind::PropertyWrapper:
     assert(!First.isNull());
     assert(!Second.isNull());
     break;
   case ConstraintKind::ApplicableFunction:
+  case ConstraintKind::DynamicCallableApplicableFunction:
     assert(First->is<FunctionType>()
            && "The left-hand side type should be a function type");
+    trailingClosureMatching = 0;
     break;
 
   case ConstraintKind::ValueMember:
   case ConstraintKind::UnresolvedValueMember:
+  case ConstraintKind::ValueWitness:
     llvm_unreachable("Wrong constructor for member constraint");
 
   case ConstraintKind::Defaultable:
+  case ConstraintKind::DefaultClosureType:
     assert(!First.isNull());
     assert(!Second.isNull());
     break;
@@ -99,9 +108,9 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second,
 
 Constraint::Constraint(ConstraintKind Kind, Type First, Type Second, Type Third,
                        ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
     : Kind(Kind), HasRestriction(false), IsActive(false), IsDisabled(false),
-      RememberChoice(false), IsFavored(false),
+      IsDisabledForPerformance(false), RememberChoice(false), IsFavored(false),
       NumTypeVariables(typeVars.size()), Types{First, Second, Third},
       Locator(locator) {
   switch (Kind) {
@@ -116,6 +125,7 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second, Type Third,
   case ConstraintKind::OperatorArgumentConversion:
   case ConstraintKind::ConformsTo:
   case ConstraintKind::LiteralConformsTo:
+  case ConstraintKind::TransitivelyConformsTo:
   case ConstraintKind::CheckedCast:
   case ConstraintKind::SelfObjectOfProtocol:
   case ConstraintKind::DynamicTypeOf:
@@ -123,13 +133,21 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second, Type Third,
   case ConstraintKind::OpenedExistentialOf:
   case ConstraintKind::OptionalObject:
   case ConstraintKind::ApplicableFunction:
+  case ConstraintKind::DynamicCallableApplicableFunction:
   case ConstraintKind::ValueMember:
+  case ConstraintKind::ValueWitness:
   case ConstraintKind::UnresolvedValueMember:
   case ConstraintKind::Defaultable:
   case ConstraintKind::BindOverload:
   case ConstraintKind::Disjunction:
   case ConstraintKind::FunctionInput:
   case ConstraintKind::FunctionResult:
+  case ConstraintKind::OpaqueUnderlyingType:
+  case ConstraintKind::OneWayEqual:
+  case ConstraintKind::OneWayBindParam:
+  case ConstraintKind::DefaultClosureType:
+  case ConstraintKind::UnresolvedMemberChainBase:
+  case ConstraintKind::PropertyWrapper:
     llvm_unreachable("Wrong constructor");
 
   case ConstraintKind::KeyPath:
@@ -145,13 +163,13 @@ Constraint::Constraint(ConstraintKind Kind, Type First, Type Second, Type Third,
 }
 
 Constraint::Constraint(ConstraintKind kind, Type first, Type second,
-                       DeclName member, DeclContext *useDC,
+                       DeclNameRef member, DeclContext *useDC,
                        FunctionRefKind functionRefKind,
                        ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
     : Kind(kind), HasRestriction(false), IsActive(false), IsDisabled(false),
-      RememberChoice(false), IsFavored(false),
-      NumTypeVariables(typeVars.size()), Member{first, second, member, useDC},
+      IsDisabledForPerformance(false), RememberChoice(false), IsFavored(false),
+      NumTypeVariables(typeVars.size()), Member{first, second, {member}, useDC},
       Locator(locator) {
   assert(kind == ConstraintKind::ValueMember ||
          kind == ConstraintKind::UnresolvedValueMember);
@@ -163,12 +181,34 @@ Constraint::Constraint(ConstraintKind kind, Type first, Type second,
   std::copy(typeVars.begin(), typeVars.end(), getTypeVariablesBuffer().begin());
 }
 
-Constraint::Constraint(Type type, OverloadChoice choice, DeclContext *useDC,
+Constraint::Constraint(ConstraintKind kind, Type first, Type second,
+                       ValueDecl *requirement, DeclContext *useDC,
+                       FunctionRefKind functionRefKind,
                        ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
-    : Kind(ConstraintKind::BindOverload), HasRestriction(false),
-      IsActive(false), IsDisabled(false), RememberChoice(false),
-      IsFavored(false),
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
+    : Kind(kind), HasRestriction(false), IsActive(false), IsDisabled(false),
+      IsDisabledForPerformance(false), RememberChoice(false), IsFavored(false),
+      NumTypeVariables(typeVars.size()), Locator(locator) {
+  Member.First = first;
+  Member.Second = second;
+  Member.Member.Ref = requirement;
+  Member.UseDC = useDC;
+  TheFunctionRefKind = static_cast<unsigned>(functionRefKind);
+
+  assert(kind == ConstraintKind::ValueWitness);
+  assert(getFunctionRefKind() == functionRefKind);
+  assert(requirement && "Value witness constraint has no requirement");
+  assert(useDC && "Member constraint has no use DC");
+
+  std::copy(typeVars.begin(), typeVars.end(), getTypeVariablesBuffer().begin());
+}
+
+Constraint::Constraint(Type type, OverloadChoice choice, DeclContext *useDC,
+                       ConstraintFix *fix, ConstraintLocator *locator,
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
+    : Kind(ConstraintKind::BindOverload), TheFix(fix), HasRestriction(false),
+      IsActive(false), IsDisabled(bool(fix)), IsDisabledForPerformance(false),
+      RememberChoice(false), IsFavored(false),
       NumTypeVariables(typeVars.size()), Overload{type, choice, useDC},
       Locator(locator) {
   std::copy(typeVars.begin(), typeVars.end(), getTypeVariablesBuffer().begin());
@@ -177,10 +217,10 @@ Constraint::Constraint(Type type, OverloadChoice choice, DeclContext *useDC,
 Constraint::Constraint(ConstraintKind kind,
                        ConversionRestrictionKind restriction, Type first,
                        Type second, ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
     : Kind(kind), Restriction(restriction), HasRestriction(true),
-      IsActive(false), IsDisabled(false), RememberChoice(false),
-      IsFavored(false),
+      IsActive(false), IsDisabled(false), IsDisabledForPerformance(false),
+      RememberChoice(false), IsFavored(false),
       NumTypeVariables(typeVars.size()), Types{first, second, Type()},
       Locator(locator) {
   assert(!first.isNull());
@@ -190,9 +230,10 @@ Constraint::Constraint(ConstraintKind kind,
 
 Constraint::Constraint(ConstraintKind kind, ConstraintFix *fix, Type first,
                        Type second, ConstraintLocator *locator,
-                       ArrayRef<TypeVariableType *> typeVars)
+                       SmallPtrSetImpl<TypeVariableType *> &typeVars)
     : Kind(kind), TheFix(fix), HasRestriction(false), IsActive(false),
-      IsDisabled(false), RememberChoice(false), IsFavored(false),
+      IsDisabled(false), IsDisabledForPerformance(false), RememberChoice(false),
+      IsFavored(false),
       NumTypeVariables(typeVars.size()), Types{first, second, Type()},
       Locator(locator) {
   assert(!first.isNull());
@@ -203,7 +244,8 @@ Constraint::Constraint(ConstraintKind kind, ConstraintFix *fix, Type first,
 ProtocolDecl *Constraint::getProtocol() const {
   assert((Kind == ConstraintKind::ConformsTo ||
           Kind == ConstraintKind::LiteralConformsTo ||
-          Kind == ConstraintKind::SelfObjectOfProtocol)
+          Kind == ConstraintKind::SelfObjectOfProtocol ||
+          Kind == ConstraintKind::TransitivelyConformsTo)
           && "Not a conformance constraint");
   return Types.Second->castTo<ProtocolType>()->getDecl();
 }
@@ -221,17 +263,29 @@ Constraint *Constraint::clone(ConstraintSystem &cs) const {
   case ConstraintKind::OperatorArgumentConversion:
   case ConstraintKind::ConformsTo:
   case ConstraintKind::LiteralConformsTo:
+  case ConstraintKind::TransitivelyConformsTo:
   case ConstraintKind::CheckedCast:
   case ConstraintKind::DynamicTypeOf:
   case ConstraintKind::EscapableFunctionOf:
   case ConstraintKind::OpenedExistentialOf:
   case ConstraintKind::SelfObjectOfProtocol:
-  case ConstraintKind::ApplicableFunction:
+  case ConstraintKind::DynamicCallableApplicableFunction:
   case ConstraintKind::OptionalObject:
   case ConstraintKind::Defaultable:
   case ConstraintKind::FunctionInput:
   case ConstraintKind::FunctionResult:
+  case ConstraintKind::OpaqueUnderlyingType:
+  case ConstraintKind::OneWayEqual:
+  case ConstraintKind::OneWayBindParam:
+  case ConstraintKind::DefaultClosureType:
+  case ConstraintKind::UnresolvedMemberChainBase:
+  case ConstraintKind::PropertyWrapper:
     return create(cs, getKind(), getFirstType(), getSecondType(), getLocator());
+
+  case ConstraintKind::ApplicableFunction:
+    return createApplicableFunction(
+        cs, getFirstType(), getSecondType(), getTrailingClosureMatching(),
+        getLocator());
 
   case ConstraintKind::BindOverload:
     return createBindOverload(cs, getFirstType(), getOverloadChoice(),
@@ -242,6 +296,11 @@ Constraint *Constraint::clone(ConstraintSystem &cs) const {
     return createMember(cs, getKind(), getFirstType(), getSecondType(),
                         getMember(), getMemberUseDC(), getFunctionRefKind(),
                         getLocator());
+
+  case ConstraintKind::ValueWitness:
+    return createValueWitness(
+        cs, getKind(), getFirstType(), getSecondType(), getRequirement(),
+        getMemberUseDC(), getFunctionRefKind(), getLocator());
 
   case ConstraintKind::Disjunction:
     return createDisjunction(cs, getNestedConstraints(), getLocator());
@@ -256,6 +315,10 @@ Constraint *Constraint::clone(ConstraintSystem &cs) const {
 }
 
 void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
+  // Print all type variables as $T0 instead of _ here.
+  PrintOptions PO;
+  PO.PrintTypesForDebugging = true;
+  
   if (Kind == ConstraintKind::Disjunction) {
     Out << "disjunction";
     if (shouldRememberChoice())
@@ -265,19 +328,23 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
       Locator->dump(sm, Out);
       Out << "]]";
     }
-    Out << ":";
+    Out << ":\n";
 
     interleave(getNestedConstraints(),
                [&](Constraint *constraint) {
                  if (constraint->isDisabled())
-                   Out << "[disabled] ";
+                   Out << ">  [disabled] ";
+                 else if (constraint->isFavored())
+                   Out << ">  [favored]  ";
+                 else
+                   Out << ">             ";
                  constraint->print(Out, sm);
                },
-               [&] { Out << " or "; });
+               [&] { Out << "\n"; });
     return;
   }
 
-  getFirstType()->print(Out);
+  Out << getFirstType()->getString(PO);
 
   bool skipSecond = false;
 
@@ -288,31 +355,46 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
   case ConstraintKind::BindToPointerType: Out << " bind to pointer "; break;
   case ConstraintKind::Subtype: Out << " subtype "; break;
   case ConstraintKind::Conversion: Out << " conv "; break;
+  case ConstraintKind::OpaqueUnderlyingType: Out << " underlying type of opaque "; break;
   case ConstraintKind::BridgingConversion: Out << " bridging conv "; break;
   case ConstraintKind::ArgumentConversion: Out << " arg conv "; break;
   case ConstraintKind::OperatorArgumentConversion:
       Out << " operator arg conv "; break;
   case ConstraintKind::ConformsTo: Out << " conforms to "; break;
   case ConstraintKind::LiteralConformsTo: Out << " literal conforms to "; break;
+  case ConstraintKind::TransitivelyConformsTo: Out << " transitive conformance to "; break;
   case ConstraintKind::CheckedCast: Out << " checked cast to "; break;
   case ConstraintKind::SelfObjectOfProtocol: Out << " Self type of "; break;
   case ConstraintKind::ApplicableFunction: Out << " applicable fn "; break;
+  case ConstraintKind::DynamicCallableApplicableFunction:
+      Out << " dynamic callable applicable fn "; break;
   case ConstraintKind::DynamicTypeOf: Out << " dynamicType type of "; break;
   case ConstraintKind::EscapableFunctionOf: Out << " @escaping type of "; break;
   case ConstraintKind::OpenedExistentialOf: Out << " opened archetype of "; break;
+  case ConstraintKind::OneWayEqual: Out << " one-way bind to "; break;
+  case ConstraintKind::OneWayBindParam: Out << " one-way bind param to "; break;
+  case ConstraintKind::DefaultClosureType:
+    Out << " closure can default to ";
+    break;
+  case ConstraintKind::UnresolvedMemberChainBase:
+    Out << " unresolved member chain base ";
+    break;
+  case ConstraintKind::PropertyWrapper:
+    Out << " property wrapper with wrapped value of ";
+    break;
   case ConstraintKind::KeyPath:
       Out << " key path from ";
-      getSecondType()->print(Out);
+      Out << getSecondType()->getString(PO);
       Out << " -> ";
-      getThirdType()->print(Out);
+      Out << getThirdType()->getString(PO);
       skipSecond = true;
       break;
 
   case ConstraintKind::KeyPathApplication:
       Out << " key path projecting ";
-      getSecondType()->print(Out);
+      Out << getSecondType()->getString(PO);
       Out << " -> ";
-      getThirdType()->print(Out);
+      Out << getThirdType()->getString(PO);
       skipSecond = true;
       break;
   case ConstraintKind::OptionalObject:
@@ -328,9 +410,6 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
       auto decl = overload.getDecl();
       decl->dumpRef(Out);
       Out << " : " << decl->getInterfaceType();
-      if (!sm || !decl->getLoc().isValid()) return;
-      Out << " at ";
-      decl->getLoc().print(Out, *sm);
     };
 
     switch (overload.getKind()) {
@@ -351,10 +430,8 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
       printDecl();
       break;
     case OverloadChoiceKind::DynamicMemberLookup:
+    case OverloadChoiceKind::KeyPathDynamicMemberLookup:
       Out << "dynamic member lookup '" << overload.getName() << "'";
-      break;
-    case OverloadChoiceKind::BaseType:
-      Out << "base type";
       break;
     case OverloadChoiceKind::TupleIndex:
       Out << "tuple index " << overload.getTupleIndex();
@@ -369,11 +446,20 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
   }
 
   case ConstraintKind::ValueMember:
-    Out << "[." << Member.Member << ": value] == ";
+    Out << "[." << getMember() << ": value] == ";
     break;
   case ConstraintKind::UnresolvedValueMember:
-    Out << "[(implicit) ." << Member.Member << ": value] == ";
+    Out << "[(implicit) ." << getMember() << ": value] == ";
     break;
+
+  case ConstraintKind::ValueWitness: {
+    auto requirement = getRequirement();
+    auto selfNominal = requirement->getDeclContext()->getSelfNominalTypeDecl();
+    Out << "[." << selfNominal->getName() << "::" << requirement->getName()
+        << ": witness] == ";
+    break;
+  }
+
   case ConstraintKind::Defaultable:
     Out << " can default to ";
     break;
@@ -382,10 +468,24 @@ void Constraint::print(llvm::raw_ostream &Out, SourceManager *sm) const {
   }
 
   if (!skipSecond)
-    getSecondType()->print(Out);
+    Out << getSecondType()->getString(PO);
 
   if (auto restriction = getRestriction()) {
     Out << ' ' << getName(*restriction);
+  }
+
+  if (getKind() == ConstraintKind::ApplicableFunction) {
+    if (auto trailingClosureMatching = getTrailingClosureMatching()) {
+      switch (*trailingClosureMatching) {
+      case TrailingClosureMatching::Forward:
+        Out << " [forward scan]";
+        break;
+
+      case TrailingClosureMatching::Backward:
+        Out << " [backward scan]";
+        break;
+      }
+    }
   }
 
   if (auto *fix = getFix()) {
@@ -406,9 +506,6 @@ void Constraint::dump(SourceManager *sm) const {
 }
 
 void Constraint::dump(ConstraintSystem *CS) const {
-  // Print all type variables as $T0 instead of _ here.
-  llvm::SaveAndRestore<bool> X(CS->getASTContext().LangOpts.
-                               DebugConstraintSolver, true);
   // Disable MSVC warning: only for use within the debugger.
 #if SWIFT_COMPILER_IS_MSVC
 #pragma warning(push)
@@ -423,14 +520,10 @@ void Constraint::dump(ConstraintSystem *CS) const {
 
 StringRef swift::constraints::getName(ConversionRestrictionKind kind) {
   switch (kind) {
-  case ConversionRestrictionKind::TupleToTuple:
-    return "[tuple-to-tuple]";
   case ConversionRestrictionKind::DeepEquality:
     return "[deep equality]";
   case ConversionRestrictionKind::Superclass:
     return "[superclass]";
-  case ConversionRestrictionKind::LValueToRValue:
-    return "[lvalue-to-rvalue]";
   case ConversionRestrictionKind::Existential:
     return "[existential]";
   case ConversionRestrictionKind::MetatypeToExistentialMetatype:
@@ -467,6 +560,10 @@ StringRef swift::constraints::getName(ConversionRestrictionKind kind) {
     return "[cf-toll-free-bridge-to-objc]";
   case ConversionRestrictionKind::ObjCTollFreeBridgeToCF:
     return "[objc-toll-free-bridge-to-cf]";
+  case ConversionRestrictionKind::CGFloatToDouble:
+    return "[CGFloat-to-Double]";
+  case ConversionRestrictionKind::DoubleToCGFloat:
+    return "[Double-to-CGFloat]";
   }
   llvm_unreachable("bad conversion restriction kind");
 }
@@ -474,7 +571,7 @@ StringRef swift::constraints::getName(ConversionRestrictionKind kind) {
 /// Recursively gather the set of type variables referenced by this constraint.
 static void
 gatherReferencedTypeVars(Constraint *constraint,
-                         SmallVectorImpl<TypeVariableType *> &typeVars) {
+                         SmallPtrSetImpl<TypeVariableType *> &typeVars) {
   switch (constraint->getKind()) {
   case ConstraintKind::Disjunction:
     for (auto nested : constraint->getNestedConstraints())
@@ -487,6 +584,7 @@ gatherReferencedTypeVars(Constraint *constraint,
     LLVM_FALLTHROUGH;
 
   case ConstraintKind::ApplicableFunction:
+  case ConstraintKind::DynamicCallableApplicableFunction:
   case ConstraintKind::Bind:
   case ConstraintKind::BindParam:
   case ConstraintKind::BindToPointerType:
@@ -499,6 +597,7 @@ gatherReferencedTypeVars(Constraint *constraint,
   case ConstraintKind::Subtype:
   case ConstraintKind::UnresolvedValueMember:
   case ConstraintKind::ValueMember:
+  case ConstraintKind::ValueWitness:
   case ConstraintKind::DynamicTypeOf:
   case ConstraintKind::EscapableFunctionOf:
   case ConstraintKind::OpenedExistentialOf:
@@ -506,9 +605,16 @@ gatherReferencedTypeVars(Constraint *constraint,
   case ConstraintKind::Defaultable:
   case ConstraintKind::ConformsTo:
   case ConstraintKind::LiteralConformsTo:
+  case ConstraintKind::TransitivelyConformsTo:
   case ConstraintKind::SelfObjectOfProtocol:
   case ConstraintKind::FunctionInput:
   case ConstraintKind::FunctionResult:
+  case ConstraintKind::OpaqueUnderlyingType:
+  case ConstraintKind::OneWayEqual:
+  case ConstraintKind::OneWayBindParam:
+  case ConstraintKind::DefaultClosureType:
+  case ConstraintKind::UnresolvedMemberChainBase:
+  case ConstraintKind::PropertyWrapper:
     constraint->getFirstType()->getTypeVariables(typeVars);
     constraint->getSecondType()->getTypeVariables(typeVars);
     break;
@@ -525,41 +631,42 @@ gatherReferencedTypeVars(Constraint *constraint,
   }
 }
 
-/// Unique the given set of type variables.
-static void uniqueTypeVariables(SmallVectorImpl<TypeVariableType *> &typeVars) {
-  // Remove any duplicate type variables.
-  llvm::SmallPtrSet<TypeVariableType *, 4> knownTypeVars;
-  typeVars.erase(std::remove_if(typeVars.begin(), typeVars.end(),
-                                [&](TypeVariableType *typeVar) {
-                                  return !knownTypeVars.insert(typeVar).second;
-                                }),
-                 typeVars.end());
+unsigned Constraint::countResolvedArgumentTypes(ConstraintSystem &cs) const {
+  auto *argumentFuncType = cs.getAppliedDisjunctionArgumentFunction(this);
+  if (!argumentFuncType)
+    return 0;
+
+  return llvm::count_if(argumentFuncType->getParams(), [&](const AnyFunctionType::Param arg) {
+    auto argType = cs.getFixedTypeRecursive(arg.getPlainType(), /*wantRValue=*/true);
+    return !argType->isTypeVariableOrMember();
+  });
 }
 
 bool Constraint::isExplicitConversion() const {
   assert(Kind == ConstraintKind::Disjunction);
 
-  if (auto *locator = getLocator()) {
-    if (auto anchor = locator->getAnchor())
-      return isa<CoerceExpr>(anchor);
-  }
+  if (auto *locator = getLocator())
+    return isExpr<CoerceExpr>(locator->getAnchor());
 
   return false;
 }
 
 Constraint *Constraint::create(ConstraintSystem &cs, ConstraintKind kind, 
                                Type first, Type second,
-                               ConstraintLocator *locator) {
+                               ConstraintLocator *locator,
+                               ArrayRef<TypeVariableType *> extraTypeVars) {
   // Collect type variables.
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   if (first->hasTypeVariable())
     first->getTypeVariables(typeVars);
   if (second && second->hasTypeVariable())
     second->getTypeVariables(typeVars);
-  uniqueTypeVariables(typeVars);
+
+  typeVars.insert(extraTypeVars.begin(), extraTypeVars.end());
 
   // Conformance constraints expect an existential on the right-hand side.
   assert((kind != ConstraintKind::ConformsTo &&
+          kind != ConstraintKind::TransitivelyConformsTo &&
           kind != ConstraintKind::SelfObjectOfProtocol) ||
          second->isExistentialType());
 
@@ -575,17 +682,18 @@ Constraint *Constraint::create(ConstraintSystem &cs, ConstraintKind kind,
 
 Constraint *Constraint::create(ConstraintSystem &cs, ConstraintKind kind,
                                Type first, Type second, Type third,
-                               ConstraintLocator *locator) {
+                               ConstraintLocator *locator,
+                               ArrayRef<TypeVariableType *> extraTypeVars) {
   // Collect type variables.
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars(extraTypeVars.begin(),
+                                              extraTypeVars.end());
   if (first->hasTypeVariable())
     first->getTypeVariables(typeVars);
   if (second->hasTypeVariable())
     second->getTypeVariables(typeVars);
   if (third->hasTypeVariable())
     third->getTypeVariables(typeVars);
-  uniqueTypeVariables(typeVars);
-  
+
   unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
   void *mem = cs.getAllocator().Allocate(size, alignof(Constraint));
   return ::new (mem) Constraint(kind,
@@ -595,7 +703,7 @@ Constraint *Constraint::create(ConstraintSystem &cs, ConstraintKind kind,
 
 Constraint *Constraint::createMemberOrOuterDisjunction(
     ConstraintSystem &cs, ConstraintKind kind, Type first, Type second,
-    DeclName member, DeclContext *useDC, FunctionRefKind functionRefKind,
+    DeclNameRef member, DeclContext *useDC, FunctionRefKind functionRefKind,
     ArrayRef<OverloadChoice> outerAlternatives, ConstraintLocator *locator) {
   auto memberConstraint = createMember(cs, kind, first, second, member,
                              useDC, functionRefKind, locator);
@@ -614,17 +722,16 @@ Constraint *Constraint::createMemberOrOuterDisjunction(
 }
 
 Constraint *Constraint::createMember(ConstraintSystem &cs, ConstraintKind kind, 
-                                     Type first, Type second, DeclName member,
-                                     DeclContext *useDC,
+                                     Type first, Type second,
+                                     DeclNameRef member, DeclContext *useDC,
                                      FunctionRefKind functionRefKind,
                                      ConstraintLocator *locator) {
   // Collect type variables.
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   if (first->hasTypeVariable())
     first->getTypeVariables(typeVars);
   if (second->hasTypeVariable())
     second->getTypeVariables(typeVars);
-  uniqueTypeVariables(typeVars);
 
   // Create the constraint.
   unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
@@ -633,22 +740,31 @@ Constraint *Constraint::createMember(ConstraintSystem &cs, ConstraintKind kind,
                               functionRefKind, locator, typeVars);
 }
 
-Constraint *Constraint::createBindOverload(ConstraintSystem &cs, Type type, 
-                                           OverloadChoice choice, 
-                                           DeclContext *useDC,
-                                           ConstraintLocator *locator) {
+Constraint *Constraint::createValueWitness(
+    ConstraintSystem &cs, ConstraintKind kind, Type first, Type second,
+    ValueDecl *requirement, DeclContext *useDC,
+    FunctionRefKind functionRefKind, ConstraintLocator *locator) {
+  assert(kind == ConstraintKind::ValueWitness);
+
   // Collect type variables.
-  SmallVector<TypeVariableType *, 4> typeVars;
-  if (type->hasTypeVariable())
-    type->getTypeVariables(typeVars);
-  if (auto baseType = choice.getBaseType()) {
-    baseType->getTypeVariables(typeVars);
-  }
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
+  if (first->hasTypeVariable())
+    first->getTypeVariables(typeVars);
+  if (second->hasTypeVariable())
+    second->getTypeVariables(typeVars);
 
   // Create the constraint.
   unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
   void *mem = cs.getAllocator().Allocate(size, alignof(Constraint));
-  return new (mem) Constraint(type, choice, useDC, locator, typeVars);
+  return new (mem) Constraint(kind, first, second, requirement, useDC,
+                              functionRefKind, locator, typeVars);
+}
+
+Constraint *Constraint::createBindOverload(ConstraintSystem &cs, Type type, 
+                                           OverloadChoice choice, 
+                                           DeclContext *useDC,
+                                           ConstraintLocator *locator) {
+  return createFixedChoice(cs, type, choice, useDC, /*fix=*/nullptr, locator);
 }
 
 Constraint *Constraint::createRestricted(ConstraintSystem &cs, 
@@ -657,12 +773,11 @@ Constraint *Constraint::createRestricted(ConstraintSystem &cs,
                                          Type first, Type second, 
                                          ConstraintLocator *locator) {
   // Collect type variables.
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   if (first->hasTypeVariable())
     first->getTypeVariables(typeVars);
   if (second->hasTypeVariable())
     second->getTypeVariables(typeVars);
-  uniqueTypeVariables(typeVars);
 
   // Create the constraint.
   unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
@@ -675,17 +790,35 @@ Constraint *Constraint::createFixed(ConstraintSystem &cs, ConstraintKind kind,
                                     ConstraintFix *fix, Type first, Type second,
                                     ConstraintLocator *locator) {
   // Collect type variables.
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   if (first->hasTypeVariable())
     first->getTypeVariables(typeVars);
   if (second->hasTypeVariable())
     second->getTypeVariables(typeVars);
-  uniqueTypeVariables(typeVars);
 
   // Create the constraint.
   unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
   void *mem = cs.getAllocator().Allocate(size, alignof(Constraint));
   return new (mem) Constraint(kind, fix, first, second, locator, typeVars);
+}
+
+Constraint *Constraint::createFixedChoice(ConstraintSystem &cs, Type type,
+                                          OverloadChoice choice,
+                                          DeclContext *useDC,
+                                          ConstraintFix *fix,
+                                          ConstraintLocator *locator) {
+  // Collect type variables.
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
+  if (type->hasTypeVariable())
+    type->getTypeVariables(typeVars);
+  if (auto baseType = choice.getBaseType()) {
+    baseType->getTypeVariables(typeVars);
+  }
+
+  // Create the constraint.
+  unsigned size = totalSizeToAlloc<TypeVariableType *>(typeVars.size());
+  void *mem = cs.getAllocator().Allocate(size, alignof(Constraint));
+  return new (mem) Constraint(type, choice, useDC, fix, locator, typeVars);
 }
 
 Constraint *Constraint::createDisjunction(ConstraintSystem &cs,
@@ -694,7 +827,7 @@ Constraint *Constraint::createDisjunction(ConstraintSystem &cs,
                                           RememberChoice_t rememberChoice) {
   // Unwrap any disjunctions inside the disjunction constraint; we only allow
   // disjunctions at the top level.
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   bool unwrappedAny = false;
   SmallVector<Constraint *, 1> unwrapped;
   unsigned index = 0;
@@ -753,13 +886,60 @@ Constraint *Constraint::createDisjunction(ConstraintSystem &cs,
 #endif
 
   // Create the disjunction constraint.
-  uniqueTypeVariables(typeVars);
   unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
   void *mem = cs.getAllocator().Allocate(size, alignof(Constraint));
   auto disjunction =  new (mem) Constraint(ConstraintKind::Disjunction,
                               cs.allocateCopy(constraints), locator, typeVars);
   disjunction->RememberChoice = (bool) rememberChoice;
   return disjunction;
+}
+
+Constraint *Constraint::createApplicableFunction(
+    ConstraintSystem &cs, Type argumentFnType, Type calleeType,
+    Optional<TrailingClosureMatching> trailingClosureMatching,
+    ConstraintLocator *locator) {
+  // Collect type variables.
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
+  if (argumentFnType->hasTypeVariable())
+    argumentFnType->getTypeVariables(typeVars);
+  if (calleeType->hasTypeVariable())
+    calleeType->getTypeVariables(typeVars);
+
+  // Create the constraint.
+  unsigned size = totalSizeToAlloc<TypeVariableType*>(typeVars.size());
+  void *mem = cs.getAllocator().Allocate(size, alignof(Constraint));
+  auto constraint = new (mem) Constraint(
+      ConstraintKind::ApplicableFunction, argumentFnType, calleeType, locator,
+      typeVars);
+
+  // Encode the trailing closure matching.
+  if (trailingClosureMatching) {
+    switch (*trailingClosureMatching) {
+      case TrailingClosureMatching::Forward:
+        constraint->trailingClosureMatching = 1;
+        break;
+
+      case TrailingClosureMatching::Backward:
+        constraint->trailingClosureMatching = 2;
+        break;
+    }
+  } else {
+    constraint->trailingClosureMatching = 0;
+  }
+
+  return constraint;
+}
+
+Optional<TrailingClosureMatching>
+Constraint::getTrailingClosureMatching() const {
+  assert(Kind == ConstraintKind::ApplicableFunction);
+  switch (trailingClosureMatching) {
+  case 0: return None;
+  case 1: return TrailingClosureMatching::Forward;
+  case 2: return TrailingClosureMatching::Backward;
+  }
+
+  llvm_unreachable("Bad trailing closure matching value");
 }
 
 void *Constraint::operator new(size_t bytes, ConstraintSystem& cs,

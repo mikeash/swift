@@ -10,29 +10,55 @@
 #
 # ----------------------------------------------------------------------------
 
+from .benchmarks import Benchmarks
 from .cmark import CMark
+from .earlyswiftdriver import EarlySwiftDriver
 from .foundation import Foundation
+from .indexstoredb import IndexStoreDB
+from .libcxx import LibCXX
 from .libdispatch import LibDispatch
 from .libicu import LibICU
 from .llbuild import LLBuild
 from .lldb import LLDB
 from .llvm import LLVM
 from .ninja import Ninja
+from .playgroundsupport import PlaygroundSupport
+from .skstresstester import SKStressTester
+from .sourcekitlsp import SourceKitLSP
 from .swift import Swift
+from .swiftdriver import SwiftDriver
+from .swiftevolve import SwiftEvolve
+from .swiftformat import SwiftFormat
+from .swiftinspect import SwiftInspect
 from .swiftpm import SwiftPM
+from .swiftsyntax import SwiftSyntax
+from .tsan_libdispatch import TSanLibDispatch
 from .xctest import XCTest
 
 __all__ = [
     'CMark',
     'Ninja',
     'Foundation',
+    'LibCXX',
     'LibDispatch',
     'LibICU',
     'LLBuild',
     'LLDB',
     'LLVM',
     'Ninja',
+    'PlaygroundSupport',
     'Swift',
+    'SwiftFormat',
+    'SwiftInspect',
     'SwiftPM',
+    'SwiftDriver',
+    'EarlySwiftDriver',
     'XCTest',
+    'SwiftSyntax',
+    'SKStressTester',
+    'SwiftEvolve',
+    'IndexStoreDB',
+    'SourceKitLSP',
+    'Benchmarks',
+    'TSanLibDispatch',
 ]

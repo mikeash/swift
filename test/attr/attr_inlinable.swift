@@ -1,7 +1,7 @@
-// RUN: %target-typecheck-verify-swift -swift-version 4.2
-// RUN: %target-typecheck-verify-swift -swift-version 4.2 -enable-testing
-// RUN: %target-typecheck-verify-swift -swift-version 4.2 -enable-resilience
-// RUN: %target-typecheck-verify-swift -swift-version 4.2 -enable-resilience -enable-testing
+// RUN: %target-typecheck-verify-swift -swift-version 5
+// RUN: %target-typecheck-verify-swift -swift-version 5 -enable-testing
+// RUN: %target-typecheck-verify-swift -swift-version 5 -enable-library-evolution
+// RUN: %target-typecheck-verify-swift -swift-version 5 -enable-library-evolution -enable-testing
 @inlinable struct TestInlinableStruct {}
 // expected-error@-1 {{'@inlinable' attribute cannot be applied to this declaration}}
 
@@ -9,18 +9,20 @@
 // expected-warning@-1 {{'@inlinable' declaration is already '@usableFromInline'}}
 
 private func privateFunction() {}
-// expected-note@-1{{global function 'privateFunction()' is not '@usableFromInline' or public}}
+// expected-note@-1 2{{global function 'privateFunction()' is not '@usableFromInline' or public}}
 fileprivate func fileprivateFunction() {}
 // expected-note@-1{{global function 'fileprivateFunction()' is not '@usableFromInline' or public}}
 func internalFunction() {}
-// expected-note@-1{{global function 'internalFunction()' is not '@usableFromInline' or public}}
+// expected-note@-1 2{{global function 'internalFunction()' is not '@usableFromInline' or public}}
 @usableFromInline func versionedFunction() {}
 public func publicFunction() {}
 
 private struct PrivateStruct {}
-// expected-note@-1 3{{struct 'PrivateStruct' is not '@usableFromInline' or public}}
+// expected-note@-1 5{{struct 'PrivateStruct' is not '@usableFromInline' or public}}
+// expected-note@-2 2{{initializer 'init()' is not '@usableFromInline' or public}}
 struct InternalStruct {}
-// expected-note@-1 4{{struct 'InternalStruct' is not '@usableFromInline' or public}}
+// expected-note@-1 3{{struct 'InternalStruct' is not '@usableFromInline' or public}}
+// expected-note@-2 {{initializer 'init()' is not '@usableFromInline' or public}}
 @usableFromInline struct VersionedStruct {
   @usableFromInline init() {}
 }
@@ -75,20 +77,10 @@ public struct Struct {
     let _ = VersionedStruct()
     let _ = InternalStruct()
     // expected-error@-1 {{struct 'InternalStruct' is internal and cannot be referenced from an '@inlinable' function}}
+    // expected-error@-2 {{initializer 'init()' is internal and cannot be referenced from an '@inlinable' function}}
     let _ = PrivateStruct()
     // expected-error@-1 {{struct 'PrivateStruct' is private and cannot be referenced from an '@inlinable' function}}
-  }
-
-  @inline(__always)
-  public func publicInlineAlwaysMethod(x: Any) {
-    struct Nested {}
-    // expected-error@-1 {{type 'Nested' cannot be nested inside an '@inline(__always)' function}}
-
-    switch x {
-      case is InternalStruct:
-      // expected-error@-1 {{struct 'InternalStruct' is internal and cannot be referenced from an '@inline(__always)' function}}
-        _ = ()
-    }
+    // expected-error@-2 {{initializer 'init()' is private and cannot be referenced from an '@inlinable' function}}
   }
 
   private func privateMethod() {}
@@ -109,13 +101,6 @@ public struct Struct {
     // expected-error@-1 {{type 'Nested' cannot be nested inside an '@inlinable' function}}
   }
 
-  @inline(__always)
-  @usableFromInline
-  func versionedInlineAlwaysMethod() {
-    struct Nested {}
-    // expected-error@-1 {{type 'Nested' cannot be nested inside an '@inline(__always)' function}}
-  }
-
   @_transparent
   func internalTransparentMethod() {
     struct Nested {}
@@ -126,7 +111,7 @@ public struct Struct {
   private func privateInlinableMethod() {
   // expected-error@-2 {{'@inlinable' attribute can only be applied to public declarations, but 'privateInlinableMethod' is private}}
     struct Nested {}
-    // OK
+    // expected-error@-1 {{type 'Nested' cannot be nested inside an '@inlinable' function}}
   }
 
   @inline(__always)
@@ -162,21 +147,25 @@ enum InternalEnum {
   // expected-note@-1 2{{enum 'InternalEnum' is not '@usableFromInline' or public}}
   // expected-note@-2 {{type declared here}}
   case apple
+  // expected-note@-1 {{enum case 'apple' is not '@usableFromInline' or public}}
   case orange
+  // expected-note@-1 {{enum case 'orange' is not '@usableFromInline' or public}}
 }
 
 @inlinable public func usesInternalEnum() {
   _ = InternalEnum.apple
   // expected-error@-1 {{enum 'InternalEnum' is internal and cannot be referenced from an '@inlinable' function}}
+  // expected-error@-2 {{enum case 'apple' is internal and cannot be referenced from an '@inlinable' function}}
   let _: InternalEnum = .orange
   // expected-error@-1 {{enum 'InternalEnum' is internal and cannot be referenced from an '@inlinable' function}}
+  // expected-error@-2 {{enum case 'orange' is internal and cannot be referenced from an '@inlinable' function}}
 }
 
 @usableFromInline enum VersionedEnum {
   case apple
   case orange
   case pear(InternalEnum)
-  // expected-warning@-1 {{type of enum case in '@usableFromInline' enum should be '@usableFromInline' or public}}
+  // expected-error@-1 {{type of enum case in '@usableFromInline' enum must be '@usableFromInline' or public}}
   case persimmon(String)
 }
 
@@ -185,6 +174,7 @@ enum InternalEnum {
   let _: VersionedEnum = .orange
   _ = VersionedEnum.persimmon
 }
+
 
 // Inherited initializers - <rdar://problem/34398148>
 @usableFromInline
@@ -207,6 +197,7 @@ class Derived : Middle {
   }
 }
 
+
 // More inherited initializers
 @_fixed_layout
 public class Base2 {
@@ -227,9 +218,41 @@ class Derived2 : Middle2 {
   }
 }
 
+
+// Even more inherited initializers - https://bugs.swift.org/browse/SR-10940
+@_fixed_layout
+public class Base3 {}
+// expected-note@-1 {{initializer 'init()' is not '@usableFromInline' or public}}
+
+@_fixed_layout
+public class Derived3 : Base3 {
+  @inlinable
+  public init(_: Int) {}
+  // expected-error@-1 {{initializer 'init()' is internal and cannot be referenced from an '@inlinable' function}}
+  // expected-note@-2 {{call to unavailable initializer 'init()' from superclass 'Base3' occurs implicitly at the end of this initializer}}
+}
+
+@_fixed_layout
+public class Base4 {}
+
+@_fixed_layout
+@usableFromInline
+class Middle4 : Base4 {}
+// expected-note@-1 {{initializer 'init()' is not '@usableFromInline' or public}}
+
+@_fixed_layout
+@usableFromInline
+class Derived4 : Middle4 {
+  @inlinable
+  public init(_: Int) {}
+  // expected-error@-1 {{initializer 'init()' is internal and cannot be referenced from an '@inlinable' function}}
+  // expected-note@-2 {{call to unavailable initializer 'init()' from superclass 'Middle4' occurs implicitly at the end of this initializer}}
+}
+
+
 // Stored property initializer expressions.
 //
-// Note the behavior here does not depend on the state of the -enable-resilience
+// Note the behavior here does not depend on the state of the -enable-library-evolution
 // flag; the test runs with both the flag on and off. Only the explicit
 // presence of a '@_fixed_layout' attribute determines the behavior here.
 
@@ -250,12 +273,25 @@ public struct PublicResilientStructWithInit {
 private func privateIntReturningFunc() -> Int { return 0 }
 internal func internalIntReturningFunc() -> Int { return 0 }
 
-@_fixed_layout
+@frozen
 public struct PublicFixedStructWithInit {
-  var x = internalGlobal // expected-error {{let 'internalGlobal' is internal and cannot be referenced from a property initializer in a '@_fixed_layout' type}}
+  var x = internalGlobal // expected-error {{let 'internalGlobal' is internal and cannot be referenced from a property initializer in a '@frozen' type}}
   var y = publicGlobal // OK
+
+  // Static property initializers are not inlinable contexts.
   static var z = privateIntReturningFunc() // OK
   static var a = internalIntReturningFunc() // OK
+
+  // Test the same with a multi-statement closure, which introduces a
+  // new DeclContext.
+  static var zz: Int = {
+    let x = privateIntReturningFunc()
+    return x
+  }()
+  static var aa: Int = {
+    let x = internalIntReturningFunc()
+    return x
+  }()
 }
 
 public struct KeypathStruct {
@@ -266,4 +302,69 @@ public struct KeypathStruct {
     _ = \KeypathStruct.x
     // expected-error@-1 {{property 'x' is internal and cannot be referenced from an '@inlinable' function}}
   }
+}
+
+public struct HasInternalSetProperty {
+  public internal(set) var x: Int // expected-note {{setter for 'x' is not '@usableFromInline' or public}}
+
+  @inlinable public mutating func setsX() {
+    x = 10 // expected-error {{setter for 'x' is internal and cannot be referenced from an '@inlinable' function}}
+  }
+}
+
+@usableFromInline protocol P {
+  typealias T = Int
+}
+
+extension P {
+  @inlinable func f() {
+    _ = T.self // ok, typealias inherits @usableFromInline from P
+  }
+}
+
+// rdar://problem/60605117
+public struct PrivateInlinableCrash {
+  @inlinable // expected-error {{'@inlinable' attribute can only be applied to public declarations, but 'formatYesNo' is private}}
+  private func formatYesNo(_ value: Bool) -> String {
+    value ? "YES" : "NO"
+  }
+}
+
+// https://bugs.swift.org/browse/SR-12404
+@inlinable public func inlinableOuterFunction() {
+  func innerFunction1(x: () = privateFunction()) {}
+  // expected-error@-1 {{global function 'privateFunction()' is private and cannot be referenced from a default argument value}}
+
+  func innerFunction2(x: () = internalFunction()) {}
+  // expected-error@-1 {{global function 'internalFunction()' is internal and cannot be referenced from a default argument value}}
+
+  func innerFunction3(x: () = versionedFunction()) {}
+
+  func innerFunction4(x: () = publicFunction()) {}
+}
+
+// This is OK -- lazy property initializers are emitted inside the getter,
+// which is never @inlinable.
+@frozen public struct LazyField {
+  public lazy var y: () = privateFunction()
+
+  @inlinable private lazy var z: () = privateFunction()
+  // expected-error@-1 {{'@inlinable' attribute cannot be applied to stored properties}}
+}
+
+@inlinable public func nestedBraceStmtTest() {
+  if true {
+    let _: PrivateStruct = PrivateStruct()
+    // expected-error@-1 2{{struct 'PrivateStruct' is private and cannot be referenced from an '@inlinable' function}}
+    // expected-error@-2 {{initializer 'init()' is private and cannot be referenced from an '@inlinable' function}}
+  }
+}
+
+// Just make sure we don't crash.
+private func deferBodyTestCall() {} // expected-note {{global function 'deferBodyTestCall()' is not '@usableFromInline' or public}}
+@inlinable public func deferBodyTest() {
+  defer {
+    deferBodyTestCall() // expected-error {{global function 'deferBodyTestCall()' is private and cannot be referenced from an '@inlinable' function}}
+  }
+  _ = ()
 }

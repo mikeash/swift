@@ -24,6 +24,21 @@
 using namespace swift;
 using namespace swift::syntax;
 
+TriviaPiece TriviaPiece::fromText(TriviaKind kind, StringRef text) {
+  switch (kind) {
+% for trivia in TRIVIAS:
+  case TriviaKind::${trivia.name}:
+% if trivia.is_collection():
+    assert(text.size() % ${trivia.characters_len()} == 0);
+    return TriviaPiece(kind, text.size()/${trivia.characters_len()});
+% else:
+    return TriviaPiece(kind, OwnedString::makeRefCounted(text));
+% end
+% end
+  }
+  llvm_unreachable("Unhandled TriviaKind in switch");
+}
+
 void TriviaPiece::dump(llvm::raw_ostream &OS, unsigned Indent) const {
   for (decltype(Count) i = 0; i < Indent; ++i)
     OS << ' ';
@@ -44,7 +59,7 @@ void TriviaPiece::dump(llvm::raw_ostream &OS, unsigned Indent) const {
   OS << ')';
 }
 
-bool TriviaPiece::isComment() const {
+bool syntax::isCommentTriviaKind(TriviaKind Kind) {
   switch (Kind) {
 % for trivia in TRIVIAS:
   case TriviaKind::${trivia.name}:
@@ -56,22 +71,6 @@ bool TriviaPiece::isComment() const {
 % end
   }
   llvm_unreachable("unknown kind");
-}
-
-void TriviaPiece::accumulateAbsolutePosition(AbsolutePosition &Pos) const {
-  switch (Kind) {
-% for trivia in TRIVIAS:
-  case TriviaKind::${trivia.name}:
-% if not trivia.is_collection():
-    Pos.addText(Text.str());
-% elif trivia.is_new_line:
-    Pos.addNewlines(Count, ${trivia.characters_len()});
-% else:
-    Pos.addColumns(Count);
-% end
-  break;
-% end
-  }
 }
 
 bool TriviaPiece::trySquash(const TriviaPiece &Next) {

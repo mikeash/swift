@@ -10,10 +10,29 @@
 #
 # ----------------------------------------------------------------------------
 
+from . import cmark
+from . import foundation
+from . import libcxx
+from . import libdispatch
+from . import libicu
+from . import llvm
 from . import product
+from . import swift
 
 
 class XCTest(product.Product):
+    @classmethod
+    def is_build_script_impl_product(cls):
+        """is_build_script_impl_product -> bool
+
+        Whether this product is produced by build-script-impl.
+        """
+        return True
+
+    @classmethod
+    def is_before_build_script_impl_product(cls):
+        return False
+
     @classmethod
     def product_source_name(cls):
         """product_source_name() -> str
@@ -21,3 +40,17 @@ class XCTest(product.Product):
         The name of the source code directory of this product.
         """
         return "swift-corelibs-xctest"
+
+    @classmethod
+    def get_dependencies(cls):
+        return [cmark.CMark,
+                llvm.LLVM,
+                libcxx.LibCXX,
+                libicu.LibICU,
+                swift.Swift,
+                libdispatch.LibDispatch,
+                foundation.Foundation]
+
+    @classmethod
+    def is_nondarwin_only_build_product(cls):
+        return True
