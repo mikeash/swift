@@ -13,6 +13,7 @@
 import os
 import platform
 
+from . import cmake_product
 from . import cmark
 from . import foundation
 from . import libcxx
@@ -29,10 +30,10 @@ from .. import targets
 
 
 # Build against the current installed toolchain.
-class SwiftInspect(product.Product):
+class SwiftInspect(cmake_product.CMakeProduct):
     @classmethod
     def product_source_name(cls):
-        return "swift-inspect"
+     return os.path.join('swift', 'tools', 'swift-inspect')
 
     @classmethod
     def is_build_script_impl_product(cls):
@@ -46,7 +47,18 @@ class SwiftInspect(product.Product):
         return True
 
     def build(self, host_target):
-        run_build_script_helper(host_target, self, self.args)
+        build_variant = 'RelWithDebInfo'
+        self.cmake_options.define('CMAKE_BUILD_TYPE:STRING', build_variant)
+
+        (platform, arch) = host_target.split('-')
+
+        common_c_flags = ' '.join(self.common_cross_c_flags(platform, arch))
+        self.cmake_options.define('CMAKE_C_FLAGS', common_c_flags)
+        self.cmake_options.define('CMAKE_CXX_FLAGS', common_c_flags)
+        self.cmake_options.define('SWIFT_BUILD_DIR', self.args.install_destdir)
+
+        self.build_with_cmake(["swift-inspect"], build_variant, [],
+                              prefer_just_built_toolchain=True)
 
     def should_test(self, host_target):
         return self.args.test_swift_inspect
@@ -72,35 +84,36 @@ class SwiftInspect(product.Product):
                 swift.Swift,
                 libdispatch.LibDispatch,
                 foundation.Foundation,
-                xctest.XCTest,
-                llbuild.LLBuild,
-                swiftpm.SwiftPM]
+#                 xctest.XCTest,
+#                 llbuild.LLBuild,
+#                 swiftpm.SwiftPM
+                ]
 
 
-def run_build_script_helper(host_target, product, args):
-    toolchain_path = args.install_destdir
-    if platform.system() == 'Darwin':
-        # The prefix is an absolute path, so concatenate without os.path.
-        toolchain_path += \
-            targets.darwin_toolchain_prefix(args.install_prefix)
-
-    # Our source_dir is expected to be './$SOURCE_ROOT/benchmarks'. That is due
-    # the assumption that each product is in its own build directory. This
-    # product is not like that and has its package/tools instead in
-    # ./$SOURCE_ROOT/swift/benchmark.
-    package_path = os.path.join(product.source_dir,
-                                '..', 'swift', 'tools', 'swift-inspect')
-    package_path = os.path.abspath(package_path)
-
-    # We use a separate python helper to enable quicker iteration when working
-    # on this by avoiding going through build-script to test small changes.
-    helper_path = os.path.join(package_path, 'build_script_helper.py')
-
-    build_cmd = [
-        helper_path,
-        '--verbose',
-        '--package-path', package_path,
-        '--build-path', product.build_dir,
-        '--toolchain', toolchain_path,
-    ]
-    shell.call(build_cmd)
+# def run_build_script_helper(host_target, product, args):
+#     toolchain_path = args.install_destdir
+#     if platform.system() == 'Darwin':
+#         # The prefix is an absolute path, so concatenate without os.path.
+#         toolchain_path += \
+#             targets.darwin_toolchain_prefix(args.install_prefix)
+# 
+#     # Our source_dir is expected to be './$SOURCE_ROOT/benchmarks'. That is due
+#     # the assumption that each product is in its own build directory. This
+#     # product is not like that and has its package/tools instead in
+#     # ./$SOURCE_ROOT/swift/benchmark.
+#     package_path = os.path.join(product.source_dir,
+#                                 '..', 'swift', 'tools', 'swift-inspect')
+#     package_path = os.path.abspath(package_path)
+# 
+#     # We use a separate python helper to enable quicker iteration when working
+#     # on this by avoiding going through build-script to test small changes.
+#     helper_path = os.path.join(package_path, 'build_script_helper.py')
+# 
+#     build_cmd = [
+#         helper_path,
+#         '--verbose',
+#         '--package-path', package_path,
+#         '--build-path', product.build_dir,
+#         '--toolchain', toolchain_path,
+#     ]
+#     shell.call(build_cmd)
