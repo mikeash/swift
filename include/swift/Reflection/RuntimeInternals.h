@@ -104,6 +104,8 @@ struct AsyncTaskPrivateStorage {
   ActiveTaskStatus<Runtime> Status;
   StackAllocator<Runtime> Allocator;
   typename Runtime::StoredPointer Local;
+  typename Runtime::StoredPointer ExclusivityAccessSet[2];
+  uint32_t Id;
 };
 
 template <typename Runtime>

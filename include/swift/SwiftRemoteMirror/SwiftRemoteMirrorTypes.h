@@ -225,6 +225,18 @@ typedef struct swift_async_task_slab_allocations_return {
   swift_async_task_allocation_chunk_t *Chunks;
 } swift_async_task_slab_allocations_return_t;
 
+typedef struct swift_async_task_info {
+  /// On failure, a pointer to a string describing the error. On success, NULL.
+  /// This pointer remains valid until the next
+  /// swift_reflection call on the given context.
+  const char *Error;
+
+  uint32_t Flags;
+  uint64_t Id;
+  swift_reflection_ptr_t RunJob;
+  swift_reflection_ptr_t AllocatorSlabPtr;
+} swift_async_task_info_t;
+
 /// An opaque pointer to a context which maintains state and
 /// caching of reflection structure for heap instances.
 typedef struct SwiftReflectionContext *SwiftReflectionContextRef;

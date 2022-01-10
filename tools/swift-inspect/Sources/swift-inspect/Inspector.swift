@@ -18,6 +18,7 @@ class Inspector {
   let task: task_t
   let symbolicator: CSTypeRef
   let swiftCore: CSTypeRef
+  let swiftConcurrency: CSTypeRef
   
   init?(pid: pid_t) {
     task = Self.findTask(pid, tryForkCorpse: false)
@@ -26,6 +27,8 @@ class Inspector {
     symbolicator = CSSymbolicatorCreateWithTask(task)
     swiftCore = CSSymbolicatorGetSymbolOwnerWithNameAtTime(
       symbolicator, "libswiftCore.dylib", kCSNow)
+    swiftConcurrency = CSSymbolicatorGetSymbolOwnerWithNameAtTime(
+      symbolicator, "libswift_Concurrency.dylib", kCSNow)
     _ = task_start_peeking(task)
   }
   
@@ -74,8 +77,11 @@ class Inspector {
   }
   
   func getAddr(symbolName: String) -> swift_addr_t {
-    let symbol = CSSymbolOwnerGetSymbolWithMangledName(swiftCore,
-                                                       "_" + symbolName)
+    let fullName = "_" + symbolName
+    var symbol = CSSymbolOwnerGetSymbolWithMangledName(swiftCore, fullName)
+    if CSIsNull(symbol) {
+      symbol = CSSymbolOwnerGetSymbolWithMangledName(swiftConcurrency, fullName)
+    }
     let range = CSSymbolGetRange(symbol)
     return swift_addr_t(range.location)
   }

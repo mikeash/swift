@@ -782,14 +782,10 @@ const char *swift_reflection_iterateMetadataAllocationBacktraces(
 swift_async_task_slab_return_t
 swift_reflection_asyncTaskSlabPointer(SwiftReflectionContextRef ContextRef,
                                       swift_reflection_ptr_t AsyncTaskPtr) {
-  auto Context = ContextRef->nativeContext;
-  llvm::Optional<std::string> Error;
-  NativeReflectionContext::StoredPointer SlabPtr;
-  std::tie(Error, SlabPtr) = Context->asyncTaskSlabPtr(AsyncTaskPtr);
-
+  auto Info = swift_reflection_asyncTaskInfo(ContextRef, AsyncTaskPtr);
   swift_async_task_slab_return_t Result = {};
-  Result.Error = returnableCString(ContextRef, Error);
-  Result.SlabPtr = SlabPtr;
+  Result.Error = Info.Error;
+  Result.SlabPtr = Info.AllocatorSlabPtr;
   return Result;
 }
 
@@ -820,5 +816,22 @@ swift_reflection_asyncTaskSlabAllocations(SwiftReflectionContextRef ContextRef,
   Result.ChunkCount = ContextRef->lastChunks.size();
   Result.Chunks = ContextRef->lastChunks.data();
 
+  return Result;
+}
+
+swift_async_task_info_t
+swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
+                               swift_reflection_ptr_t AsyncTaskPtr) {
+  auto Context = ContextRef->nativeContext;
+  llvm::Optional<std::string> Error;
+  NativeReflectionContext::AsyncTaskInfo TaskInfo;
+  std::tie(Error, TaskInfo) = Context->asyncTaskInfo(AsyncTaskPtr);
+
+  swift_async_task_info_t Result = {};
+  Result.Error = returnableCString(ContextRef, Error);
+  Result.Flags = TaskInfo.Flags;
+  Result.Id = TaskInfo.Id;
+  Result.RunJob = TaskInfo.RunJob;
+  Result.AllocatorSlabPtr = TaskInfo.AllocatorSlabPtr;
   return Result;
 }

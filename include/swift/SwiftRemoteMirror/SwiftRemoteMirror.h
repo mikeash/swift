@@ -435,6 +435,11 @@ swift_async_task_slab_allocations_return_t
 swift_reflection_asyncTaskSlabAllocations(SwiftReflectionContextRef ContextRef,
                                           swift_reflection_ptr_t SlabPtr);
 
+SWIFT_REMOTE_MIRROR_LINKAGE
+swift_async_task_info_t
+swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
+                               swift_reflection_ptr_t AsyncTaskPtr);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

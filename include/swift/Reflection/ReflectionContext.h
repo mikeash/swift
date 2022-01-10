@@ -137,6 +137,13 @@ public:
     std::vector<AsyncTaskAllocationChunk> Chunks;
   };
 
+  struct AsyncTaskInfo {
+    uint32_t Flags;
+    uint64_t Id;
+    StoredPointer RunJob;
+    StoredPointer AllocatorSlabPtr;
+  };
+
   explicit ReflectionContext(std::shared_ptr<MemoryReader> reader)
     : super(std::move(reader), *this)
   {}
@@ -1378,8 +1385,8 @@ public:
     return {llvm::None, {Slab->Next, SlabSize, {Chunk}}};
   }
 
-  std::pair<llvm::Optional<std::string>, StoredPointer>
-  asyncTaskSlabPtr(StoredPointer AsyncTaskPtr) {
+  std::pair<llvm::Optional<std::string>, AsyncTaskInfo>
+  asyncTaskInfo(StoredPointer AsyncTaskPtr) {
     using AsyncTask = AsyncTask<Runtime>;
 
     auto AsyncTaskBytes =
@@ -1387,10 +1394,15 @@ public:
     auto *AsyncTaskObj =
         reinterpret_cast<const AsyncTask *>(AsyncTaskBytes.get());
     if (!AsyncTaskObj)
-      return {std::string("failure reading async task"), 0};
+      return {std::string("failure reading async task"), {}};
 
-    StoredPointer SlabPtr = AsyncTaskObj->PrivateStorage.Allocator.FirstSlab;
-    return {llvm::None, SlabPtr};
+    AsyncTaskInfo Info{};
+    Info.Flags = AsyncTaskObj->Flags;
+    Info.Id =
+        AsyncTaskObj->Id | ((uint64_t)AsyncTaskObj->PrivateStorage.Id << 32);
+    Info.RunJob = AsyncTaskObj->RunJob;
+    Info.AllocatorSlabPtr = AsyncTaskObj->PrivateStorage.Allocator.FirstSlab;
+    return {llvm::None, Info};
   }
 
 private:
