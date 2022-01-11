@@ -151,6 +151,11 @@ swift_reflection_metadataNominalTypeDescriptor(SwiftReflectionContextRef Context
 																							 swift_reflection_ptr_t Metadata);
 
 
+SWIFT_REMOTE_MIRROR_LINKAGE
+int
+swift_reflection_metadataIsActor(SwiftReflectionContextRef ContextRef,
+                                 swift_reflection_ptr_t Metadata);
+
 /// Returns an opaque type reference for a class or closure context
 /// instance pointer, or NULL if one can't be constructed.
 ///

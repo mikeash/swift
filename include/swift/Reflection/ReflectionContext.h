@@ -1074,6 +1074,26 @@ public:
     return dyn_cast_or_null<const RecordTypeInfo>(TypeInfo);
   }
 
+  bool metadataIsActor(StoredPointer MetadataAddress) {
+    auto Metadata = readMetadata(MetadataAddress);
+    if (!Metadata)
+      return false;
+
+    // Only classes can be actors.
+    if (Metadata->getKind() != MetadataKind::Class)
+      return false;
+
+    auto DescriptorAddress = super::readAddressOfNominalTypeDescriptor(Metadata);
+    if (!DescriptorAddress)
+      return false;
+
+    auto DescriptorBytes = getReader().readBytes(RemoteAddress(DescriptorAddress), sizeof(TargetTypeContextDescriptor<Runtime>));
+    if (!DescriptorBytes)
+      return false;
+    auto Descriptor = reinterpret_cast<const TargetTypeContextDescriptor<Runtime> *>(DescriptorBytes.get());
+    return Descriptor->getTypeContextDescriptorFlags().class_isActor();
+  }
+
   /// Iterate the protocol conformance cache tree rooted at NodePtr, calling
   /// Call with the type and protocol in each node.
   void iterateConformanceTree(StoredPointer NodePtr,

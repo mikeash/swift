@@ -193,7 +193,6 @@ func task_peek(
   var ptr: UnsafeRawPointer? = nil
   let result = Sym.task_peek(task, start, size, &ptr)
   if result != KERN_SUCCESS {
-    print("Unable to read (\(start), \(size)): \(machErrStr(result))", to: &Std.err)
     return nil
   }
   return ptr

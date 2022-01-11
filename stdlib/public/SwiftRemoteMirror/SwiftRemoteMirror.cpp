@@ -297,6 +297,13 @@ swift_reflection_metadataNominalTypeDescriptor(SwiftReflectionContextRef Context
   return Context->nominalTypeDescriptorFromMetadata(MetadataAddress);
 }
 
+int
+swift_reflection_metadataIsActor(SwiftReflectionContextRef ContextRef,
+                                swift_reflection_ptr_t Metadata) {
+  auto Context = ContextRef->nativeContext;
+  return Context->metadataIsActor(Metadata);
+}
+
 swift_typeref_t
 swift_reflection_typeRefForInstance(SwiftReflectionContextRef ContextRef,
                                     uintptr_t Object) {
