@@ -7,6 +7,9 @@ func dumpConcurrency(
   let dumper = ConcurrencyDumper(context: context, inspector: inspector)
   dumper.dumpTasks()
   dumper.dumpActors()
+  for (thread, task) in inspector.threadCurrentTasks() {
+    print("\(hex: thread) - \(hex: task)")
+  }
 }
 
 fileprivate class ConcurrencyDumper {
