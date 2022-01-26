@@ -75,7 +75,7 @@ struct Job {
   uint32_t Flags;
   uint32_t Id;
   typename Runtime::StoredPointer Reserved[2];
-  typename Runtime::StoredPointer RunJob;
+  typename Runtime::StoredSignedPointer RunJob;
 };
 
 template <typename Runtime>
@@ -115,6 +115,35 @@ struct AsyncTask: Job<Runtime> {
     sizeof(typename Runtime::StoredPointer) == 8 ? 2 : 1];
 
   AsyncTaskPrivateStorage<Runtime> PrivateStorage;
+};
+
+template <typename Runtime>
+struct AsyncContext {
+  typename Runtime::StoredSignedPointer Parent;
+  typename Runtime::StoredSignedPointer ResumeParent;
+  uint32_t Flags;
+};
+
+template <typename Runtime>
+struct AsyncContextPrefix {
+  typename Runtime::StoredSignedPointer AsyncEntryPoint;
+  typename Runtime::StoredPointer ClosureContext;
+  typename Runtime::StoredPointer ErrorResult;
+};
+
+template <typename Runtime>
+struct FutureAsyncContextPrefix {
+  typename Runtime::StoredPointer IndirectResult;
+  typename Runtime::StoredSignedPointer AsyncEntryPoint;
+  typename Runtime::StoredPointer ClosureContext;
+  typename Runtime::StoredPointer ErrorResult;
+};
+
+template <typename Runtime>
+struct DefaultActorImpl {
+  HeapObject<Runtime> HeapObject;
+  typename Runtime::StoredPointer FirstJob;
+  typename Runtime::StoredSize Flags;
 };
 
 } // end namespace reflection

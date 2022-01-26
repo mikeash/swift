@@ -237,6 +237,16 @@ typedef struct swift_async_task_info {
   swift_reflection_ptr_t AllocatorSlabPtr;
 } swift_async_task_info_t;
 
+typedef struct swift_actor_info {
+  /// On failure, a pointer to a string describing the error. On success, NULL.
+  /// This pointer remains valid until the next
+  /// swift_reflection call on the given context.
+  const char *Error;
+
+  uint64_t Flags;
+  swift_reflection_ptr_t FirstJob;
+} swift_actor_info_t;
+
 /// An opaque pointer to a context which maintains state and
 /// caching of reflection structure for heap instances.
 typedef struct SwiftReflectionContext *SwiftReflectionContextRef;

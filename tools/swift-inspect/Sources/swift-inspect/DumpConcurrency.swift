@@ -92,8 +92,9 @@ fileprivate class ConcurrencyDumper {
       let info = swift_reflection_asyncTaskInfo(context, task)
       guard info.Error == nil else { continue }
 
-      let runJobName = inspector.getSymbol(address: info.RunJob).name
-        ?? "<\(hex: info.RunJob)>"
+      let runJobSymbol = inspector.getSymbol(address: info.RunJob)
+      let runJobName = runJobSymbol.name ?? "<\(hex: info.RunJob)>"
+      let runJobLibrary = runJobSymbol.library ?? "<unknown>"
 
       var allocatorSlab = info.AllocatorSlabPtr
       var allocatorTotalSize = 0
@@ -108,7 +109,8 @@ fileprivate class ConcurrencyDumper {
         allocatorSlab = allocations.NextSlab
       }
 
-      print("  \(hex: task) - flags=\(hex: info.Flags) id=\(info.Id) runjob=\(runJobName)")
+      print("  \(hex: task) - flags=\(hex: info.Flags) id=\(info.Id)")
+      print("    resume function: \(runJobName) in \(runJobLibrary)")
       print("    task allocator: \(allocatorTotalSize) bytes in \(allocatorTotalChunks) chunks")
     }
 
@@ -121,7 +123,22 @@ fileprivate class ConcurrencyDumper {
     for actor in actors {
       let metadata = swift_reflection_metadataForObject(context, UInt(actor))
       let metadataName = name(metadata: swift_reflection_ptr_t(metadata)) ?? "<unknown class name>"
-      print("  \(hex: actor) \(metadataName)")
+      let info = swift_reflection_actorInfo(context, actor);
+      print("  \(hex: actor) \(metadataName) flags=\(hex: info.Flags)")
+
+      var job = info.FirstJob
+      if job == 0 {
+        print("    empty job queue")
+      } else {
+        print("    job queue: \(hex: job)", terminator: "")
+        while job != 0 {
+          job = swift_reflection_nextJob(context, job);
+          if job != 0 {
+            print(" -> \(hex: job)", terminator: "")
+          }
+        }
+        print("")
+      }
     }
 
     print("")

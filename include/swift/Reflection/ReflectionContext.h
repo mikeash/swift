@@ -101,6 +101,12 @@ class ReflectionContext
   std::vector<MemoryReader::ReadBytesResult> savedBuffers;
   std::vector<std::tuple<RemoteAddress, RemoteAddress>> imageRanges;
 
+  bool setupTargetPointers = false;
+  typename super::StoredPointer target_non_future_adapter = 0;
+  typename super::StoredPointer target_future_adapter = 0;
+  typename super::StoredPointer target_task_wait_throwing_resume_adapter = 0;
+  typename super::StoredPointer target_task_future_wait_resume_adapter = 0;
+
 public:
   using super::getBuilder;
   using super::readDemanglingForContextDescriptor;
@@ -142,6 +148,11 @@ public:
     uint64_t Id;
     StoredPointer RunJob;
     StoredPointer AllocatorSlabPtr;
+  };
+
+  struct ActorInfo {
+    StoredPointer Flags;
+    StoredPointer FirstJob;
   };
 
   explicit ReflectionContext(std::shared_ptr<MemoryReader> reader)
@@ -1420,12 +1431,104 @@ public:
     Info.Flags = AsyncTaskObj->Flags;
     Info.Id =
         AsyncTaskObj->Id | ((uint64_t)AsyncTaskObj->PrivateStorage.Id << 32);
-    Info.RunJob = AsyncTaskObj->RunJob;
     Info.AllocatorSlabPtr = AsyncTaskObj->PrivateStorage.Allocator.FirstSlab;
+    Info.RunJob = getRunJob(AsyncTaskObj);
     return {llvm::None, Info};
   }
 
+  std::pair<llvm::Optional<std::string>, ActorInfo>
+  actorInfo(StoredPointer ActorPtr) {
+    using DefaultActorImpl = DefaultActorImpl<Runtime>;
+
+    auto ActorBytes =
+        getReader().readBytes(RemoteAddress(ActorPtr), sizeof(DefaultActorImpl));
+    auto *ActorObj =
+        reinterpret_cast<const DefaultActorImpl *>(ActorBytes.get());
+    if (!ActorObj)
+      return {std::string("failure reading actor"), {}};
+
+    ActorInfo Info{};
+    Info.Flags = ActorObj->Flags;
+    // This is a JobRef which stores flags in the low bits.
+    Info.FirstJob = ActorObj->FirstJob & ~StoredPointer(0x3);
+    return {llvm::None, Info};
+  }
+
+  StoredPointer
+  nextJob(StoredPointer JobPtr) {
+    using Job = Job<Runtime>;
+
+    auto JobBytes =
+        getReader().readBytes(RemoteAddress(JobPtr), sizeof(Job));
+    auto *JobObj =
+        reinterpret_cast<const Job *>(JobBytes.get());
+    if (!JobObj)
+      return 0;
+
+    // This is a JobRef which stores flags in the low bits.
+    return JobObj->SchedulerPrivate[0] & ~StoredPointer(0x3);
+  }
+
 private:
+  // Get the most human meaningful "run job" function pointer from the task,
+  // like AsyncTask::getResumeFunctionForLogging does.
+  StoredPointer getRunJob(const AsyncTask<Runtime> *AsyncTaskObj) {
+    auto Fptr = stripSignedPointer(AsyncTaskObj->RunJob);
+
+    loadTargetPointers();
+    auto ResumeContextPtr = AsyncTaskObj->ResumeContextAndReserved[0];
+    if (target_non_future_adapter && Fptr == target_non_future_adapter) {
+      using Prefix = AsyncContextPrefix<Runtime>;
+      auto PrefixAddr = ResumeContextPtr - sizeof(Prefix);
+      auto PrefixBytes = getReader().readBytes(RemoteAddress(PrefixAddr), sizeof(Prefix));
+      if (PrefixBytes) {
+        auto PrefixPtr = reinterpret_cast<const Prefix *>(PrefixBytes.get());
+        return stripSignedPointer(PrefixPtr->AsyncEntryPoint);
+      }
+    } else if (target_future_adapter && Fptr == target_future_adapter) {
+      using Prefix = FutureAsyncContextPrefix<Runtime>;
+      auto PrefixAddr = ResumeContextPtr - sizeof(Prefix);
+      auto PrefixBytes = getReader().readBytes(RemoteAddress(PrefixAddr), sizeof(Prefix));
+      if (PrefixBytes) {
+        auto PrefixPtr = reinterpret_cast<const Prefix *>(PrefixBytes.get());
+        return stripSignedPointer(PrefixPtr->AsyncEntryPoint);
+      }
+    } else if ((target_task_wait_throwing_resume_adapter && Fptr == target_task_wait_throwing_resume_adapter) ||
+        (target_task_future_wait_resume_adapter && Fptr == target_task_future_wait_resume_adapter)) {
+      auto ContextBytes = getReader().readBytes(RemoteAddress(ResumeContextPtr), sizeof(AsyncContext<Runtime>));
+      if (ContextBytes) {
+        auto ContextPtr = reinterpret_cast<const AsyncContext<Runtime> *>(ContextBytes.get());
+        return stripSignedPointer(ContextPtr->ResumeParent);
+      }
+    }
+
+    return Fptr;
+  }
+
+  void loadTargetPointers() {
+    if (setupTargetPointers)
+      return;
+
+    auto getFunc = [&](const std::string &name) -> StoredPointer {
+      auto Symbol = getReader().getSymbolAddress(name);
+      if (!Symbol)
+        return 0;
+      auto Pointer = getReader().readPointer(Symbol, sizeof(StoredPointer));
+      if (!Pointer)
+        return 0;
+      return Pointer->getResolvedAddress().getAddressData();
+    };
+    target_non_future_adapter =
+        getFunc("_swift_concurrency_debug_non_future_adapter");
+    target_future_adapter =
+        getFunc("_swift_concurrency_debug_future_adapter");
+    target_task_wait_throwing_resume_adapter =
+        getFunc("_swift_concurrency_debug_task_wait_throwing_resume_adapter");
+    target_task_future_wait_resume_adapter =
+        getFunc("_swift_concurrency_debug_task_future_wait_resume_adapter");
+    setupTargetPointers = true;
+  }
+
   const TypeInfo *
   getClosureContextInfo(StoredPointer Context, const ClosureContextInfo &Info,
                         remote::TypeInfoProvider *ExternalTypeInfo) {

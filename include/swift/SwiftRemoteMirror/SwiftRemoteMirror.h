@@ -445,6 +445,16 @@ swift_async_task_info_t
 swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
                                swift_reflection_ptr_t AsyncTaskPtr);
 
+SWIFT_REMOTE_MIRROR_LINKAGE
+swift_actor_info_t
+swift_reflection_actorInfo(SwiftReflectionContextRef ContextRef,
+                           swift_reflection_ptr_t ActorPtr);
+
+SWIFT_REMOTE_MIRROR_LINKAGE
+swift_reflection_ptr_t
+swift_reflection_nextJob(SwiftReflectionContextRef ContextRef,
+                         swift_reflection_ptr_t JobPtr);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

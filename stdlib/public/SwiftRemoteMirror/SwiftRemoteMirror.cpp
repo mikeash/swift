@@ -842,3 +842,25 @@ swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
   Result.AllocatorSlabPtr = TaskInfo.AllocatorSlabPtr;
   return Result;
 }
+
+swift_actor_info_t
+swift_reflection_actorInfo(SwiftReflectionContextRef ContextRef,
+                           swift_reflection_ptr_t ActorPtr) {
+  auto Context = ContextRef->nativeContext;
+  llvm::Optional<std::string> Error;
+  NativeReflectionContext::ActorInfo TaskInfo;
+  std::tie(Error, TaskInfo) = Context->actorInfo(ActorPtr);
+
+  swift_actor_info_t Result = {};
+  Result.Error = returnableCString(ContextRef, Error);
+  Result.Flags = TaskInfo.Flags;
+  Result.FirstJob = TaskInfo.FirstJob;
+  return Result;
+}
+
+swift_reflection_ptr_t
+swift_reflection_nextJob(SwiftReflectionContextRef ContextRef,
+                         swift_reflection_ptr_t JobPtr) {
+  auto Context = ContextRef->nativeContext;
+  return Context->nextJob(JobPtr);
+}
