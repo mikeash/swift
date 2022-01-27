@@ -152,7 +152,7 @@ public:
   };
 
   struct ActorInfo {
-    StoredPointer Flags;
+    StoredSize Flags;
     StoredPointer FirstJob;
   };
 
@@ -1480,8 +1480,14 @@ public:
 
     ActorInfo Info{};
     Info.Flags = ActorObj->Flags;
-    // This is a JobRef which stores flags in the low bits.
-    Info.FirstJob = ActorObj->FirstJob & ~StoredPointer(0x3);
+
+    // Status is the low 3 bits of Flags. Status of 0 is Idle. Don't read
+    // FirstJob when idle.
+    auto Status = Info.Flags & 0x7;
+    if (Status != 0) {
+      // This is a JobRef which stores flags in the low bits.
+      Info.FirstJob = ActorObj->FirstJob & ~StoredPointer(0x3);
+    }
     return {llvm::None, Info};
   }
 
