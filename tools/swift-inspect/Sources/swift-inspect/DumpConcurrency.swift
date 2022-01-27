@@ -7,9 +7,7 @@ func dumpConcurrency(
   let dumper = ConcurrencyDumper(context: context, inspector: inspector)
   dumper.dumpTasks()
   dumper.dumpActors()
-  for (thread, task) in inspector.threadCurrentTasks() {
-    print("\(hex: thread) - \(hex: task)")
-  }
+  dumper.dumpThreads()
 }
 
 fileprivate class ConcurrencyDumper {
@@ -19,6 +17,7 @@ fileprivate class ConcurrencyDumper {
   let taskMetadata: swift_reflection_ptr_t?
 
   struct TaskInfo {
+    var address: swift_reflection_ptr_t
     var flags: UInt32
     var id: UInt64
     var runJob: swift_reflection_ptr_t
@@ -26,6 +25,7 @@ fileprivate class ConcurrencyDumper {
     var allocatorTotalSize: Int
     var allocatorTotalChunks: Int
     var childTasks: [swift_reflection_ptr_t]
+    var parent: swift_reflection_ptr_t?
   }
 
   struct HeapInfo {
@@ -35,6 +35,8 @@ fileprivate class ConcurrencyDumper {
   }
 
   lazy var heapInfo: HeapInfo = gatherHeapInfo()
+
+  lazy var threadCurrentTasks = inspector.threadCurrentTasks().filter{ $0.currentTask != 0 }
 
   lazy var tasks: [swift_reflection_ptr_t: TaskInfo] = gatherTasks()
 
@@ -79,7 +81,9 @@ fileprivate class ConcurrencyDumper {
 
   func gatherTasks() -> [swift_reflection_ptr_t: TaskInfo] {
     var map: [swift_reflection_ptr_t: TaskInfo] = [:]
-    var tasksToScan: Set<swift_reflection_ptr_t> = Set(heapInfo.tasks)
+    var tasksToScan: Set<swift_reflection_ptr_t> = []
+    tasksToScan.formUnion(heapInfo.tasks)
+    tasksToScan.formUnion(threadCurrentTasks.map{ $0.currentTask }.filter{ $0 != 0 })
 
     while !tasksToScan.isEmpty {
       let taskToScan = tasksToScan.removeFirst()
@@ -96,6 +100,13 @@ fileprivate class ConcurrencyDumper {
         }
       }
     }
+
+    for (task, info) in map {
+      for child in info.childTasks {
+        map[child]!.parent = task
+      }
+    }
+
     return map
   }
 
@@ -145,6 +156,7 @@ fileprivate class ConcurrencyDumper {
     }
 
     return TaskInfo(
+      address: task,
       flags: reflectionInfo.Flags,
       id: reflectionInfo.Id,
       runJob: reflectionInfo.RunJob,
@@ -167,6 +179,9 @@ fileprivate class ConcurrencyDumper {
       let childrenHex = info.childTasks.map{ "\(hex: $0)" }
 
       print("  \(hex: task) - flags=\(hex: info.flags) id=\(info.id)")
+      if let parent = info.parent {
+        print("    parent: \(hex: parent)")
+      }
       print("    resume function: \(runJobName) in \(runJobLibrary)")
       print("    task allocator: \(info.allocatorTotalSize) bytes in \(info.allocatorTotalChunks) chunks")
       if !childrenHex.isEmpty {
@@ -202,5 +217,17 @@ fileprivate class ConcurrencyDumper {
     }
 
     print("")
+  }
+
+  func dumpThreads() {
+    print("THREADS")
+    if threadCurrentTasks.isEmpty {
+      print("  no threads with active tasks")
+      return
+    }
+
+    for (thread, task) in threadCurrentTasks {
+      print("  Thread \(hex: thread) - current task: \(task)")
+    }
   }
 }

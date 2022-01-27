@@ -114,7 +114,10 @@ struct AsyncTask: Job<Runtime> {
   typename Runtime::StoredPointer ResumeContextAndReserved[
     sizeof(typename Runtime::StoredPointer) == 8 ? 2 : 1];
 
-  AsyncTaskPrivateStorage<Runtime> PrivateStorage;
+  union {
+    AsyncTaskPrivateStorage<Runtime> PrivateStorage;
+    typename Runtime::StoredPointer PrivateStorageRaw[14];
+  };
 };
 
 template <typename Runtime>

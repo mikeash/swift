@@ -1432,7 +1432,6 @@ public:
 
     auto RecordPtr = AsyncTaskObj->PrivateStorage.Status.Record;
     while (RecordPtr) {
-      fprintf(stderr, "RECORD=%p\n", RecordPtr);
       auto RecordObj = readObj<TaskStatusRecord<Runtime>>(RecordPtr);
       if (!RecordObj)
         break;
@@ -1442,7 +1441,6 @@ public:
       // Beware of this when reading anything else.
       TaskStatusRecordFlags Flags{RecordObj->Flags};
       auto Kind = Flags.getKind();
-      fprintf(stderr, "KIND=%d\n", Kind);
 
       StoredPointer ChildTask = 0;
       if (Kind == TaskStatusRecordKind::ChildTask) {
@@ -1454,7 +1452,6 @@ public:
         if (RecordObj)
           ChildTask = RecordObj->FirstChild;
       }
-      fprintf(stderr, "CHILD TASK=%p\n", ChildTask);
 
       while (ChildTask) {
         Info.ChildTasks.push_back(ChildTask);
@@ -1463,10 +1460,8 @@ public:
         auto ChildFragmentObj = readObj<ChildFragment<Runtime>>(ChildFragmentAddr);
         if (ChildFragmentObj) {
           ChildTask = ChildFragmentObj->NextChild;
-          fprintf(stderr, "ChildFragmentObj->NextChild=%p\n", ChildFragmentObj->NextChild);
         } else
           ChildTask = 0;
-        fprintf(stderr, "NEXT CHILD=%p\n", ChildTask);
       }
 
       RecordPtr = RecordObj->Parent;
@@ -1503,12 +1498,6 @@ public:
 
     // This is a JobRef which stores flags in the low bits.
     return JobObj->SchedulerPrivate[0] & ~StoredPointer(0x3);
-  }
-
-  std::pair<llvm::Optional<std::string>, std::vector<StoredPointer>>
-  childTasks(StoredPointer AsyncTaskPtr) {
-    auto *ActorObj = getReader().readObj(RemoteAddress(AsyncTaskPtr));
-    return ActorObj;
   }
 
 private:
