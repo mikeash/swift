@@ -146,6 +146,29 @@ struct DefaultActorImpl {
   typename Runtime::StoredSize Flags;
 };
 
+template <typename Runtime>
+struct TaskStatusRecord {
+  typename Runtime::StoredSize Flags;
+  typename Runtime::StoredPointer Parent;
+};
+
+template <typename Runtime>
+struct ChildTaskStatusRecord : TaskStatusRecord<Runtime> {
+  typename Runtime::StoredPointer FirstChild;
+};
+
+template <typename Runtime>
+struct TaskGroupTaskStatusRecord : TaskStatusRecord<Runtime> {
+  typename Runtime::StoredPointer FirstChild;
+};
+
+template <typename Runtime>
+struct ChildFragment {
+  typename Runtime::StoredPointer Parent;
+  typename Runtime::StoredPointer NextChild;
+};
+
+
 } // end namespace reflection
 } // end namespace swift
 

@@ -235,6 +235,9 @@ typedef struct swift_async_task_info {
   uint64_t Id;
   swift_reflection_ptr_t RunJob;
   swift_reflection_ptr_t AllocatorSlabPtr;
+
+  unsigned ChildTaskCount;
+  swift_reflection_ptr_t *ChildTasks;
 } swift_async_task_info_t;
 
 typedef struct swift_actor_info {

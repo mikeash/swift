@@ -47,8 +47,8 @@ struct SwiftReflectionContext {
   NativeReflectionContext *nativeContext;
   std::vector<std::function<void()>> freeFuncs;
   std::vector<std::tuple<swift_addr_t, swift_addr_t>> dataSegments;
-  std::string lastString;
-  std::vector<swift_async_task_allocation_chunk_t> lastChunks;
+
+  std::function<void(void)> freeTemporaryAllocation = []{};
 
   SwiftReflectionContext(MemoryReaderImpl impl) {
     auto Reader = std::make_shared<CMemoryReader>(impl);
@@ -56,9 +56,20 @@ struct SwiftReflectionContext {
   }
   
   ~SwiftReflectionContext() {
+    freeTemporaryAllocation();
     delete nativeContext;
     for (auto f : freeFuncs)
       f();
+  }
+
+  // Allocate a single temporary object that will stay allocated until the next
+  // call to this method, or until the context is destroyed.
+  template <typename T>
+  T *allocateTemporaryObject() {
+    freeTemporaryAllocation();
+    T *obj = new T;
+    freeTemporaryAllocation = [obj]{ delete obj; };
+    return obj;
   }
 };
 
@@ -512,8 +523,9 @@ static swift_layout_kind_t convertAllocationChunkKind(
 static const char *returnableCString(SwiftReflectionContextRef ContextRef,
                                       llvm::Optional<std::string> String) {
   if (String) {
-    ContextRef->lastString = *String;
-    return ContextRef->lastString.c_str();
+    auto *TmpStr = ContextRef->allocateTemporaryObject<std::string>();
+    *TmpStr = *String;
+    return TmpStr->c_str();
   }
   return nullptr;
 }
@@ -810,18 +822,18 @@ swift_reflection_asyncTaskSlabAllocations(SwiftReflectionContextRef ContextRef,
   Result.NextSlab = Info.NextSlab;
   Result.SlabSize = Info.SlabSize;
 
-  ContextRef->lastChunks.clear();
-  ContextRef->lastChunks.reserve(Info.Chunks.size());
+  auto *Chunks = ContextRef->allocateTemporaryObject<std::vector<swift_async_task_allocation_chunk_t>>();
+  Chunks->reserve(Info.Chunks.size());
   for (auto &Chunk : Info.Chunks) {
     swift_async_task_allocation_chunk_t ConvertedChunk;
     ConvertedChunk.Start = Chunk.Start;
     ConvertedChunk.Length = Chunk.Length;
     ConvertedChunk.Kind = convertAllocationChunkKind(Chunk.Kind);
-    ContextRef->lastChunks.push_back(ConvertedChunk);
+    Chunks->push_back(ConvertedChunk);
   }
 
-  Result.ChunkCount = ContextRef->lastChunks.size();
-  Result.Chunks = ContextRef->lastChunks.data();
+  Result.ChunkCount = Chunks->size();
+  Result.Chunks = Chunks->data();
 
   return Result;
 }
@@ -840,6 +852,12 @@ swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
   Result.Id = TaskInfo.Id;
   Result.RunJob = TaskInfo.RunJob;
   Result.AllocatorSlabPtr = TaskInfo.AllocatorSlabPtr;
+
+  auto *ChildTasks = ContextRef->allocateTemporaryObject<std::vector<swift_reflection_ptr_t>>();
+  std::copy(TaskInfo.ChildTasks.begin(), TaskInfo.ChildTasks.end(), std::back_inserter(*ChildTasks));
+  Result.ChildTaskCount = ChildTasks->size();
+  Result.ChildTasks = ChildTasks->data();
+
   return Result;
 }
 
@@ -855,6 +873,7 @@ swift_reflection_actorInfo(SwiftReflectionContextRef ContextRef,
   Result.Error = returnableCString(ContextRef, Error);
   Result.Flags = TaskInfo.Flags;
   Result.FirstJob = TaskInfo.FirstJob;
+
   return Result;
 }
 

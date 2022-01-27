@@ -18,6 +18,16 @@ fileprivate class ConcurrencyDumper {
   let jobMetadata: swift_reflection_ptr_t?
   let taskMetadata: swift_reflection_ptr_t?
 
+  struct TaskInfo {
+    var flags: UInt32
+    var id: UInt64
+    var runJob: swift_reflection_ptr_t
+    var allocatorSlabPtr: swift_reflection_ptr_t
+    var allocatorTotalSize: Int
+    var allocatorTotalChunks: Int
+    var childTasks: [swift_reflection_ptr_t]
+  }
+
   struct HeapInfo {
     var tasks: [swift_reflection_ptr_t] = []
     var jobs: [swift_reflection_ptr_t] = []
@@ -26,9 +36,7 @@ fileprivate class ConcurrencyDumper {
 
   lazy var heapInfo: HeapInfo = gatherHeapInfo()
 
-  var tasks: [swift_reflection_ptr_t] {
-    heapInfo.tasks
-  }
+  lazy var tasks: [swift_reflection_ptr_t: TaskInfo] = gatherTasks()
 
   var actors: [swift_reflection_ptr_t] {
     heapInfo.actors
@@ -69,6 +77,28 @@ fileprivate class ConcurrencyDumper {
     return result
   }
 
+  func gatherTasks() -> [swift_reflection_ptr_t: TaskInfo] {
+    var map: [swift_reflection_ptr_t: TaskInfo] = [:]
+    var tasksToScan: Set<swift_reflection_ptr_t> = Set(heapInfo.tasks)
+
+    while !tasksToScan.isEmpty {
+      let taskToScan = tasksToScan.removeFirst()
+      if let info = info(forTask: taskToScan) {
+        map[taskToScan] = info
+        for child in info.childTasks {
+          let childMetadata = swift_reflection_metadataForObject(context, UInt(child))
+          if let taskMetadata = taskMetadata, childMetadata != taskMetadata {
+            print("Inconsistent data datected!! Child task \(hex: child) has unknown metadata \(hex: taskMetadata)")
+          }
+          if map[child] == nil {
+            tasksToScan.insert(child)
+          }
+        }
+      }
+    }
+    return map
+  }
+
   func isActorMetadata(_ metadata: swift_reflection_ptr_t) -> Bool {
     if let cached = metadataIsActorCache[metadata] {
       return cached
@@ -88,33 +118,60 @@ fileprivate class ConcurrencyDumper {
     return name
   }
 
+  func info(forTask task: swift_reflection_ptr_t) -> TaskInfo? {
+    let reflectionInfo = swift_reflection_asyncTaskInfo(context, task)
+    if let error = reflectionInfo.Error {
+      print("Error getting info for async task \(hex: task): \(String(cString: error))")
+      return nil
+    }
+
+    // ChildTasks is a temporary pointer which we must copy out before we call
+    // into Remote Mirror again.
+    let children = Array(UnsafeBufferPointer(
+        start: reflectionInfo.ChildTasks,
+        count: Int(reflectionInfo.ChildTaskCount)))
+
+    var allocatorSlab = reflectionInfo.AllocatorSlabPtr
+    var allocatorTotalSize = 0
+    var allocatorTotalChunks = 0
+    while allocatorSlab != 0 {
+      let allocations = swift_reflection_asyncTaskSlabAllocations(context,
+                                                                  allocatorSlab)
+      guard allocations.Error == nil else { break }
+      allocatorTotalSize += Int(allocations.SlabSize)
+      allocatorTotalChunks += Int(allocations.ChunkCount)
+
+      allocatorSlab = allocations.NextSlab
+    }
+
+    return TaskInfo(
+      flags: reflectionInfo.Flags,
+      id: reflectionInfo.Id,
+      runJob: reflectionInfo.RunJob,
+      allocatorSlabPtr: reflectionInfo.AllocatorSlabPtr,
+      allocatorTotalSize: allocatorTotalSize,
+      allocatorTotalChunks: allocatorTotalChunks,
+      childTasks: children
+    )
+  }
+
   func dumpTasks() {
     print("TASKS")
 
-    for task in tasks {
-      let info = swift_reflection_asyncTaskInfo(context, task)
-      guard info.Error == nil else { continue }
-
-      let runJobSymbol = inspector.getSymbol(address: info.RunJob)
-      let runJobName = runJobSymbol.name ?? "<\(hex: info.RunJob)>"
+    for task in tasks.keys.sorted() {
+      let info = tasks[task]!
+      let runJobSymbol = inspector.getSymbol(address: info.runJob)
+      let runJobName = runJobSymbol.name ?? "<\(hex: info.runJob)>"
       let runJobLibrary = runJobSymbol.library ?? "<unknown>"
 
-      var allocatorSlab = info.AllocatorSlabPtr
-      var allocatorTotalSize = 0
-      var allocatorTotalChunks = 0
-      while allocatorSlab != 0 {
-        let allocations = swift_reflection_asyncTaskSlabAllocations(context,
-                                                                    allocatorSlab)
-        guard allocations.Error == nil else { break }
-        allocatorTotalSize += Int(allocations.SlabSize)
-        allocatorTotalChunks += Int(allocations.ChunkCount)
+      let childrenHex = info.childTasks.map{ "\(hex: $0)" }
 
-        allocatorSlab = allocations.NextSlab
-      }
-
-      print("  \(hex: task) - flags=\(hex: info.Flags) id=\(info.Id)")
+      print("  \(hex: task) - flags=\(hex: info.flags) id=\(info.id)")
       print("    resume function: \(runJobName) in \(runJobLibrary)")
-      print("    task allocator: \(allocatorTotalSize) bytes in \(allocatorTotalChunks) chunks")
+      print("    task allocator: \(info.allocatorTotalSize) bytes in \(info.allocatorTotalChunks) chunks")
+      if !childrenHex.isEmpty {
+        print("    children:", childrenHex.joined(separator: ", "))
+      }
     }
 
     print("")

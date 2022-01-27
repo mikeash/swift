@@ -148,6 +148,7 @@ public:
     uint64_t Id;
     StoredPointer RunJob;
     StoredPointer AllocatorSlabPtr;
+    std::vector<StoredPointer> ChildTasks;
   };
 
   struct ActorInfo {
@@ -1418,12 +1419,7 @@ public:
 
   std::pair<llvm::Optional<std::string>, AsyncTaskInfo>
   asyncTaskInfo(StoredPointer AsyncTaskPtr) {
-    using AsyncTask = AsyncTask<Runtime>;
-
-    auto AsyncTaskBytes =
-        getReader().readBytes(RemoteAddress(AsyncTaskPtr), sizeof(AsyncTask));
-    auto *AsyncTaskObj =
-        reinterpret_cast<const AsyncTask *>(AsyncTaskBytes.get());
+    auto AsyncTaskObj = readObj<AsyncTask<Runtime>>(AsyncTaskPtr);
     if (!AsyncTaskObj)
       return {std::string("failure reading async task"), {}};
 
@@ -1432,7 +1428,50 @@ public:
     Info.Id =
         AsyncTaskObj->Id | ((uint64_t)AsyncTaskObj->PrivateStorage.Id << 32);
     Info.AllocatorSlabPtr = AsyncTaskObj->PrivateStorage.Allocator.FirstSlab;
-    Info.RunJob = getRunJob(AsyncTaskObj);
+    Info.RunJob = getRunJob(AsyncTaskObj.get());
+
+    auto RecordPtr = AsyncTaskObj->PrivateStorage.Status.Record;
+    while (RecordPtr) {
+      fprintf(stderr, "RECORD=%p\n", RecordPtr);
+      auto RecordObj = readObj<TaskStatusRecord<Runtime>>(RecordPtr);
+      if (!RecordObj)
+        break;
+
+      // This cuts off high bits if our size_t doesn't match the target's. We
+      // only read the Kind bits which are at the bottom, so that's OK here.
+      // Beware of this when reading anything else.
+      TaskStatusRecordFlags Flags{RecordObj->Flags};
+      auto Kind = Flags.getKind();
+      fprintf(stderr, "KIND=%d\n", Kind);
+
+      StoredPointer ChildTask = 0;
+      if (Kind == TaskStatusRecordKind::ChildTask) {
+        auto RecordObj = readObj<ChildTaskStatusRecord<Runtime>>(RecordPtr);
+        if (RecordObj)
+          ChildTask = RecordObj->FirstChild;
+      } else if (Kind == TaskStatusRecordKind::TaskGroup) {
+        auto RecordObj = readObj<TaskGroupTaskStatusRecord<Runtime>>(RecordPtr);
+        if (RecordObj)
+          ChildTask = RecordObj->FirstChild;
+      }
+      fprintf(stderr, "CHILD TASK=%p\n", ChildTask);
+
+      while (ChildTask) {
+        Info.ChildTasks.push_back(ChildTask);
+
+        StoredPointer ChildFragmentAddr = ChildTask + sizeof(AsyncTask<Runtime>);
+        auto ChildFragmentObj = readObj<ChildFragment<Runtime>>(ChildFragmentAddr);
+        if (ChildFragmentObj) {
+          ChildTask = ChildFragmentObj->NextChild;
+          fprintf(stderr, "ChildFragmentObj->NextChild=%p\n", ChildFragmentObj->NextChild);
+        } else
+          ChildTask = 0;
+        fprintf(stderr, "NEXT CHILD=%p\n", ChildTask);
+      }
+
+      RecordPtr = RecordObj->Parent;
+    }
+
     return {llvm::None, Info};
   }
 
@@ -1440,10 +1479,7 @@ public:
   actorInfo(StoredPointer ActorPtr) {
     using DefaultActorImpl = DefaultActorImpl<Runtime>;
 
-    auto ActorBytes =
-        getReader().readBytes(RemoteAddress(ActorPtr), sizeof(DefaultActorImpl));
-    auto *ActorObj =
-        reinterpret_cast<const DefaultActorImpl *>(ActorBytes.get());
+    auto ActorObj = readObj<DefaultActorImpl>(ActorPtr);
     if (!ActorObj)
       return {std::string("failure reading actor"), {}};
 
@@ -1467,6 +1503,12 @@ public:
 
     // This is a JobRef which stores flags in the low bits.
     return JobObj->SchedulerPrivate[0] & ~StoredPointer(0x3);
+  }
+
+  std::pair<llvm::Optional<std::string>, std::vector<StoredPointer>>
+  childTasks(StoredPointer AsyncTaskPtr) {
+    auto *ActorObj = getReader().readObj(RemoteAddress(AsyncTaskPtr));
+    return ActorObj;
   }
 
 private:
@@ -1749,6 +1791,12 @@ private:
     }
 
     return llvm::None;
+  }
+
+  template <typename T>
+  MemoryReader::ReadObjResult<T>
+  readObj(StoredPointer Ptr) {
+    return getReader().template readObj<T>(RemoteAddress(Ptr));
   }
 };
 
