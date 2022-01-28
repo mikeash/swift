@@ -167,20 +167,20 @@ fileprivate class ConcurrencyDumper {
     )
   }
 
-  func taskHierarchy() -> [(level: Int, task: TaskInfo)] {
-    var hierarchy: [(level: Int, task: TaskInfo)] = []
+  func taskHierarchy() -> [(level: Int, lastChild: Bool, task: TaskInfo)] {
+    var hierarchy: [(level: Int, lastChild: Bool, task: TaskInfo)] = []
 
     let topLevelTasks = tasks.values.filter{ $0.parent == nil }
     for top in topLevelTasks.sorted(by: { $0.address < $1.address }) {
       var stack: [(index: Int, task: TaskInfo)] = [(0, top)]
-      hierarchy.append((0, top))
+      hierarchy.append((0, true, top))
 
       while let (index, task) = stack.popLast() {
         if index < task.childTasks.count {
           stack.append((index + 1, task))
           let childPtr = task.childTasks[index]
           let childTask = tasks[childPtr]!
-          hierarchy.append((stack.count, childTask))
+          hierarchy.append((stack.count, index == task.childTasks.count - 1, childTask))
           stack.append((0, childTask))
         }
       }
@@ -191,18 +191,47 @@ fileprivate class ConcurrencyDumper {
   func dumpTasks() {
     print("TASKS")
 
-    for (level, task) in taskHierarchy() {
-      let prefix = String(repeating: " ", count: level * 2 + 2)
+    var lastChilds: [Bool] = []
+
+    let hierarchy = taskHierarchy()
+    for (i, (level, lastChild, task)) in hierarchy.enumerated() {
+      lastChilds.removeSubrange(level...)
+      lastChilds.append(lastChild)
+
+      let nextEntry = i < hierarchy.count - 1 ? hierarchy[i + 1] : nil
+
+      let levelWillDecrease = level > (nextEntry?.level ?? -1)
+
+      var prefix = ""
+      for lastChild in lastChilds {
+        prefix += lastChild ? "    " : "  | "
+      }
+      prefix += "  "
+      let firstPrefix = String(prefix.dropLast(4) + (
+          level == 0 ? "    " :
+          lastChild  ? "`--" :
+                       "+--"))
+
+      var firstLine = true
+      func output(_ str: String) {
+        print((firstLine ? firstPrefix : prefix) + str)
+        firstLine = false
+      }
+
       let runJobSymbol = inspector.getSymbol(address: task.runJob)
       let runJobName = runJobSymbol.name ?? "<\(hex: task.runJob)>"
       let runJobLibrary = runJobSymbol.library ?? "<unknown>"
 
-      print(prefix, "\(hex: task.address) - flags=\(hex: task.flags) id=\(task.id)")
+      output("Task \(hex: task.address) - flags=\(hex: task.flags) id=\(task.id)")
       if let parent = task.parent {
-        print(prefix, "  parent: \(hex: parent)")
+        output("parent: \(hex: parent)")
       }
-      print(prefix, "  resume function: \(runJobName) in \(runJobLibrary)")
-      print(prefix, "  task allocator: \(task.allocatorTotalSize) bytes in \(task.allocatorTotalChunks) chunks")
+      output("resume function: \(runJobName) in \(runJobLibrary)")
+      output("task allocator: \(task.allocatorTotalSize) bytes in \(task.allocatorTotalChunks) chunks")
+
+      if levelWillDecrease {
+        print(prefix)
+      }
     }
 
     print("")
