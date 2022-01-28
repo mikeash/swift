@@ -167,26 +167,42 @@ fileprivate class ConcurrencyDumper {
     )
   }
 
+  func taskHierarchy() -> [(level: Int, task: TaskInfo)] {
+    var hierarchy: [(level: Int, task: TaskInfo)] = []
+
+    let topLevelTasks = tasks.values.filter{ $0.parent == nil }
+    for top in topLevelTasks.sorted(by: { $0.address < $1.address }) {
+      var stack: [(index: Int, task: TaskInfo)] = [(0, top)]
+      hierarchy.append((0, top))
+
+      while let (index, task) = stack.popLast() {
+        if index < task.childTasks.count {
+          stack.append((index + 1, task))
+          let childPtr = task.childTasks[index]
+          let childTask = tasks[childPtr]!
+          hierarchy.append((stack.count, childTask))
+          stack.append((0, childTask))
+        }
+      }
+    }
+    return hierarchy
+  }
+
   func dumpTasks() {
     print("TASKS")
 
-    for task in tasks.keys.sorted() {
-      let info = tasks[task]!
-      let runJobSymbol = inspector.getSymbol(address: info.runJob)
-      let runJobName = runJobSymbol.name ?? "<\(hex: info.runJob)>"
+    for (level, task) in taskHierarchy() {
+      let prefix = String(repeating: " ", count: level * 2 + 2)
+      let runJobSymbol = inspector.getSymbol(address: task.runJob)
+      let runJobName = runJobSymbol.name ?? "<\(hex: task.runJob)>"
       let runJobLibrary = runJobSymbol.library ?? "<unknown>"
 
-      let childrenHex = info.childTasks.map{ "\(hex: $0)" }
-
-      print("  \(hex: task) - flags=\(hex: info.flags) id=\(info.id)")
-      if let parent = info.parent {
-        print("    parent: \(hex: parent)")
+      print(prefix, "\(hex: task.address) - flags=\(hex: task.flags) id=\(task.id)")
+      if let parent = task.parent {
+        print(prefix, "  parent: \(hex: parent)")
       }
-      print("    resume function: \(runJobName) in \(runJobLibrary)")
-      print("    task allocator: \(info.allocatorTotalSize) bytes in \(info.allocatorTotalChunks) chunks")
-      if !childrenHex.isEmpty {
-        print("    children:", childrenHex.joined(separator: ", "))
-      }
+      print(prefix, "  resume function: \(runJobName) in \(runJobLibrary)")
+      print(prefix, "  task allocator: \(task.allocatorTotalSize) bytes in \(task.allocatorTotalChunks) chunks")
     }
 
     print("")
