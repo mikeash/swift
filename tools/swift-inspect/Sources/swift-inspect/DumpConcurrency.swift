@@ -18,13 +18,15 @@ fileprivate class ConcurrencyDumper {
 
   struct TaskInfo {
     var address: swift_reflection_ptr_t
-    var flags: UInt32
+    var jobFlags: UInt32
+    var taskStatusFlags: UInt64
     var id: UInt64
     var runJob: swift_reflection_ptr_t
     var allocatorSlabPtr: swift_reflection_ptr_t
     var allocatorTotalSize: Int
     var allocatorTotalChunks: Int
     var childTasks: [swift_reflection_ptr_t]
+    var asyncBacktrace: [swift_reflection_ptr_t]
     var parent: swift_reflection_ptr_t?
   }
 
@@ -136,11 +138,14 @@ fileprivate class ConcurrencyDumper {
       return nil
     }
 
-    // ChildTasks is a temporary pointer which we must copy out before we call
+    // These arrays are temporary pointers which we must copy out before we call
     // into Remote Mirror again.
     let children = Array(UnsafeBufferPointer(
         start: reflectionInfo.ChildTasks,
         count: Int(reflectionInfo.ChildTaskCount)))
+    let asyncBacktraceFrames = Array(UnsafeBufferPointer(
+        start: reflectionInfo.AsyncBacktraceFrames,
+        count: Int(reflectionInfo.AsyncBacktraceFramesCount)))
 
     var allocatorSlab = reflectionInfo.AllocatorSlabPtr
     var allocatorTotalSize = 0
@@ -157,13 +162,15 @@ fileprivate class ConcurrencyDumper {
 
     return TaskInfo(
       address: task,
-      flags: reflectionInfo.Flags,
+      jobFlags: reflectionInfo.JobFlags,
+      taskStatusFlags: reflectionInfo.TaskStatusFlags,
       id: reflectionInfo.Id,
       runJob: reflectionInfo.RunJob,
       allocatorSlabPtr: reflectionInfo.AllocatorSlabPtr,
       allocatorTotalSize: allocatorTotalSize,
       allocatorTotalChunks: allocatorTotalChunks,
-      childTasks: children
+      childTasks: children,
+      asyncBacktrace: asyncBacktraceFrames
     )
   }
 
@@ -188,6 +195,23 @@ fileprivate class ConcurrencyDumper {
     return hierarchy
   }
 
+  func remove(from: String, upTo: String) -> String {
+    from.withCString {
+      if let found = strstr($0, upTo) {
+        return String(cString: found + strlen(upTo))
+      }
+      return from
+    }
+  }
+
+  func symbolicateBacktracePointer(ptr: swift_reflection_ptr_t) -> String {
+    guard let name = inspector.getSymbol(address: ptr).name else {
+      return "<\(hex: ptr)>"
+    }
+
+    return remove(from: name, upTo: " await resume partial function for ")
+  }
+
   func dumpTasks() {
     print("TASKS")
 
@@ -199,18 +223,23 @@ fileprivate class ConcurrencyDumper {
       lastChilds.append(lastChild)
 
       let nextEntry = i < hierarchy.count - 1 ? hierarchy[i + 1] : nil
+      let prevEntry = i > 0 ? hierarchy[i - 1] : nil
 
       let levelWillDecrease = level > (nextEntry?.level ?? -1)
+      let levelDidIncrease = level > (prevEntry?.level ?? -1)
 
       var prefix = ""
       for lastChild in lastChilds {
-        prefix += lastChild ? "    " : "  | "
+        prefix += lastChild ? "     " : "   | "
       }
-      prefix += "  "
-      let firstPrefix = String(prefix.dropLast(4) + (
-          level == 0 ? "    " :
+      prefix += "   "
+      let firstPrefix = String(prefix.dropLast(5) + (
+          level == 0 ? "   " :
           lastChild  ? "`--" :
                        "+--"))
+      if levelDidIncrease {
+        print(prefix)
+      }
 
       var firstLine = true
       func output(_ str: String) {
@@ -219,17 +248,31 @@ fileprivate class ConcurrencyDumper {
       }
 
       let runJobSymbol = inspector.getSymbol(address: task.runJob)
-      let runJobName = runJobSymbol.name ?? "<\(hex: task.runJob)>"
       let runJobLibrary = runJobSymbol.library ?? "<unknown>"
 
-      output("Task \(hex: task.address) - flags=\(hex: task.flags) id=\(task.id)")
+      let symbolicatedBacktrace = task.asyncBacktrace.map(symbolicateBacktracePointer)
+
+      output("Task \(hex: task.address) - jobFlags=\(hex: task.jobFlags) taskStatusFlags=\(hex: task.taskStatusFlags) id=\(task.id)")
       if let parent = task.parent {
         output("parent: \(hex: parent)")
       }
-      output("resume function: \(runJobName) in \(runJobLibrary)")
+
+      if let first = symbolicatedBacktrace.first {
+        output("async backtrace: \(first)")
+        for entry in symbolicatedBacktrace.dropFirst() {
+          output("                 \(entry)")
+        }
+      }
+
+      output("resume function: \(symbolicateBacktracePointer(ptr: task.runJob)) in \(runJobLibrary)")
       output("task allocator: \(task.allocatorTotalSize) bytes in \(task.allocatorTotalChunks) chunks")
 
-      if levelWillDecrease {
+      if task.childTasks.count > 0 {
+        let s = task.childTasks.count > 1 ? "s" : ""
+        output("* \(task.childTasks.count) child task\(s)")
+      }
+
+      if (task.childTasks.isEmpty) && i < hierarchy.count - 1 {
         print(prefix)
       }
     }

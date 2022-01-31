@@ -231,13 +231,17 @@ typedef struct swift_async_task_info {
   /// swift_reflection call on the given context.
   const char *Error;
 
-  uint32_t Flags;
+  uint32_t JobFlags;
+  uint64_t TaskStatusFlags;
   uint64_t Id;
   swift_reflection_ptr_t RunJob;
   swift_reflection_ptr_t AllocatorSlabPtr;
 
   unsigned ChildTaskCount;
   swift_reflection_ptr_t *ChildTasks;
+
+  unsigned AsyncBacktraceFramesCount;
+  swift_reflection_ptr_t *AsyncBacktraceFrames;
 } swift_async_task_info_t;
 
 typedef struct swift_actor_info {

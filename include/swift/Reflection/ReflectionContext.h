@@ -144,11 +144,13 @@ public:
   };
 
   struct AsyncTaskInfo {
-    uint32_t Flags;
+    uint32_t JobFlags;
+    uint64_t TaskStatusFlags;
     uint64_t Id;
     StoredPointer RunJob;
     StoredPointer AllocatorSlabPtr;
     std::vector<StoredPointer> ChildTasks;
+    std::vector<StoredPointer> AsyncBacktraceFrames;
   };
 
   struct ActorInfo {
@@ -1424,12 +1426,14 @@ public:
       return {std::string("failure reading async task"), {}};
 
     AsyncTaskInfo Info{};
-    Info.Flags = AsyncTaskObj->Flags;
+    Info.JobFlags = AsyncTaskObj->Flags;
+    Info.TaskStatusFlags = AsyncTaskObj->PrivateStorage.Status.Flags;
     Info.Id =
         AsyncTaskObj->Id | ((uint64_t)AsyncTaskObj->PrivateStorage.Id << 32);
     Info.AllocatorSlabPtr = AsyncTaskObj->PrivateStorage.Allocator.FirstSlab;
     Info.RunJob = getRunJob(AsyncTaskObj.get());
 
+    // Find all child tasks.
     auto RecordPtr = AsyncTaskObj->PrivateStorage.Status.Record;
     while (RecordPtr) {
       auto RecordObj = readObj<TaskStatusRecord<Runtime>>(RecordPtr);
@@ -1458,13 +1462,28 @@ public:
 
         StoredPointer ChildFragmentAddr = ChildTask + sizeof(AsyncTask<Runtime>);
         auto ChildFragmentObj = readObj<ChildFragment<Runtime>>(ChildFragmentAddr);
-        if (ChildFragmentObj) {
+        if (ChildFragmentObj)
           ChildTask = ChildFragmentObj->NextChild;
-        } else
+        else
           ChildTask = 0;
       }
 
       RecordPtr = RecordObj->Parent;
+    }
+
+    // Walk the async backtrace if the task isn't running or cancelled.
+    int IsCancelledFlag = 0x100;
+    int IsRunningFlag = 0x800;
+    if (!(AsyncTaskObj->PrivateStorage.Status.Flags & IsCancelledFlag) &&
+        !(AsyncTaskObj->PrivateStorage.Status.Flags & IsRunningFlag)) {
+      auto ResumeContext = AsyncTaskObj->ResumeContextAndReserved[0];
+      while (ResumeContext) {
+        auto ResumeContextObj = readObj<AsyncContext<Runtime>>(ResumeContext);
+        if (!ResumeContextObj)
+          break;
+        Info.AsyncBacktraceFrames.push_back(stripSignedPointer(ResumeContextObj->ResumeParent));
+        ResumeContext = stripSignedPointer(ResumeContextObj->Parent);
+      }
     }
 
     return {llvm::None, Info};

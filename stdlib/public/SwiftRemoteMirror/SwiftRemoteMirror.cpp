@@ -71,6 +71,23 @@ struct SwiftReflectionContext {
     freeTemporaryAllocation = [obj]{ delete obj; };
     return obj;
   }
+
+  // Allocate a single temporary object that will stay allocated until the next
+  // call to allocateTemporaryObject, or until the context is destroyed. Does
+  // NOT free any existing objects created with allocateTemporaryObject or
+  // allocateSubsequentTemporaryObject. Use to allocate additional objects after
+  // a call to allocateTemporaryObject when muliple objects are needed
+  // simultaneously.
+  template <typename T>
+  T *allocateSubsequentTemporaryObject() {
+    T *obj = new T;
+    auto oldFree = freeTemporaryAllocation;
+    freeTemporaryAllocation = [obj, oldFree]{
+      delete obj;
+      oldFree();
+    };
+    return obj;
+  }
 };
 
 
@@ -848,7 +865,8 @@ swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
 
   swift_async_task_info_t Result = {};
   Result.Error = returnableCString(ContextRef, Error);
-  Result.Flags = TaskInfo.Flags;
+  Result.JobFlags = TaskInfo.JobFlags;
+  Result.TaskStatusFlags = TaskInfo.TaskStatusFlags;
   Result.Id = TaskInfo.Id;
   Result.RunJob = TaskInfo.RunJob;
   Result.AllocatorSlabPtr = TaskInfo.AllocatorSlabPtr;
@@ -857,6 +875,11 @@ swift_reflection_asyncTaskInfo(SwiftReflectionContextRef ContextRef,
   std::copy(TaskInfo.ChildTasks.begin(), TaskInfo.ChildTasks.end(), std::back_inserter(*ChildTasks));
   Result.ChildTaskCount = ChildTasks->size();
   Result.ChildTasks = ChildTasks->data();
+
+  auto *AsyncBacktraceFrames = ContextRef->allocateSubsequentTemporaryObject<std::vector<swift_reflection_ptr_t>>();
+  std::copy(TaskInfo.AsyncBacktraceFrames.begin(), TaskInfo.AsyncBacktraceFrames.end(), std::back_inserter(*AsyncBacktraceFrames));
+  Result.AsyncBacktraceFramesCount = AsyncBacktraceFrames->size();
+  Result.AsyncBacktraceFrames = AsyncBacktraceFrames->data();
 
   return Result;
 }
