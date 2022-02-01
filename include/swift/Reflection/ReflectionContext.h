@@ -1472,6 +1472,8 @@ public:
     }
 
     // Walk the async backtrace if the task isn't running or cancelled.
+    // TODO: Use isEnqueued from https://github.com/apple/swift/pull/41088/ once
+    // that's available.
     int IsCancelledFlag = 0x100;
     int IsRunningFlag = 0x800;
     if (!(AsyncTaskObj->PrivateStorage.Status.Flags & IsCancelledFlag) &&

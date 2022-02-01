@@ -212,6 +212,70 @@ fileprivate class ConcurrencyDumper {
     return remove(from: name, upTo: " await resume partial function for ")
   }
 
+  func flagsStrings<T: BinaryInteger>(flags: T, strings: [T: String]) -> [String] {
+    return strings.sorted{ $0.key < $1.key }
+                  .filter({ ($0.key & flags) != 0})
+                  .map{ $0.value }
+  }
+
+  func flagsString<T: BinaryInteger>(flags: T, strings: [T: String]) -> String {
+    let flagStrs = flagsStrings(flags: flags, strings: strings)
+    if flagStrs.isEmpty {
+      return "0"
+    }
+
+    let flagsStr = flagStrs.joined(separator: "|")
+    return flagsStr
+  }
+
+  func decodeTaskFlags(_ info: TaskInfo) -> (
+    priority: UInt32,
+    flags: String
+  ) {
+    let priority = (info.jobFlags >> 8) & 0xff
+    let jobFlags = flagsStrings(flags: info.jobFlags, strings: [
+      1 << 24: "childTask",
+      1 << 25: "future",
+      1 << 26: "groupChildTask",
+      1 << 28: "asyncLetTask"
+    ])
+    let taskFlags = flagsStrings(flags: info.taskStatusFlags, strings: [
+      0x100: "cancelled",
+      0x200: "locked",
+      0x400: "escalated",
+      0x800: "running"
+    ])
+    let allFlags = jobFlags + taskFlags
+    let flagsStr = allFlags.isEmpty ? "0" : allFlags.joined(separator: "|")
+    return (priority, flagsStr)
+  }
+
+  func decodeActorFlags(_ flags: UInt64) -> (
+    status: String,
+    flags: String,
+    maxPriority: UInt64
+  ) {
+    let statuses: [UInt64: String] = [
+      0: "idle",
+      1: "scheduled",
+      2: "running",
+      3: "zombie-latching",
+      4: "zombie-ready-for-deallocation"
+    ]
+    let flagsString = flagsString(flags: flags, strings: [
+      1 << 3: "hasActiveInlineJob",
+      1 << 4: "isDistributedRemote"
+    ])
+
+    let status = flags & 0x7
+    let maxPriority = (flags >> 8) & 0xff
+    return (
+      status: statuses[status] ?? "unknown(\(status))",
+      flags: flagsString,
+      maxPriority: maxPriority
+    )
+  }
+
   func dumpTasks() {
     print("TASKS")
 
@@ -252,7 +316,9 @@ fileprivate class ConcurrencyDumper {
 
       let symbolicatedBacktrace = task.asyncBacktrace.map(symbolicateBacktracePointer)
 
-      output("Task \(hex: task.address) - jobFlags=\(hex: task.jobFlags) taskStatusFlags=\(hex: task.taskStatusFlags) id=\(task.id)")
+      let flags = decodeTaskFlags(task)
+
+      output("Task \(hex: task.address) - flags=\(flags.flags) priority=\(hex: flags.priority) id=\(task.id)")
       if let parent = task.parent {
         output("parent: \(hex: parent)")
       }
@@ -287,7 +353,10 @@ fileprivate class ConcurrencyDumper {
       let metadata = swift_reflection_metadataForObject(context, UInt(actor))
       let metadataName = name(metadata: swift_reflection_ptr_t(metadata)) ?? "<unknown class name>"
       let info = swift_reflection_actorInfo(context, actor);
-      print("  \(hex: actor) \(metadataName) flags=\(hex: info.Flags)")
+
+      let flags = decodeActorFlags(info.Flags)
+
+      print("  \(hex: actor) \(metadataName) status=\(flags.status) flags=\(flags.flags) maxPriority=\(hex: flags.maxPriority)")
 
       var job = info.FirstJob
       if job == 0 {
