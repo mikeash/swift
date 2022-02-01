@@ -178,7 +178,7 @@ fileprivate class ConcurrencyDumper {
     var hierarchy: [(level: Int, lastChild: Bool, task: TaskInfo)] = []
 
     let topLevelTasks = tasks.values.filter{ $0.parent == nil }
-    for top in topLevelTasks.sorted(by: { $0.address < $1.address }) {
+    for top in topLevelTasks.sorted(by: { $0.id < $1.id }) {
       var stack: [(index: Int, task: TaskInfo)] = [(0, top)]
       hierarchy.append((0, true, top))
 
@@ -209,7 +209,7 @@ fileprivate class ConcurrencyDumper {
       return "<\(hex: ptr)>"
     }
 
-    return remove(from: name, upTo: " await resume partial function for ")
+    return remove(from: name, upTo: " resume partial function for ")
   }
 
   func flagsStrings<T: BinaryInteger>(flags: T, strings: [T: String]) -> [String] {
@@ -318,7 +318,7 @@ fileprivate class ConcurrencyDumper {
 
       let flags = decodeTaskFlags(task)
 
-      output("Task \(hex: task.address) - flags=\(flags.flags) priority=\(hex: flags.priority) id=\(task.id)")
+      output("Task \(hex: task.id) - flags=\(flags.flags) priority=\(hex: flags.priority) address=\(hex: task.address)")
       if let parent = task.parent {
         output("parent: \(hex: parent)")
       }
@@ -358,22 +358,27 @@ fileprivate class ConcurrencyDumper {
 
       print("  \(hex: actor) \(metadataName) status=\(flags.status) flags=\(flags.flags) maxPriority=\(hex: flags.maxPriority)")
 
+      func jobStr(_ job: swift_reflection_ptr_t) -> String {
+        if let task = tasks[job] {
+          return "Task \(hex: task.id) \(symbolicateBacktracePointer(ptr: task.runJob))"
+        }
+        return "<internal job \(hex: job)>"
+      }
+
       var job = info.FirstJob
       if job == 0 {
-        print("    empty job queue")
+        print("    no jobs queued")
       } else {
-        print("    job queue: \(hex: job)", terminator: "")
+        print("    job queue: \(jobStr(job))")
         while job != 0 {
           job = swift_reflection_nextJob(context, job);
           if job != 0 {
-            print(" -> \(hex: job)", terminator: "")
+            print("               \(jobStr(job))")
           }
         }
-        print("")
       }
+        print("")
     }
-
-    print("")
   }
 
   func dumpThreads() {
@@ -384,7 +389,13 @@ fileprivate class ConcurrencyDumper {
     }
 
     for (thread, task) in threadCurrentTasks {
-      print("  Thread \(hex: thread) - current task: \(task)")
+      let taskStr: String
+      if let info = tasks[task] {
+        taskStr = "\(hex: info.id)"
+      } else {
+        taskStr = "<unknown task \(hex: task)>"
+      }
+      print("  Thread \(hex: thread) - current task: \(taskStr)")
     }
   }
 }
