@@ -21,6 +21,8 @@
 #include <new>
 #include <utility>
 
+#include "Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "swift/Runtime/Config.h"
 #include "../../../stdlib/public/SwiftShims/Visibility.h"
 
@@ -80,6 +82,38 @@ static inline void swift_cxx_deleteObject(T *ptr) {
     swift_slowDealloc(ptr, sizeof(T), alignof(T) - 1);
   }
 }
+
+template <class T>
+struct SwiftAllocator {
+  typedef T value_type;
+
+  T *allocate(size_t n) {
+    bool overflowed;
+    size_t bytes = llvm::SaturatingMultiply(n, sizeof(T), &overflowed);
+    if (overflowed)
+      swift::crash("Memory allocation calculation overflowed.");
+#if SWIFT_BUILDING_SWIFTCORE
+    return reinterpret_cast<T *>(swift_slowAlloc(bytes, alignof(T) - 1));
+#else
+    return reinterpret_cast<T *>(malloc(bytes));
+#endif
+  }
+
+  void deallocate(T *ptr, size_t n) {
+#if SWIFT_BUILDING_SWIFTCORE
+    bool overflowed;
+    size_t bytes = llvm::SaturatingMultiply(n, sizeof(T), &overflowed);
+    if (overflowed)
+      swift::crash("Memory deallocation calculation overflowed.");
+    swift_slowDealloc(ptr, bytes, alignof(T) - 1);
+#else
+    free(ptr);
+#endif
+  }
+
+  bool operator==(const SwiftAllocator<T> &other) { return true; }
+  bool operator!=(const SwiftAllocator<T> &other) { return false; }
+};
 }
 
 #endif // SWIFT_RUNTIME_HEAP_H

@@ -1009,7 +1009,7 @@ protected:
 
     case NodeKind::Tuple: {
       llvm::SmallVector<BuiltType, 8> elements;
-      std::string labels;
+      string labels;
       for (auto &element : *Node) {
         if (element->getKind() != NodeKind::TupleElement)
           return MAKE_NODE_TYPE_ERROR0(Node, "unexpected kind");

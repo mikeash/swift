@@ -1330,7 +1330,7 @@ ManglingError Remangler::mangleFunctionSignatureSpecialization(Node *node,
           NodePointer TextNd = Param->getChild(2);
           StringRef Text = TextNd->getText();
           if (!Text.empty() && (isDigit(Text[0]) || Text[0] == '_')) {
-            std::string Buffer = "_";
+            string Buffer = "_";
             Buffer.append(Text.data(), Text.size());
             TextNd = Factory.createNode(Node::Kind::Identifier, Buffer);
           }
@@ -3470,7 +3470,7 @@ ManglingError Remangler::mangleExtendedExistentialTypeShape(Node *node,
 } // anonymous namespace
 
 /// The top-level interface to the remangler.
-ManglingErrorOr<std::string> Demangle::mangleNode(NodePointer node) {
+ManglingErrorOr<string> Demangle::mangleNode(NodePointer node) {
   return mangleNode(node, [](SymbolicReferenceKind, const void *) -> NodePointer {
                             return nullptr;
                           });
@@ -3478,9 +3478,9 @@ ManglingErrorOr<std::string> Demangle::mangleNode(NodePointer node) {
   //              "resolve it to a non-symbolic demangling tree instead");
 }
 
-ManglingErrorOr<std::string>
+ManglingErrorOr<string>
 Demangle::mangleNode(NodePointer node, SymbolicResolver resolver) {
-  if (!node) return std::string();
+  if (!node) return {};
 
   NodeFactory Factory;
   Remangler remangler(resolver, Factory);

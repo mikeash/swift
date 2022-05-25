@@ -6453,10 +6453,10 @@ void swift::verifyMangledNameRoundtrip(const Metadata *metadata) {
                    "Metadata mangled name failed to roundtrip: %p couldn't be mangled\n",
                    metadata);
   } else {
-    std::string mangledName = mangling.result();
+    auto mangledName = mangling.result();
     auto result =
       swift_getTypeByMangledName(MetadataState::Abstract,
-                                 mangledName,
+                                 Demangle::stringToStringRef(mangledName),
                                  nullptr,
                                  [](unsigned, unsigned){ return nullptr; },
                                  [](const Metadata *, unsigned) { return nullptr; })

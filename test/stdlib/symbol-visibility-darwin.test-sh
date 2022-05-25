@@ -10,6 +10,10 @@
 // RUN: %llvm-nm --defined-only --extern-only --no-weak --demangle %platform-dylib-dir/%target-library-name(swiftCore) > %t/swiftCore-no-weak.txt
 // RUN: diff -u %t/swiftCore-all.txt %t/swiftCore-no-weak.txt
 
+// And ensure that we aren't trying to bring in any outside operator new/delete.
+// We don't want to call any overrides that other code might have added.
+// RUN: %llvm-nm --undefined-only --demangle %platform-dylib-dir/%target-library-name(swiftCore) | not grep 'operator new\|operator delete'
+
 // RUN: %llvm-nm --defined-only --extern-only --demangle %platform-dylib-dir/%target-library-name(swiftRemoteMirror) > %t/swiftRemoteMirror-all.txt
 // RUN: %llvm-nm --defined-only --extern-only --no-weak --demangle %platform-dylib-dir/%target-library-name(swiftRemoteMirror) > %t/swiftRemoteMirror-no-weak.txt
 // RUN: diff -u %t/swiftRemoteMirror-all.txt %t/swiftRemoteMirror-no-weak.txt

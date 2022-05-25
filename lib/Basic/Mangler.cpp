@@ -181,13 +181,13 @@ void Mangler::verify(StringRef nameStr) {
     llvm::errs() << "Can't remangle: " << nameStr << '\n';
     abort();
   }
-  std::string Remangled = mangling.result();
-  if (Remangled == nameStr)
+  string Remangled = mangling.result();
+  if (stringToStringRef(Remangled) == nameStr)
     return;
 
   llvm::errs() << "Remangling failed:\n"
                   "original     = " << nameStr << "\n"
-                  "remangled    = " << Remangled << "\n";
+                  "remangled    = " << stringToStringRef(Remangled) << "\n";
   abort();
 #endif
 }

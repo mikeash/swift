@@ -21,6 +21,7 @@
 
 #include "swift/Demangling/Errors.h"
 #include "swift/Demangling/NamespaceMacros.h"
+#include "swift/Runtime/Heap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Compiler.h"
 #include <cassert>
@@ -36,11 +37,34 @@ namespace swift {
 namespace Demangle {
 SWIFT_BEGIN_INLINE_NAMESPACE
 
+#if SWIFT_BUILDING_DEMANGLE_LIBRARY
+// When building a library, we want to use a custom allocator to avoid
+// calling the global new/delete operators.
+using string = std::basic_string<char, std::char_traits<char>, SwiftAllocator<char>>;
+
+template<typename T>
+using vector = std::vector<T, SwiftAllocator<T>>;
+#else
+using string = std::string;
+
+template<typename T>
+using vector = std::vector<T>;
+#endif
+
+static inline string stringRefToString(const llvm::StringRef &stringRef) {
+  return string(stringRef.data(), stringRef.size());
+}
+
+// Create a StringRef that references (does not copy!) the given string.
+static inline llvm::StringRef stringToStringRef(const string &str) {
+  return llvm::StringRef(str.data(), str.size());
+}
+
 enum class SymbolicReferenceKind : uint8_t;
 
 /// A simple default implementation that assigns letters to type parameters in
 /// alphabetic order.
-std::string genericParameterName(uint64_t depth, uint64_t index);
+string genericParameterName(uint64_t depth, uint64_t index);
 
 /// Display style options for the demangler.
 struct DemangleOptions {
@@ -69,7 +93,7 @@ struct DemangleOptions {
   /// If this is nonempty, entities in this module name will not be qualified.
   llvm::StringRef HidingCurrentModule;
   /// A function to render generic parameter names.
-  std::function<std::string(uint64_t, uint64_t)> GenericParameterName =
+  std::function<string(uint64_t, uint64_t)> GenericParameterName =
       genericParameterName;
 
   DemangleOptions() {}
@@ -392,7 +416,7 @@ public:
   /// prefix: _T, _T0, $S, _$S.
   ///
   /// \returns The demangled string.
-  std::string demangleSymbolAsString(
+  string demangleSymbolAsString(
       llvm::StringRef MangledName,
       const DemangleOptions &Options = DemangleOptions());
 
@@ -402,7 +426,7 @@ public:
   /// a mangling prefix.
   ///
   /// \returns The demangled string.
-  std::string
+  string
   demangleTypeAsString(llvm::StringRef MangledName,
                        const DemangleOptions &Options = DemangleOptions());
 
@@ -418,7 +442,7 @@ public:
   /// characters from \p MangledName. If \p MangledName is not a thunk symbol
   /// or the thunk target cannot be derived from the mangling, an empty string
   /// is returned.
-  std::string getThunkTarget(llvm::StringRef MangledName);
+  string getThunkTarget(llvm::StringRef MangledName);
 
   /// Returns true if the \p mangledName refers to a function which conforms to
   /// the Swift calling convention.
@@ -433,7 +457,7 @@ public:
   /// prefix: _T, _T0, $S, _$S.
   ///
   /// \returns The module name.
-  std::string getModuleName(llvm::StringRef mangledName);
+  string getModuleName(llvm::StringRef mangledName);
 
   /// Deallocates all nodes.
   ///
@@ -449,7 +473,7 @@ public:
 /// \param mangledName The mangled name string pointer.
 /// \param mangledNameLength The length of the mangledName string.
 /// \returns The demangled string.
-std::string
+string
 demangleSymbolAsString(const char *mangledName, size_t mangledNameLength,
                        const DemangleOptions &options = DemangleOptions());
 
@@ -459,8 +483,8 @@ demangleSymbolAsString(const char *mangledName, size_t mangledNameLength,
 /// Context::demangleSymbolAsString should be used instead.
 /// \param mangledName The mangled name string.
 /// \returns The demangled string.
-inline std::string
-demangleSymbolAsString(const std::string &mangledName,
+inline string
+demangleSymbolAsString(const string &mangledName,
                        const DemangleOptions &options = DemangleOptions()) {
   return demangleSymbolAsString(mangledName.data(), mangledName.size(),
                                 options);
@@ -472,7 +496,7 @@ demangleSymbolAsString(const std::string &mangledName,
 /// Context::demangleSymbolAsString should be used instead.
 /// \param MangledName The mangled name string.
 /// \returns The demangled string.
-inline std::string
+inline string
 demangleSymbolAsString(llvm::StringRef MangledName,
                        const DemangleOptions &Options = DemangleOptions()) {
   return demangleSymbolAsString(MangledName.data(),
@@ -486,7 +510,7 @@ demangleSymbolAsString(llvm::StringRef MangledName,
 /// \param mangledName The mangled name string pointer.
 /// \param mangledNameLength The length of the mangledName string.
 /// \returns The demangled string.
-std::string
+string
 demangleTypeAsString(const char *mangledName, size_t mangledNameLength,
                      const DemangleOptions &options = DemangleOptions());
 
@@ -496,8 +520,8 @@ demangleTypeAsString(const char *mangledName, size_t mangledNameLength,
 /// Context::demangleTypeAsString should be used instead.
 /// \param mangledName The mangled name string.
 /// \returns The demangled string.
-inline std::string
-demangleTypeAsString(const std::string &mangledName,
+inline string
+demangleTypeAsString(const string &mangledName,
                      const DemangleOptions &options = DemangleOptions()) {
   return demangleTypeAsString(mangledName.data(), mangledName.size(), options);
 }
@@ -508,7 +532,7 @@ demangleTypeAsString(const std::string &mangledName,
 /// Context::demangleTypeAsString should be used instead.
 /// \param MangledName The mangled name string.
 /// \returns The demangled string.
-inline std::string
+inline string
 demangleTypeAsString(llvm::StringRef MangledName,
                      const DemangleOptions &Options = DemangleOptions()) {
   return demangleTypeAsString(MangledName.data(),
@@ -592,7 +616,7 @@ public:
 };
 
 /// Remangle a demangled parse tree.
-ManglingErrorOr<std::string> mangleNode(NodePointer root);
+ManglingErrorOr<string> mangleNode(NodePointer root);
 
 using SymbolicResolver =
   llvm::function_ref<Demangle::NodePointer (SymbolicReferenceKind,
@@ -600,7 +624,7 @@ using SymbolicResolver =
 
 /// Remangle a demangled parse tree, using a callback to resolve
 /// symbolic references.
-ManglingErrorOr<std::string> mangleNode(NodePointer root, SymbolicResolver resolver);
+ManglingErrorOr<string> mangleNode(NodePointer root, SymbolicResolver resolver);
 
 /// Remangle a demangled parse tree, using a callback to resolve
 /// symbolic references.
@@ -614,7 +638,7 @@ ManglingErrorOr<llvm::StringRef> mangleNode(NodePointer root,
 /// Remangle in the old mangling scheme.
 ///
 /// This is only used for objc-runtime names.
-ManglingErrorOr<std::string> mangleNodeOld(NodePointer root);
+ManglingErrorOr<string> mangleNodeOld(NodePointer root);
 
 /// Remangle in the old mangling scheme.
 ///
@@ -635,7 +659,7 @@ ManglingErrorOr<const char *> mangleNodeAsObjcCString(NodePointer node,
 ///
 /// Typical usage:
 /// \code
-///   std::string aDemangledName =
+///   string aDemangledName =
 /// swift::Demangler::nodeToString(aNode)
 /// \endcode
 ///
@@ -644,10 +668,10 @@ ManglingErrorOr<const char *> mangleNodeAsObjcCString(NodePointer node,
 ///
 /// \returns A string representing the demangled name.
 ///
-std::string nodeToString(NodePointer Root,
+string nodeToString(NodePointer Root,
                          const DemangleOptions &Options = DemangleOptions());
 
-/// A class for printing to a std::string.
+/// A class for printing to a string.
 class DemanglerPrinter {
 public:
   DemanglerPrinter() = default;
@@ -657,6 +681,16 @@ public:
     return *this;
   }
   
+  DemanglerPrinter &operator<<(const string &str) & {
+    Stream.append(str);
+    return *this;
+  }
+
+  DemanglerPrinter &operator<<(const char *str) & {
+    Stream.append(str);
+    return *this;
+  }
+
   DemanglerPrinter &operator<<(char c) & {
     Stream.push_back(c);
     return *this;
@@ -683,9 +717,9 @@ public:
   
   DemanglerPrinter &writeHex(unsigned long long n) &;
  
-  std::string &&str() && { return std::move(Stream); }
+  string &&str() && { return std::move(Stream); }
 
-  llvm::StringRef getStringRef() const { return Stream; }
+  llvm::StringRef getStringRef() const { return llvm::StringRef{Stream.data(), Stream.size()}; }
 
   /// Shrinks the buffer.
   void resetSize(size_t toPos) {
@@ -693,16 +727,16 @@ public:
     Stream.resize(toPos);
   }
 private:
-  std::string Stream;
+  string Stream;
 };
 
 /// Returns a the node kind \p k as string.
 const char *getNodeKindString(swift::Demangle::Node::Kind k);
 
-/// Prints the whole node tree \p Root in readable form into a std::string.
+/// Prints the whole node tree \p Root in readable form into a string.
 ///
 /// Useful for debugging.
-std::string getNodeTreeAsString(NodePointer Root);
+string getNodeTreeAsString(NodePointer Root);
 
 bool nodeConsumesGenericArgs(Node *node);
 

@@ -19,6 +19,7 @@
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/ManglingUtils.h"
 #include "swift/Strings.h"
+#include "swift/Runtime/Heap.h"
 #include "swift/Demangling/Punycode.h"
 #include "llvm/ADT/Optional.h"
 #include <functional>
@@ -149,7 +150,7 @@ public:
     return result;
   }
 
-  bool readUntil(char c, std::string &result) {
+  bool readUntil(char c, string &result) {
     llvm::Optional<char> c2;
     while (!isEmpty() && (c2 = peek()).getValue() != c) {
       result.push_back(c2.getValue());
@@ -161,7 +162,7 @@ public:
 
 /// The main class for parsing a demangling tree out of a mangled string.
 class OldDemangler {
-  std::vector<NodePointer> Substitutions;
+  std::vector<NodePointer, SwiftAllocator<NodePointer>> Substitutions;
   NameSource Mangled;
   NodeFactory &Factory;
 
@@ -542,7 +543,7 @@ private:
     }
 
     if (Mangled.nextIf('i')) {
-      std::string Str;
+      string Str;
       if (!Mangled.readUntil('_', Str) || !Mangled.nextIf('_'))
         return false;
       parent->addChild(FUNCSIGSPEC_CREATE_PARAM_KIND(ConstantPropInteger), Factory);
@@ -551,7 +552,7 @@ private:
     }
 
     if (Mangled.nextIf("fl")) {
-      std::string Str;
+      string Str;
       if (!Mangled.readUntil('_', Str) || !Mangled.nextIf('_'))
         return false;
       parent->addChild(FUNCSIGSPEC_CREATE_PARAM_KIND(ConstantPropFloat), Factory);
@@ -568,7 +569,7 @@ private:
       char encoding = Mangled.peek();
       if (encoding != '0' && encoding != '1')
         return false;
-      std::string encodingStr;
+      string encodingStr;
       if (encoding == '0')
         encodingStr += "u8";
       else
@@ -774,14 +775,14 @@ private:
       return nullptr;
     
     bool isPunycoded = Mangled.nextIf('X');
-    std::string decodeBuffer;
+    string decodeBuffer;
 
     auto decode = [&](StringRef s) -> StringRef {
       if (!isPunycoded)
         return s;
       if (!Punycode::decodePunycodeUTF8(s, decodeBuffer))
         return {};
-      return decodeBuffer;
+      return stringToStringRef(decodeBuffer);
     };
     
     bool isOperator = false;
@@ -824,7 +825,7 @@ private:
       return nullptr;
 
     // Decode operator names.
-    std::string opDecodeBuffer;
+    string opDecodeBuffer;
     if (isOperator) {
                                         // abcdefghijklmnopqrstuvwxyz
       static const char op_char_table[] = "& @/= >    <*!|+?%-~   ^ .";
@@ -843,7 +844,7 @@ private:
           return nullptr;
         opDecodeBuffer.push_back(o);
       }
-      identifier = opDecodeBuffer;
+      identifier = stringToStringRef(opDecodeBuffer);
     }
     
     return Factory.createNode(*kind, identifier);
@@ -1959,7 +1960,7 @@ private:
         return nullptr;
       if (!Mangled.nextIf('R'))
         return nullptr;
-      return Factory.createNode(Node::Kind::ErrorType, std::string());
+      return Factory.createNode(Node::Kind::ErrorType, string());
     }
     if (c == 'F') {
       return demangleFunctionType(Node::Kind::FunctionType, depth + 1);

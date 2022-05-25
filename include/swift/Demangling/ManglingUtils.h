@@ -15,6 +15,7 @@
 
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringRef.h"
+#include "swift/Demangling/Demangle.h"
 #include "swift/Demangling/NamespaceMacros.h"
 #include "swift/Demangling/Punycode.h"
 
@@ -97,7 +98,7 @@ char translateOperatorChar(char op);
 
 /// Returns a string where all characters of the operator \p Op are translated
 /// to their mangled form.
-std::string translateOperator(StringRef Op);
+Demangle::string translateOperator(StringRef Op);
 
 /// Returns the standard type kind for an 'S' substitution, e.g. 'i' for "Int".
 ///
@@ -125,10 +126,10 @@ void mangleIdentifier(Mangler &M, StringRef ident) {
   if (M.UsePunycode && needsPunycodeEncoding(ident)) {
     // If the identifier contains non-ASCII character, we mangle
     // with an initial '00' and Punycode the identifier string.
-    std::string punycodeBuf;
+    Demangle::string punycodeBuf;
     Punycode::encodePunycodeUTF8(ident, punycodeBuf,
                                  /*mapNonSymbolChars*/ true);
-    StringRef pcIdent = punycodeBuf;
+    StringRef pcIdent = Demangle::stringToStringRef(punycodeBuf);
     M.Buffer << "00" << pcIdent.size();
     if (isDigit(pcIdent[0]) || pcIdent[0] == '_')
       M.Buffer << '_';

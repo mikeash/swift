@@ -58,8 +58,8 @@ char Mangle::translateOperatorChar(char op) {
   }
 }
 
-std::string Mangle::translateOperator(StringRef Op) {
-  std::string Encoded;
+Demangle::string Mangle::translateOperator(StringRef Op) {
+  Demangle::string Encoded;
   for (char ch : Op) {
     Encoded.push_back(translateOperatorChar(ch));
   }

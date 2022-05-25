@@ -19,6 +19,7 @@
 #define SWIFT_DEMANGLING_TypeLookupError_H
 
 #include "swift/Basic/TaggedUnion.h"
+#include "swift/Demangling/Demangle.h"
 #include "swift/Runtime/Portability.h"
 #include <cstring>
 #include <string>
@@ -79,11 +80,11 @@ private:
   }
 
   /// Helper functions for getting a C string from a lambda. These allow us to
-  /// wrap lambdas returning `char *` or `std::string` and standardize them on
+  /// wrap lambdas returning `char *` or `Demangle::string` and standardize them on
   /// `char *`.
   static char *getCString(char *str) { return str; }
 
-  static char *getCString(const std::string &str) {
+  static char *getCString(const Demangle::string &str) {
     return strdup(str.c_str());
   }
 
@@ -127,7 +128,7 @@ public:
   }
 
   /// Construct a TypeLookupError that wraps a function returning a string. The
-  /// passed-in function can return either a `std::string` or `char *`. If it
+  /// passed-in function can return either a `Demangle::string` or `char *`. If it
   /// returns `char *` then the string will be destroyed with `free()`.
   template <typename F> TypeLookupError(const F &fn) {
     Context = new F(fn);

@@ -247,7 +247,7 @@ swift::swift_getMangledTypeName(const Metadata *type) {
     auto mangling = Demangle::mangleNode(demangling);
     if (!mangling.isSuccess())
       return TypeNamePair{NULL, 0};
-    std::string name = mangling.result();
+    auto name = mangling.result();
 
     // Copy it to memory we can reference forever.
     auto size = name.size();

@@ -18,6 +18,9 @@ if(SWIFT_RUNTIME_ENABLE_LEAK_CHECKER)
   set(swift_runtime_leaks_sources Leaks.mm)
 endif()
 
+list(APPEND swift_runtime_compile_flags
+     "-DSWIFT_BUILDING_SWIFTCORE=1")
+
 set(swift_runtime_objc_sources
     ErrorObject.mm
     SwiftObject.mm

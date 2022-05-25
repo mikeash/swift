@@ -53,7 +53,7 @@ static void printer_unreachable(const char *Message) {
   std::abort();
 }
 
-std::string Demangle::genericParameterName(uint64_t depth, uint64_t index) {
+string Demangle::genericParameterName(uint64_t depth, uint64_t index) {
   DemanglerPrinter name;
   do {
     name << (char)('A' + (index % 26));
@@ -67,9 +67,9 @@ std::string Demangle::genericParameterName(uint64_t depth, uint64_t index) {
 namespace {
 
 struct QuotedString {
-  std::string Value;
+  string Value;
 
-  explicit QuotedString(std::string Value) : Value(Value) {}
+  explicit QuotedString(string Value) : Value(Value) {}
 };
 
 static DemanglerPrinter &operator<<(DemanglerPrinter &printer,
@@ -176,7 +176,7 @@ private:
 public:
   NodePrinter(DemangleOptions options) : Options(options) {}
 
-  std::string printRoot(NodePointer root) {
+  string printRoot(NodePointer root) {
     isValid = true;
     print(root, 0);
     if (isValid)
@@ -751,11 +751,11 @@ private:
       return;
     }
 
-    auto getLabelFor = [&](NodePointer Param, unsigned Index) -> std::string {
+    auto getLabelFor = [&](NodePointer Param, unsigned Index) -> string {
       auto Label = LabelList->getChild(Index);
       assert(Label && (Label->getKind() == Node::Kind::Identifier ||
                        Label->getKind() == Node::Kind::FirstElementMarker));
-      return Label->getKind() == Node::Kind::Identifier ? Label->getText().str()
+      return Label->getKind() == Node::Kind::Identifier ? stringRefToString(Label->getText())
                                                         : "_";
     };
 
@@ -1032,7 +1032,7 @@ void NodePrinter::printFunctionSigSpecializationParams(NodePointer Node,
       print(Node->getChild(Idx++), depth + 1);
       Printer << " : ";
       const auto &text = Node->getChild(Idx++)->getText();
-      std::string demangledName = demangleSymbolAsString(text);
+      string demangledName = demangleSymbolAsString(text);
       if (demangledName.empty()) {
         Printer << text;
       } else {
@@ -1333,7 +1333,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   case Node::Kind::Suffix:
     if (Options.DisplayUnmangledSuffix) {
       Printer << " with unmangled suffix "
-              << QuotedString(Node->getText().str());
+              << QuotedString(stringRefToString(Node->getText()));
     }
     return nullptr;
   case Node::Kind::Initializer:
@@ -1554,7 +1554,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
   case Node::Kind::FunctionSignatureSpecializationParam:
     printer_unreachable("should be handled in printSpecializationPrefix");
   case Node::Kind::FunctionSignatureSpecializationParamPayload: {
-    std::string demangledName = demangleSymbolAsString(Node->getText());
+    string demangledName = demangleSymbolAsString(Node->getText());
     if (demangledName.empty()) {
       Printer << Node->getText();
     } else {
@@ -3159,7 +3159,7 @@ void NodePrinter::printEntityType(NodePointer Entity, NodePointer type,
   }
 }
 
-std::string Demangle::nodeToString(NodePointer root,
+string Demangle::nodeToString(NodePointer root,
                                    const DemangleOptions &options) {
   if (!root)
     return "";

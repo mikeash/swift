@@ -93,7 +93,7 @@ static bool isRequirement(Node::Kind kind) {
 
 void swift::Demangle::failAssert(const char *file, unsigned line,
                                  NodePointer node, const char *expr) {
-  std::string treeStr = getNodeTreeAsString(node);
+  auto treeStr = getNodeTreeAsString(node);
 
   fatal(0,
         "%s:%u: assertion failed for Node %p: %s\n"
@@ -1080,10 +1080,10 @@ NodePointer Demangler::demangleIdentifier() {
       return nullptr;
     StringRef Slice = StringRef(Text.data() + Pos, numChars);
     if (isPunycoded) {
-      std::string PunycodedString;
+      string PunycodedString;
       if (!Punycode::decodePunycodeUTF8(Slice, PunycodedString))
         return nullptr;
-      Identifier.append(StringRef(PunycodedString), *this);
+      Identifier.append(stringToStringRef(PunycodedString), *this);
     } else {
       Identifier.append(Slice, *this);
       int wordStartPos = -1;
@@ -2618,7 +2618,7 @@ NodePointer Demangler::demangleThunkOrSpecialization() {
       return createNode(Node::Kind::OutlinedVariable, Idx);
     }
     case 'e': {
-      std::string Params = demangleBridgedMethodParams();
+      string Params = demangleBridgedMethodParams();
       if (Params.empty())
         return nullptr;
       return createNode(Node::Kind::OutlinedBridgedMethod, Params);
@@ -2748,7 +2748,7 @@ NodePointer Demangler::demangleDifferentiabilityWitness() {
 }
 
 NodePointer Demangler::demangleIndexSubset() {
-  std::string str;
+  string str;
   for (auto c = peekChar(); c == 'S' || c == 'U'; c = peekChar()) {
     str.push_back(c);
     (void)nextChar();
@@ -2771,16 +2771,16 @@ NodePointer Demangler::demangleDifferentiableFunctionType() {
       Node::Kind::DifferentiableFunctionType, (Node::IndexType)kind);
 }
 
-std::string Demangler::demangleBridgedMethodParams() {
+string Demangler::demangleBridgedMethodParams() {
   if (nextIf('_'))
-    return std::string();
+    return {};
 
-  std::string Str;
+  string Str;
 
   auto kind = nextChar();
   switch (kind) {
   default:
-    return std::string();
+    return {};
   case 'p': case 'a': case 'm':
     Str.push_back(kind);
   }
@@ -2788,7 +2788,7 @@ std::string Demangler::demangleBridgedMethodParams() {
   while (!nextIf('_')) {
     auto c = nextChar();
     if (c != 'n' && c != 'b' && c != 'g')
-      return std::string();
+      return {};
     Str.push_back(c);
   }
   return Str;

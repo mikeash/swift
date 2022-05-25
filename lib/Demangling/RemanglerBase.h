@@ -142,7 +142,7 @@ protected:
 
   // The "overflow" for InlineSubstitutions. Only if InlineSubstitutions is
   // full, new substitutions are stored in OverflowSubstitutions.
-  std::unordered_map<SubstitutionEntry, unsigned, SubstitutionEntry::Hasher>
+  std::unordered_map<SubstitutionEntry, unsigned, SubstitutionEntry::Hasher, std::equal_to<SubstitutionEntry>, SwiftAllocator<std::pair<const SubstitutionEntry, unsigned>>>
     OverflowSubstitutions;
 
   RemanglerBuffer Buffer;
@@ -167,8 +167,8 @@ public:
 
   StringRef getBufferStr() const { return Buffer.strRef(); }
 
-  std::string str() {
-    return getBufferStr().str();
+  string str() {
+    return stringRefToString(getBufferStr());
   }
 };
 

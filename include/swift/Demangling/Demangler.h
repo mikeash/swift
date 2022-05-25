@@ -76,7 +76,7 @@ class NodeFactory {
 #ifdef NODE_FACTORY_DEBUGGING
   size_t allocatedMemory = 0;
   static int nestingLevel;
-  std::string indent() { return std::string(nestingLevel * 2, ' '); }
+  string indent() { return string(nestingLevel * 2, ' '); }
 #endif
 
 public:
@@ -227,6 +227,13 @@ public:
   /// The \p Text string is copied.
   NodePointer createNode(Node::Kind K, llvm::StringRef Text) {
     return createNodeWithAllocatedText(K, Text.copy(*this));
+  }
+
+  /// Creates a node of kind \p K with a \p Text payload.
+  ///
+  /// The \p Text string is copied.
+  NodePointer createNode(Node::Kind K, const string &str) {
+    return createNode(K, stringToStringRef(str));
   }
 
   /// Creates a node of kind \p K with a \p Text payload.
@@ -492,7 +499,7 @@ protected:
   NodePointer demangleIdentifier();
   NodePointer demangleOperatorIdentifier();
 
-  std::string demangleBridgedMethodParams();
+  string demangleBridgedMethodParams();
 
   NodePointer demangleMultiSubstitutions();
   NodePointer pushMultiSubstitutions(int RepeatCount, size_t SubstIdx);

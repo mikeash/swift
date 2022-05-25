@@ -38,7 +38,7 @@ namespace {
 
     class EntityContext {
       bool AsContext = false;
-      std::string AnonymousContextDiscriminator;
+      string AnonymousContextDiscriminator;
     public:
       bool isAsContext() const {
         return AsContext;
@@ -48,7 +48,7 @@ namespace {
         AnonymousContextDiscriminator = discriminator.str();
       }
       
-      std::string takeAnonymousContextDiscriminator() {
+      string takeAnonymousContextDiscriminator() {
         auto r = std::move(AnonymousContextDiscriminator);
         AnonymousContextDiscriminator.clear();
         return r;
@@ -1282,7 +1282,7 @@ Remangler::mangleNamedEntity(Node *node, char basicKind, StringRef entityKind,
   auto privateDiscriminator = ctx.takeAnonymousContextDiscriminator();
   if (!privateDiscriminator.empty() &&
       swift::Mangle::isDigit(privateDiscriminator[0]))
-    privateDiscriminator = "_" + privateDiscriminator;
+    privateDiscriminator = string("_") + privateDiscriminator;
   if (!artificialPrivateDiscriminator.empty())
     privateDiscriminator.append(artificialPrivateDiscriminator.data(),
                                 artificialPrivateDiscriminator.size());
@@ -1293,7 +1293,7 @@ Remangler::mangleNamedEntity(Node *node, char basicKind, StringRef entityKind,
       && name->getKind() == Node::Kind::Identifier) {
     Buffer << 'P';
     RETURN_IF_ERROR(
-        mangleIdentifier(privateDiscriminator, OperatorKind::NotOperator));
+        mangleIdentifier(stringToStringRef(privateDiscriminator), OperatorKind::NotOperator));
   }
   return mangle(name, depth + 1);
 }
@@ -2765,9 +2765,9 @@ Remangler::mangleCanonicalPrespecializedGenericTypeCachingOnceToken(
 }
 
 /// The top-level interface to the remangler.
-ManglingErrorOr<std::string>
+ManglingErrorOr<string>
 Demangle::mangleNodeOld(NodePointer node) {
-  if (!node) return std::string();
+  if (!node) return string();
 
   NodeFactory Factory;
   Remangler remangler(Factory);

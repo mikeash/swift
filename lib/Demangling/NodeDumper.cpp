@@ -49,14 +49,14 @@ static void printNode(DemanglerPrinter &Out, const Node *node, unsigned depth) {
   }
 }
 
-std::string Demangle::getNodeTreeAsString(NodePointer Root) {
+string Demangle::getNodeTreeAsString(NodePointer Root) {
   DemanglerPrinter Printer;
   printNode(Printer, Root, 0);
   return std::move(Printer).str();
 }
 
 void swift::Demangle::Node::dump() {
-  std::string TreeStr = getNodeTreeAsString(this);
+  auto TreeStr = getNodeTreeAsString(this);
   fputs(TreeStr.c_str(), stderr);
 }
 

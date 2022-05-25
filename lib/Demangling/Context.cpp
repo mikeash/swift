@@ -55,25 +55,25 @@ NodePointer Context::demangleTypeAsNode(llvm::StringRef MangledName) {
 
 #if SWIFT_STDLIB_HAS_TYPE_PRINTING
 
-std::string Context::demangleSymbolAsString(llvm::StringRef MangledName,
+string Context::demangleSymbolAsString(llvm::StringRef MangledName,
                                             const DemangleOptions &Options) {
   NodePointer root = demangleSymbolAsNode(MangledName);
-  if (!root) return MangledName.str();
+  if (!root) return stringRefToString(MangledName);
 
-  std::string demangling = nodeToString(root, Options);
+  auto demangling = nodeToString(root, Options);
   if (demangling.empty())
-    return MangledName.str();
+    return stringRefToString(MangledName);
   return demangling;
 }
 
-std::string Context::demangleTypeAsString(llvm::StringRef MangledName,
+string Context::demangleTypeAsString(llvm::StringRef MangledName,
                                           const DemangleOptions &Options) {
   NodePointer root = demangleTypeAsNode(MangledName);
-  if (!root) return MangledName.str();
+  if (!root) return stringRefToString(MangledName);
   
-  std::string demangling = nodeToString(root, Options);
+  auto demangling = nodeToString(root, Options);
   if (demangling.empty())
-    return MangledName.str();
+    return stringRefToString(MangledName);
   return demangling;
 }
 
@@ -143,38 +143,38 @@ bool Context::isThunkSymbol(llvm::StringRef MangledName) {
   return false;
 }
 
-std::string Context::getThunkTarget(llvm::StringRef MangledName) {
+string Context::getThunkTarget(llvm::StringRef MangledName) {
   if (!isThunkSymbol(MangledName))
-    return std::string();
+    return {};
 
   if (isMangledName(MangledName)) {
     // If the symbol has a suffix we cannot derive the target.
     if (stripSuffix(MangledName) != MangledName)
-      return std::string();
+      return {};
 
     // The targets of those thunks not derivable from the mangling.
     if (MangledName.endswith("TR") ||
         MangledName.endswith("Tr") ||
         MangledName.endswith("TW") )
-      return std::string();
+      return {};
 
     if (MangledName.endswith("fC")) {
-      std::string target = MangledName.str();
+      auto target = stringRefToString(MangledName);
       target[target.size() - 1] = 'c';
       return target;
     }
 
-    return MangledName.substr(0, MangledName.size() - 2).str();
+    return stringRefToString(MangledName.substr(0, MangledName.size() - 2));
   }
   // Old mangling.
   assert(MangledName.startswith("_T"));
   StringRef Remaining = MangledName.substr(2);
   if (Remaining.startswith("PA_"))
-    return Remaining.substr(3).str();
+    return stringRefToString(Remaining.substr(3));
   if (Remaining.startswith("PAo_"))
-    return Remaining.substr(4).str();
+    return stringRefToString(Remaining.substr(4));
   assert(Remaining.startswith("To") || Remaining.startswith("TO"));
-  return std::string("_T") + Remaining.substr(2).str();
+  return string("_T") + stringRefToString(Remaining.substr(2));
 }
 
 bool Context::hasSwiftCallingConvention(llvm::StringRef MangledName) {
@@ -202,12 +202,12 @@ bool Context::hasSwiftCallingConvention(llvm::StringRef MangledName) {
   return true;
 }
 
-std::string Context::getModuleName(llvm::StringRef mangledName) {
+string Context::getModuleName(llvm::StringRef mangledName) {
   NodePointer node = demangleSymbolAsNode(mangledName);
   while (node) {
     switch (node->getKind()) {
     case Demangle::Node::Kind::Module:
-      return node->getText().str();
+      return stringRefToString(node->getText());
     case Demangle::Node::Kind::TypeMangling:
     case Demangle::Node::Kind::Type:
       node = node->getFirstChild();
@@ -236,10 +236,10 @@ std::string Context::getModuleName(llvm::StringRef mangledName) {
         node = node->getFirstChild();
         break;
       }
-      return std::string();
+      return {};
     }
   }
-  return std::string();
+  return {};
 }
 
 
@@ -249,7 +249,7 @@ std::string Context::getModuleName(llvm::StringRef mangledName) {
 
 #if SWIFT_STDLIB_HAS_TYPE_PRINTING
 
-std::string demangleSymbolAsString(const char *MangledName,
+string demangleSymbolAsString(const char *MangledName,
                                    size_t MangledNameLength,
                                    const DemangleOptions &Options) {
   Context Ctx;
@@ -257,7 +257,7 @@ std::string demangleSymbolAsString(const char *MangledName,
                                     Options);
 }
 
-std::string demangleTypeAsString(const char *MangledName,
+string demangleTypeAsString(const char *MangledName,
                                  size_t MangledNameLength,
                                  const DemangleOptions &Options) {
   Context Ctx;

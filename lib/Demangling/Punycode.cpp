@@ -73,7 +73,7 @@ static int adapt(int delta, int numpoints, bool firsttime) {
 // Section 6.2: Decoding procedure
 
 bool Punycode::decodePunycode(StringRef InputPunycode,
-                              std::vector<uint32_t> &OutCodePoints) {
+                              Demangle::vector<uint32_t> &OutCodePoints) {
   OutCodePoints.clear();
   OutCodePoints.reserve(InputPunycode.size());
 
@@ -145,8 +145,8 @@ bool Punycode::decodePunycode(StringRef InputPunycode,
 
 // Section 6.3: Encoding procedure
 
-bool Punycode::encodePunycode(const std::vector<uint32_t> &InputCodePoints,
-                              std::string &OutPunycode) {
+bool Punycode::encodePunycode(const Demangle::vector<uint32_t> &InputCodePoints,
+                              Demangle::string &OutPunycode) {
   OutPunycode.clear();
 
   uint32_t n = initial_n;
@@ -211,8 +211,8 @@ bool Punycode::encodePunycode(const std::vector<uint32_t> &InputCodePoints,
   return true;
 }
 
-static bool encodeToUTF8(const std::vector<uint32_t> &Scalars,
-                         std::string &OutUTF8) {
+static bool encodeToUTF8(const Demangle::vector<uint32_t> &Scalars,
+                         Demangle::string &OutUTF8) {
   for (auto S : Scalars) {
     if (!isValidUnicodeScalar(S)) {
       OutUTF8.clear();
@@ -274,8 +274,8 @@ static bool encodeToUTF8(const std::vector<uint32_t> &Scalars,
 }
 
 bool Punycode::decodePunycodeUTF8(StringRef InputPunycode,
-                                  std::string &OutUTF8) {
-  std::vector<uint32_t> OutCodePoints;
+                                  Demangle::string &OutUTF8) {
+  Demangle::vector<uint32_t> OutCodePoints;
   if (!decodePunycode(InputPunycode, OutCodePoints))
     return false;
 
@@ -295,7 +295,7 @@ static bool isContinuationByte(uint8_t unit) {
 /// except [$_a-zA-Z0-9]) are also encoded like non-ASCII unicode characters.
 /// Returns false if \p InputUTF8 contains surrogate code points.
 static bool convertUTF8toUTF32(llvm::StringRef InputUTF8,
-                               std::vector<uint32_t> &OutUTF32,
+                               Demangle::vector<uint32_t> &OutUTF32,
                                bool mapNonSymbolChars) {
   auto ptr = InputUTF8.begin();
   auto end = InputUTF8.end();
@@ -356,9 +356,9 @@ static bool convertUTF8toUTF32(llvm::StringRef InputUTF8,
 }
 
 bool Punycode::encodePunycodeUTF8(StringRef InputUTF8,
-                                  std::string &OutPunycode,
+                                  Demangle::string &OutPunycode,
                                   bool mapNonSymbolChars) {
-  std::vector<uint32_t> InputCodePoints;
+  Demangle::vector<uint32_t> InputCodePoints;
   InputCodePoints.reserve(InputUTF8.size());
 
   if (!convertUTF8toUTF32(InputUTF8, InputCodePoints, mapNonSymbolChars))
