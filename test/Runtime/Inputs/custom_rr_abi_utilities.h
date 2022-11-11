@@ -1,9 +1,5 @@
 #define NUM_REGS 30
 
-struct Registers {
-  void *x[NUM_REGS];
-};
-
 #define ALL_REGS(macro) \
   macro( 0) \
   macro( 1) \
@@ -60,15 +56,14 @@ struct Registers {
   macro(25, __VA_ARGS__) \
   macro(26, __VA_ARGS__) \
   macro(27, __VA_ARGS__) \
-  macro(28, __VA_ARGS__) \
-  macro(29, __VA_ARGS__)
+  macro(28, __VA_ARGS__)
 
 #define ALL_FUNCTIONS(macro) \
-  macro(swift_retain, true) \
-  macro(swift_release, false) \
+  macro(swift_retain, 1) \
+  macro(swift_release, 0) \
 
 #define PASS_REGS_HELPER(num) \
-  register void *x ## num asm ("x" #num) = regs->x[num];
+  register void *x ## num asm ("x" #num) = regs[num];
 #define PASS_REGS ALL_REGS(PASS_REGS_HELPER)
 
 #define REG_INPUTS_HELPER(num) \
@@ -76,20 +71,21 @@ struct Registers {
 #define REG_INPUTS ALL_REGS(REG_INPUTS_HELPER)
 
 #define MAKE_CALL_FUNC(reg, func) \
-  void call_ ## func ## x_ ## reg(struct Registers *regs) { \
+  static inline void call_ ## func ## _x ## reg(void **regs) { \
     PASS_REGS \
-    asm("bl _" #func ## x_ ## reg: : REG_INPUTS "i" (0)); \
+    asm("bl _" #func "_x" #reg: : REG_INPUTS "i" (0)); \
   }
 
-#define MAKE_ALL_CALL_FUNCS(function, isRetain)
+#define MAKE_ALL_CALL_FUNCS(function, isRetain) \
   FUNCTION_REGS(MAKE_CALL_FUNC, function)
 ALL_FUNCTIONS(MAKE_ALL_CALL_FUNCS)
 
-static inline void foreachRRFunction(void (*call)(void (*)(struct Registers *regs), int reg, bool isRetain)) {
+static inline void foreachRRFunction(void (*call)(void (*)(void **regs), const char *name, int reg, int isRetain)) {
   #define CALL_ONE_FUNCTION(reg, function, isRetain) \
-    call(function ## _x ## reg, reg, isRetain);
-  #define CALL_WITH_FUNCTIONS(function, isRetain)
+    call(call_ ## function ## _x ## reg, #function, reg, isRetain);
+  #define CALL_WITH_FUNCTIONS(function, isRetain) \
     FUNCTION_REGS(CALL_ONE_FUNCTION, function, isRetain)
 
   ALL_FUNCTIONS(CALL_WITH_FUNCTIONS)
+//   call_swift_retain_x21(0);
 }
