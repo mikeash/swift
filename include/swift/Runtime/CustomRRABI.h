@@ -61,7 +61,7 @@ template<typename Ret, typename Param> Param returnTypeHelper(Ret (*)(Param)) {}
 // Helper macro that defines one entrypoint that takes the parameter in reg and
 // calls through to function.
 #define CUSTOM_RR_ENTRYPOINTS_DEFINE_ONE_ENTRYPOINT(reg, function) \
-  extern "C" SWIFT_RUNTIME_EXPORT decltype(function(nullptr)) function ## _x ## reg() { \
+  SWIFT_RUNTIME_EXPORT decltype(function(nullptr)) function ## _x ## reg() { \
     decltype(returnTypeHelper(function)) ptr; \
     asm(".ifnc %0, x" #reg "\n" \
         "mov %0, x" #reg "\n" \
