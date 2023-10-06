@@ -790,6 +790,10 @@ initializeValueMetadataFromPattern(ValueMetadata *metadata,
   metadata->Description = description;
 }
 
+ValueMetadata *swift_allocateGenericValueMetadata_new(
+    const ValueTypeDescriptor *description, const void *arguments,
+    const GenericValueMetadataPattern *pattern, size_t extraDataSize);
+
 ValueMetadata *
 swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description,
                                           const void *arguments,
@@ -824,6 +828,12 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
 
   // Copy the generic arguments into place.
   installGenericArguments(metadata, description, arguments);
+
+  auto otherMetadata = swift_allocateGenericValueMetadata_new(description, arguments, pattern, extraDataSize);
+
+  auto a = asFullMetadata(metadata);
+  auto b = asFullMetadata(otherMetadata);
+  assert(!memcmp(a, b, totalSize));
 
   return metadata;
 }
