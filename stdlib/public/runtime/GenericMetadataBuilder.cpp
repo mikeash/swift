@@ -14,10 +14,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Support/Casting.h"
 #include "MetadataCache.h"
 #include "swift/ABI/Metadata.h"
 #include "swift/ABI/TargetLayout.h"
 #include "swift/Runtime/Metadata.h"
+#include <dlfcn.h>
+#include <inttypes.h>
+#include <string>
 
 using namespace swift;
 
@@ -88,7 +92,42 @@ public:
     resolvePointer(const RelativeIndirectablePointer<const U, Nullable> *ptr) {
       return {ptr->get()};
     }
+
+    template <typename U>
+    Buffer<const U>
+    resolvePointer(const U * const *ptr) {
+      return {*ptr};
+    }
+
+    uint64_t getAddress() {
+      return (uint64_t)ptr;
+    }
   };
+
+  struct SymbolInfo {
+    std::string symbolName;
+    std::string libraryName;
+    uint64_t pointerOffset;
+  };
+
+  template <typename T>
+  SymbolInfo getSymbolInfo(Buffer<T> buffer) {
+    Dl_info info;
+    int result = dladdr(buffer.ptr, &info);
+    if (result == 0)
+      return {"<unknown>", "<unknown>", 0};
+
+    if (info.dli_fname == nullptr)
+      info.dli_fname = "<unknown>";
+    if (info.dli_sname == nullptr)
+      info.dli_sname = "<unknown>";
+
+    const char *libName = info.dli_fname;
+    if (auto slash = strrchr(libName, '/'))
+      libName = slash + 1;
+
+    return {info.dli_sname, libName, buffer.getAddress() - (uintptr_t)info.dli_fbase};
+  }
 
   WritableData allocate(size_t size);
   template <typename T>
@@ -122,6 +161,8 @@ class GenericMetadataBuilder {
   using WritableData = typename ReaderWriter::WritableData;
 
   using StoredPointer = typename ReaderWriter::Runtime::StoredPointer;
+
+  using StoredSize = typename Runtime::StoredSize;
 
   using GenericArgument = typename ReaderWriter::GenericArgument;
 
@@ -223,6 +264,103 @@ public:
 
     return {metadataBuffer, metadataOffset};
   }
+
+  template <typename Printer>
+  class Dumper {
+    Printer print;
+    ReaderWriter readerWriter;
+
+    template <typename T>
+    void printPointer(Buffer<T> buffer) {
+      auto info = readerWriter.getSymbolInfo(buffer);
+      print("%#" PRIx64 " - %s (%s + %" PRIu64 ")", buffer.getAddress(), info.symbolName.c_str(), info.libraryName.c_str(), info.pointerOffset);
+    }
+
+    template <typename T>
+    void printPointer(const char *prefix, Buffer<T> buffer, const char *suffix = "\n") {
+      print("%s", prefix);
+      printPointer(buffer);
+      print("%s", suffix);
+    }
+
+  public:
+    Dumper(Printer print): print(print) {}
+
+    void dumpMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer) {
+      printPointer("Metadata ", metadataBuffer);
+
+      auto fullMetadata = asFullMetadata(metadataBuffer.ptr);
+
+      auto valueWitnesses = metadataBuffer.resolvePointer(&fullMetadata->ValueWitnesses);
+      printPointer("  value witnesses: ", valueWitnesses);
+
+      auto kind = fullMetadata->getKind();
+      auto kindString = getStringForMetadataKind(kind);
+      print("  kind: %#" PRIx32 " (%s)\n", static_cast<uint32_t>(kind), kindString.str().c_str());
+
+      if (auto classmd = dyn_cast<TargetClassMetadataType<Runtime>>(metadataBuffer.ptr))
+        dumpClassMetadata(metadataBuffer, classmd);
+      else if (auto valuemd = dyn_cast<TargetValueMetadata<Runtime>>(metadataBuffer.ptr))
+        dumpValueMetadata(metadataBuffer, valuemd);
+    }
+
+    void dumpClassMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer, const TargetClassMetadataType<Runtime> *metadata) {
+      print("  TODO class dumping\n");
+    }
+
+    void dumpValueMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer, const TargetValueMetadata<Runtime> *metadata) {
+      auto descriptionBuffer = metadataBuffer.resolvePointer(&metadata->Description);
+      auto description = descriptionBuffer.ptr;
+      printPointer("  description: ", descriptionBuffer);
+
+      if (description->hasLayoutString()) {
+        auto layoutStringBuffer = metadataBuffer.resolvePointer(&asFullMetadata(metadata)->layoutString);
+        printPointer("  layout string: ", layoutStringBuffer);
+      }
+
+      auto name = descriptionBuffer.resolvePointer(&description->Name);
+      printPointer("  name: ", name);
+      print("        \"%s\"\n", name.ptr);
+
+      if (auto structmd = dyn_cast<TargetStructMetadata<Runtime>>(metadataBuffer.ptr))
+        dumpStructMetadata(metadataBuffer, structmd);
+      else if (auto enummd = dyn_cast<TargetEnumMetadata<Runtime>>(metadataBuffer.ptr))
+        dumpEnumMetadata(metadataBuffer, enummd);
+
+      if (description->isGeneric()) {
+        auto numGenericParams = description->getGenericContextHeader().NumParams;
+        auto genericArgumentOffset = description->getGenericArgumentOffset();
+        auto asWords = reinterpret_cast<
+          ConstTargetMetadataPointer<Runtime, swift::TargetMetadata> const *>(metadata);
+        auto genericArguments = asWords + description->getGenericArgumentOffset();
+        for (unsigned i = 0; i < numGenericParams; i++) {
+          auto arg = metadataBuffer.resolvePointer(&genericArguments[i]);
+          print("  genericArg[%u]: ", i);
+          printPointer(arg);
+          print("\n");
+        }
+      }
+    }
+
+    void dumpStructMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer, const TargetStructMetadata<Runtime> *metadata) {
+
+    }
+
+    void dumpEnumMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer, const TargetEnumMetadata<Runtime> *metadata) {
+      auto descriptionBuffer = metadataBuffer.resolvePointer(&metadata->Description);
+      auto description = reinterpret_cast<const TargetEnumDescriptor<Runtime> *>(descriptionBuffer.ptr);
+
+      if (description->hasPayloadSizeOffset()) {
+        auto payloadSizeOffset = description->getPayloadSizeOffset();
+        print("  offset: %u\n", payloadSizeOffset);
+        const StoredSize *asWords = reinterpret_cast<const StoredSize *>(metadata);
+        auto payloadSize = asWords[payloadSizeOffset];
+        print("  payload size: %" PRIu64 "\n", (uint64_t)payloadSize);
+      }
+    }
+  };
+
+  template <typename Printer> Dumper(Printer) -> Dumper<Printer>;
 };
 
 // SWIFT_RUNTIME_EXPORT
@@ -237,4 +375,9 @@ ValueMetadata *swift_allocateGenericValueMetadata_new(
       {pattern}, extraDataSize);
   char *base = static_cast<char *>(data.ptr);
   return reinterpret_cast<ValueMetadata *>(base + offset);
+}
+
+void _swift_dumpMetadata(const Metadata *metadata) {
+  GenericMetadataBuilder<InProcessReaderWriter>::Dumper dumper(printf);
+  dumper.dumpMetadata({metadata});
 }

@@ -793,6 +793,7 @@ initializeValueMetadataFromPattern(ValueMetadata *metadata,
 ValueMetadata *swift_allocateGenericValueMetadata_new(
     const ValueTypeDescriptor *description, const void *arguments,
     const GenericValueMetadataPattern *pattern, size_t extraDataSize);
+void _swift_dumpMetadata(const Metadata *metadata);
 
 ValueMetadata *
 swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description,
@@ -834,6 +835,7 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
   auto a = asFullMetadata(metadata);
   auto b = asFullMetadata(otherMetadata);
   assert(!memcmp(a, b, totalSize));
+  _swift_dumpMetadata(metadata);
 
   return metadata;
 }
