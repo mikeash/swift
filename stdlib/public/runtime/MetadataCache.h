@@ -1179,6 +1179,7 @@ public:
         verifyMangledNameRoundtrip(value);
 #endif
 
+      asImpl().verifyBuiltMetadata(value, args...);
       return Status{allocationResult.Value, MetadataState::Complete};
     }
 
@@ -1205,13 +1206,20 @@ public:
     return true;
   }
 
+  template <class... Args>
+  void verifyBuiltMetadata(Args &&...args) {
+    // By default, do no verification.
+  }
+
   /// Begin initialization immediately after allocation.
   template <class... Args>
   Status beginInitialization(WaitQueue::Worker &worker,
                              MetadataRequest request, Args &&...args) {
     // Note that we ignore the extra arguments; those are just for the
     // constructor and allocation.
-    return doInitialization(worker, request);
+    auto result = doInitialization(worker, request);
+    asImpl().verifyBuiltMetadata(asImpl().getValue(), args...);
+    return result;
   }
 
 private:

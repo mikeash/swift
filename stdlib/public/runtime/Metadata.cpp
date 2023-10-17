@@ -322,6 +322,8 @@ static PrivateMetadataState inferStateForMetadata(Metadata *metadata) {
   return PrivateMetadataState::LayoutComplete;
 }
 
+static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, const TypeContextDescriptor *description, const void *arguments);
+
 namespace {
   struct GenericCacheEntry final :
       VariadicMetadataCacheEntryBase<GenericCacheEntry> {
@@ -395,6 +397,13 @@ namespace {
                                   const TypeContextDescriptor *description,
                                              const void * const *arguments) {
       return true;
+    }
+
+    void verifyBuiltMetadata(const Metadata *original, const Metadata *candidate) {
+    }
+
+    void verifyBuiltMetadata(const Metadata *original, const TypeContextDescriptor *description, const void * const *arguments) {
+      _swift_validateNewGenericMetadataBuilder(original, description, arguments);
     }
 
     MetadataStateWithDependency tryInitialize(Metadata *metadata,
@@ -830,14 +839,31 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
   // Copy the generic arguments into place.
   installGenericArguments(metadata, description, arguments);
 
-  auto otherMetadata = swift_allocateGenericValueMetadata_new(description, arguments, pattern, extraDataSize);
-
-  auto a = asFullMetadata(metadata);
-  auto b = asFullMetadata(otherMetadata);
-  assert(!memcmp(a, b, totalSize));
-  _swift_dumpMetadata(metadata);
-
   return metadata;
+}
+
+static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, const TypeContextDescriptor *description, const void *arguments) {
+  if (auto valueDescriptor = dyn_cast<ValueTypeDescriptor>(description)) {
+    if (valueDescriptor->isGeneric()) {
+      auto pattern = reinterpret_cast<GenericValueMetadataPattern *>(valueDescriptor->getFullGenericContextHeader().DefaultInstantiationPattern.get());
+      size_t extraDataSize = 0;
+      if (pattern->hasExtraDataPattern()) {
+        auto extraDataPattern = pattern->getExtraDataPattern();
+        extraDataSize = (extraDataPattern->OffsetInWords + extraDataPattern->SizeInWords) * sizeof(void *);
+      }
+      auto otherMetadata = swift_allocateGenericValueMetadata_new(valueDescriptor, arguments, pattern, extraDataSize);
+
+      auto a = asFullMetadata(original);
+      auto b = asFullMetadata(otherMetadata);
+      size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
+      if (memcmp(a, b, totalSize)) {
+        printf("Error! Mismatch between new/old metadata builders!\n");
+        _swift_dumpMetadata(original);
+        _swift_dumpMetadata(otherMetadata);
+        abort();
+      }
+    }
+  }
 }
 
 ValueMetadata *

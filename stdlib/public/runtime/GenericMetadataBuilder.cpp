@@ -341,7 +341,6 @@ public:
       if (description->isGeneric()) {
         auto numGenericParams =
             description->getGenericContextHeader().NumParams;
-        auto genericArgumentOffset = description->getGenericArgumentOffset();
         auto asWords = reinterpret_cast<
             ConstTargetMetadataPointer<Runtime, swift::TargetMetadata> const *>(
             metadata);
