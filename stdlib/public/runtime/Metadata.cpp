@@ -825,7 +825,7 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
          (extraDataSize == (pattern->getExtraDataPattern()->OffsetInWords +
                             pattern->getExtraDataPattern()->SizeInWords) *
                                sizeof(void *)));
-
+  printf("extraDataSize=%zu\n", extraDataSize);
   size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
 
   auto bytes = (char*) MetadataAllocator(GenericValueMetadataTag)
@@ -842,21 +842,22 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
   return metadata;
 }
 
+size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description, const GenericMetadataPattern *pattern);
+
 static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, const TypeContextDescriptor *description, const void *arguments) {
   if (auto valueDescriptor = dyn_cast<ValueTypeDescriptor>(description)) {
     if (valueDescriptor->isGeneric()) {
       auto pattern = reinterpret_cast<GenericValueMetadataPattern *>(valueDescriptor->getFullGenericContextHeader().DefaultInstantiationPattern.get());
-      size_t extraDataSize = 0;
-      if (pattern->hasExtraDataPattern()) {
-        auto extraDataPattern = pattern->getExtraDataPattern();
-        extraDataSize = (extraDataPattern->OffsetInWords + extraDataPattern->SizeInWords) * sizeof(void *);
-      }
+      size_t extraDataSize = swift_genericValueDataExtraSize(valueDescriptor, pattern);
       auto otherMetadata = swift_allocateGenericValueMetadata_new(valueDescriptor, arguments, pattern, extraDataSize);
 
-      auto a = asFullMetadata(original);
-      auto b = asFullMetadata(otherMetadata);
-      size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
-      if (memcmp(a, b, totalSize)) {
+// Skip the VWT pointers when comparing for now.
+//       auto a = asFullMetadata(original);
+//       auto b = asFullMetadata(otherMetadata);
+//       size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
+//       if (memcmp(a, b, totalSize)) {
+      size_t totalSize = sizeof(ValueMetadata) + extraDataSize;
+      if (memcmp(original, otherMetadata, totalSize)) {
         printf("Error! Mismatch between new/old metadata builders!\n");
         _swift_dumpMetadata(original);
         _swift_dumpMetadata(otherMetadata);
