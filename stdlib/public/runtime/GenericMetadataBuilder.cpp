@@ -26,7 +26,9 @@
 using namespace swift;
 
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
-#define LOG(fmt, ...) fprintf(stderr, "%s:%d:%s: " fmt "\n", __FILE_NAME__, __LINE__, __func__ __VA_OPT__(,) __VA_ARGS__)
+#define LOG(fmt, ...)                                                          \
+  fprintf(stderr, "%s:%d:%s: " fmt "\n", __FILE_NAME__, __LINE__,              \
+          __func__ __VA_OPT__(, ) __VA_ARGS__)
 
 template <class T>
 static constexpr T roundUpToAlignment(T offset, T alignment) {
@@ -210,7 +212,8 @@ public:
              size_t(extraDataPattern->OffsetInWords) * sizeof(StoredPointer));
 
       // Copy the pattern into the rest of the extra data.
-      LOG("Writing %" PRIu16 "words of extra data from offset %" PRIu16, extraDataPattern->SizeInWords, extraDataPattern->OffsetInWords);
+      LOG("Writing %" PRIu16 "words of extra data from offset %" PRIu16,
+          extraDataPattern->SizeInWords, extraDataPattern->OffsetInWords);
       auto patternPointers =
           patternBuffer.resolvePointer(&extraDataPattern->Pattern);
       for (unsigned i = 0; i < extraDataPattern->SizeInWords; i++) {
@@ -251,7 +254,9 @@ public:
     const auto &header = genericContext.getGenericContextHeader();
     auto dst = (reinterpret_cast<GenericArgument *>(metadata) +
                 descriptionBuffer.ptr->getGenericArgumentOffset());
-    LOG("Installing %" PRIu16 " generic arguments at offset %" PRId32, header.NumKeyArguments, descriptionBuffer.ptr->getGenericArgumentOffset());
+    LOG("Installing %" PRIu16 " generic arguments at offset %" PRId32,
+        header.NumKeyArguments,
+        descriptionBuffer.ptr->getGenericArgumentOffset());
     for (unsigned i = 0; i < header.NumKeyArguments; i++)
       data.writePointer(&dst[i], arguments[i]);
 
@@ -272,7 +277,8 @@ public:
                                  sizeof(void *)));
 
     size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
-    LOG("Extra data size is %zu, allocating %zu bytes total", extraDataSize, totalSize);
+    LOG("Extra data size is %zu, allocating %zu bytes total", extraDataSize,
+        totalSize);
     auto metadataBuffer = readerWriter.allocate(totalSize);
     auto metadataOffset = sizeof(ValueMetadata::HeaderType);
 
@@ -286,7 +292,8 @@ public:
     return {metadataBuffer, metadataOffset};
   }
 
-  size_t extraDataSize(Buffer<const TargetTypeContextDescriptor<Runtime>> descriptionBuffer,
+  size_t extraDataSize(
+      Buffer<const TargetTypeContextDescriptor<Runtime>> descriptionBuffer,
       Buffer<const TargetGenericMetadataPattern<Runtime>> patternBuffer) {
     LOG("Getting extra data size for %s", getDescriptorName(descriptionBuffer));
 
@@ -295,27 +302,39 @@ public:
     auto *description = descriptionBuffer.ptr;
 
     if (auto *valueDescription = dyn_cast<ValueTypeDescriptor>(description)) {
-      auto *valuePattern = reinterpret_cast<const TargetGenericValueMetadataPattern<Runtime> *>(pattern);
+      auto *valuePattern =
+          reinterpret_cast<const TargetGenericValueMetadataPattern<Runtime> *>(
+              pattern);
       if (valuePattern->hasExtraDataPattern()) {
         auto extraDataPattern = valuePattern->getExtraDataPattern();
-        auto result = (extraDataPattern->OffsetInWords + extraDataPattern->SizeInWords) * sizeof(void *);
-        LOG("Value type descriptor has extra data pattern, extra data size: %zu", result);
+        auto result =
+            (extraDataPattern->OffsetInWords + extraDataPattern->SizeInWords) *
+            sizeof(void *);
+        LOG("Value type descriptor has extra data pattern, extra data size: "
+            "%zu",
+            result);
         return result;
       }
 
       if (auto structDescription = dyn_cast<StructDescriptor>(description)) {
         if (structDescription->hasFieldOffsetVector()) {
-          auto fieldsStart = structDescription->FieldOffsetVectorOffset * sizeof(void *);
-          auto fieldsEnd = fieldsStart + structDescription->NumFields * sizeof(uint32_t);
+          auto fieldsStart =
+              structDescription->FieldOffsetVectorOffset * sizeof(void *);
+          auto fieldsEnd =
+              fieldsStart + structDescription->NumFields * sizeof(uint32_t);
           auto size = fieldsEnd - sizeof(TargetStructMetadata<Runtime>);
           auto result = roundUpToAlignment(size, sizeof(StoredPointer));
-          LOG("Struct descriptor has field offset vector, computed extra data size: %zu", result);
+          LOG("Struct descriptor has field offset vector, computed extra data "
+              "size: %zu",
+              result);
           return result;
         } else if (structDescription->isGeneric()) {
           const auto &genericContext = *structDescription->getGenericContext();
           const auto &header = genericContext.getGenericContextHeader();
           auto result = header.NumKeyArguments * sizeof(void *);
-          LOG("Struct descriptor has no field offset vector, computed extra data size from generic arguments, extra data size: %zu", result);
+          LOG("Struct descriptor has no field offset vector, computed extra "
+              "data size from generic arguments, extra data size: %zu",
+              result);
           return result;
         }
       }
@@ -323,14 +342,19 @@ public:
       if (auto enumDescription = dyn_cast<EnumDescriptor>(description)) {
         if (enumDescription->hasPayloadSizeOffset()) {
           auto offset = enumDescription->getPayloadSizeOffset();
-          auto result = offset * sizeof(StoredPointer) - sizeof(TargetEnumMetadata<Runtime>);
-          LOG("Enum descriptor has payload size offset, computed extra data size: %zu", result);
+          auto result = offset * sizeof(StoredPointer) -
+                        sizeof(TargetEnumMetadata<Runtime>);
+          LOG("Enum descriptor has payload size offset, computed extra data "
+              "size: %zu",
+              result);
           return result;
         } else if (enumDescription->isGeneric()) {
           const auto &genericContext = *enumDescription->getGenericContext();
           const auto &header = genericContext.getGenericContextHeader();
           auto result = header.NumKeyArguments * sizeof(void *);
-          LOG("Enum descriptor has no payload size offset, computed extra data size from generic arguments, extra data size: %zu", result);
+          LOG("Enum descriptor has no payload size offset, computed extra data "
+              "size from generic arguments, extra data size: %zu",
+              result);
           return result;
         }
       }
@@ -436,10 +460,14 @@ public:
                        const TargetStructMetadata<Runtime> *metadata) {
       auto descriptionBuffer =
           metadataBuffer.resolvePointer(&metadata->Description);
-      auto structDescription = reinterpret_cast<const TargetStructDescriptor<Runtime> *>(descriptionBuffer.ptr);
+      auto structDescription =
+          reinterpret_cast<const TargetStructDescriptor<Runtime> *>(
+              descriptionBuffer.ptr);
       if (structDescription->hasFieldOffsetVector()) {
-        const StoredPointer *asWords = reinterpret_cast<const StoredPointer *>(metadata);
-        const uint32_t *offsets = reinterpret_cast<const uint32_t *>(asWords + structDescription->FieldOffsetVectorOffset);
+        const StoredPointer *asWords =
+            reinterpret_cast<const StoredPointer *>(metadata);
+        const uint32_t *offsets = reinterpret_cast<const uint32_t *>(
+            asWords + structDescription->FieldOffsetVectorOffset);
         for (unsigned i = 0; i < structDescription->NumFields; i++)
           print("  fieldOffset[%u]: %" PRIu32 "\n", i, offsets[i]);
       }
@@ -482,7 +510,8 @@ ValueMetadata *swift_allocateGenericValueMetadata_new(
   return reinterpret_cast<ValueMetadata *>(base + offset);
 }
 
-size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description, const GenericMetadataPattern *pattern) {
+size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description,
+                                       const GenericMetadataPattern *pattern) {
   GenericMetadataBuilder<InProcessReaderWriter> builder;
   return builder.extraDataSize({description}, {pattern});
 }
