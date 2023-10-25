@@ -843,24 +843,26 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
 }
 
 size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description, const GenericMetadataPattern *pattern);
+void swift_initializeGenericValueMetadata(ValueMetadata *metadata);
 
 static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, const TypeContextDescriptor *description, const void *arguments) {
   if (auto valueDescriptor = dyn_cast<ValueTypeDescriptor>(description)) {
     if (valueDescriptor->isGeneric()) {
       auto pattern = reinterpret_cast<GenericValueMetadataPattern *>(valueDescriptor->getFullGenericContextHeader().DefaultInstantiationPattern.get());
       size_t extraDataSize = swift_genericValueDataExtraSize(valueDescriptor, pattern);
-      auto otherMetadata = swift_allocateGenericValueMetadata_new(valueDescriptor, arguments, pattern, extraDataSize);
+      auto newMetadata = swift_allocateGenericValueMetadata_new(valueDescriptor, arguments, pattern, extraDataSize);
+      swift_initializeGenericValueMetadata(newMetadata);
 
 // Skip the VWT pointers when comparing for now.
 //       auto a = asFullMetadata(original);
-//       auto b = asFullMetadata(otherMetadata);
+//       auto b = asFullMetadata(newMetadata);
 //       size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
 //       if (memcmp(a, b, totalSize)) {
       size_t totalSize = sizeof(ValueMetadata) + extraDataSize;
-      if (memcmp(original, otherMetadata, totalSize)) {
+      if (memcmp(original, newMetadata, totalSize)) {
         printf("Error! Mismatch between new/old metadata builders!\n");
         _swift_dumpMetadata(original);
-        _swift_dumpMetadata(otherMetadata);
+        _swift_dumpMetadata(newMetadata);
         abort();
       }
     }
