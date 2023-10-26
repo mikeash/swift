@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MetadataCache.h"
+#include "Private.h"
 #include "swift/ABI/Metadata.h"
 #include "swift/ABI/TargetLayout.h"
 #include "swift/Runtime/Metadata.h"
@@ -312,7 +313,7 @@ public:
                  dyn_cast<TargetEnumMetadata<Runtime>>(metadataBuffer.ptr))
       initializeEnumMetadata(metadataBuffer, enummd);
     else
-      LOG("Don't know how to initialize metadata kind %#" PRIx32 "\n", static_cast<uint32_t>(metadataBuffer.ptr->getKind()));
+      LOG("Don't know how to initialize metadata kind %#" PRIx32, static_cast<uint32_t>(metadataBuffer.ptr->getKind()));
   }
 
   static constexpr TypeLayout getInitialLayoutForValueType() {
@@ -324,7 +325,12 @@ public:
 
     auto descriptionBuffer =
         metadataBuffer.resolvePointer(&metadata->Description);
-    auto description = descriptionBuffer.ptr;
+    auto description = reinterpret_cast<const TargetStructDescriptor<Runtime> *>(descriptionBuffer.ptr);
+
+    auto fieldDescriptorBuffer = descriptionBuffer.resolvePointer(&description->Fields);
+    auto fieldDescriptor = fieldDescriptorBuffer.ptr;
+    auto fields = fieldDescriptor->getFields();
+    LOG("%zu fields", fields.size());
 
     auto layout = getInitialLayoutForValueType();
     size_t size = layout.size;
@@ -332,18 +338,41 @@ public:
     bool isPOD = layout.flags.isPOD();
     bool isBitwiseTakable = layout.flags.isBitwiseTakable();
 
-    auto *fieldOffsetsStart = wordsOffset<StoredPointer>(metadata, structDescription->FieldOffsetVectorOffset);
+    auto *fieldOffsetsStart = wordsOffset<StoredPointer>(metadata, description->FieldOffsetVectorOffset);
     auto *fieldOffsets = reinterpret_cast<const uint32_t *>(fieldOffsetsStart);
 
     auto numGenericParams =
         description->getGenericContextHeader().NumParams;
     auto genericArguments = wordsOffset<ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(metadata, description->getGenericArgumentOffset());
-    for (unsigned i = 0; i != numGenericParams; ++i) {
-      auto arg = genericArguments[i];
-      auto wtableBuffer = metadataBuffer.resolvePointer(&asFullMetadata(metadata)->ValueWitnesses);
-      auto *wtable = wtableBuffer.ptr;
-      auto layout = wtable->getTypeLayout();
-      size = roundUpToAlignMask(size, layout->flags.getAlignmentMask());
+
+    for (unsigned i = 0; i != fields.size(); ++i) {
+      auto &field = fields[i];
+      auto nameBuffer = fieldDescriptorBuffer.resolvePointer(&field.FieldName);
+      auto mangledTypeNameBuffer = fieldDescriptorBuffer.resolvePointer(&field.MangledTypeName);
+      auto mangledTypeName = Demangle::makeSymbolicMangledNameStringRef(mangledTypeNameBuffer.ptr);
+      LOG("Examining field %u '%s' type '%.*s' (mangled name is %zu bytes)", i, nameBuffer.ptr, (int)mangledTypeName.size(), mangledTypeName.data(), mangledTypeName.size());
+
+      SubstGenericParametersFromMetadata substitutions(metadata);
+      auto result = swift_getTypeByMangledName(
+          MetadataState::LayoutComplete, mangledTypeName, substitutions.getGenericArgs(),
+          [&substitutions](unsigned depth, unsigned index) {
+            auto result = substitutions.getMetadata(depth, index).Ptr;
+            LOG("substitutions.getMetadata(%u, %u).Ptr = %p", depth, index, result);
+            return result;
+          },
+          [&substitutions](const Metadata *type, unsigned index) {
+            auto result = substitutions.getWitnessTable(type, index);
+            LOG("substitutions.getWitnessTable(%p, %u) = %p", type, index, result);
+            return result;
+          });
+      if (result.isError()) {
+        auto *error = result.getError();
+        char *errorStr = error->copyErrorString();
+        LOG("Failed to look up field: %s", errorStr);
+        error->freeErrorString(errorStr);
+        abort(); // TODO: fail gracefully
+      }
+      LOG("Looked up field type metadata %p", result.getType());
     }
   }
 
