@@ -305,7 +305,8 @@ public:
     return {metadataBuffer, metadataOffset};
   }
 
-  void initializeGenericValueMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer) {
+  void initializeGenericValueMetadata(
+      Buffer<TargetValueMetadata<Runtime>> metadataBuffer) {
     if (auto structmd =
             dyn_cast<TargetStructMetadata<Runtime>>(metadataBuffer.ptr))
       initializeStructMetadata(metadataBuffer, structmd);
@@ -313,21 +314,27 @@ public:
                  dyn_cast<TargetEnumMetadata<Runtime>>(metadataBuffer.ptr))
       initializeEnumMetadata(metadataBuffer, enummd);
     else
-      LOG("Don't know how to initialize metadata kind %#" PRIx32, static_cast<uint32_t>(metadataBuffer.ptr->getKind()));
+      LOG("Don't know how to initialize metadata kind %#" PRIx32,
+          static_cast<uint32_t>(metadataBuffer.ptr->getKind()));
   }
 
   static constexpr TypeLayout getInitialLayoutForValueType() {
     return {0, 0, ValueWitnessFlags().withAlignment(1).withPOD(true), 0};
   }
 
-  void initializeStructMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer, TargetStructMetadata<Runtime> *metadata) {
+  void
+  initializeStructMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer,
+                           TargetStructMetadata<Runtime> *metadata) {
     LOG("Initializing struct");
 
     auto descriptionBuffer =
         metadataBuffer.resolvePointer(&metadata->Description);
-    auto description = reinterpret_cast<const TargetStructDescriptor<Runtime> *>(descriptionBuffer.ptr);
+    auto description =
+        reinterpret_cast<const TargetStructDescriptor<Runtime> *>(
+            descriptionBuffer.ptr);
 
-    auto fieldDescriptorBuffer = descriptionBuffer.resolvePointer(&description->Fields);
+    auto fieldDescriptorBuffer =
+        descriptionBuffer.resolvePointer(&description->Fields);
     auto fieldDescriptor = fieldDescriptorBuffer.ptr;
     auto fields = fieldDescriptor->getFields();
     LOG("%zu fields", fields.size());
@@ -338,31 +345,40 @@ public:
     bool isPOD = layout.flags.isPOD();
     bool isBitwiseTakable = layout.flags.isBitwiseTakable();
 
-    auto *fieldOffsetsStart = wordsOffset<StoredPointer>(metadata, description->FieldOffsetVectorOffset);
+    auto *fieldOffsetsStart = wordsOffset<StoredPointer>(
+        metadata, description->FieldOffsetVectorOffset);
     auto *fieldOffsets = reinterpret_cast<const uint32_t *>(fieldOffsetsStart);
 
-    auto numGenericParams =
-        description->getGenericContextHeader().NumParams;
-    auto genericArguments = wordsOffset<ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(metadata, description->getGenericArgumentOffset());
+    auto numGenericParams = description->getGenericContextHeader().NumParams;
+    auto genericArguments =
+        wordsOffset<ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(
+            metadata, description->getGenericArgumentOffset());
 
     for (unsigned i = 0; i != fields.size(); ++i) {
       auto &field = fields[i];
       auto nameBuffer = fieldDescriptorBuffer.resolvePointer(&field.FieldName);
-      auto mangledTypeNameBuffer = fieldDescriptorBuffer.resolvePointer(&field.MangledTypeName);
-      auto mangledTypeName = Demangle::makeSymbolicMangledNameStringRef(mangledTypeNameBuffer.ptr);
-      LOG("Examining field %u '%s' type '%.*s' (mangled name is %zu bytes)", i, nameBuffer.ptr, (int)mangledTypeName.size(), mangledTypeName.data(), mangledTypeName.size());
+      auto mangledTypeNameBuffer =
+          fieldDescriptorBuffer.resolvePointer(&field.MangledTypeName);
+      auto mangledTypeName =
+          Demangle::makeSymbolicMangledNameStringRef(mangledTypeNameBuffer.ptr);
+      LOG("Examining field %u '%s' type '%.*s' (mangled name is %zu bytes)", i,
+          nameBuffer.ptr, (int)mangledTypeName.size(), mangledTypeName.data(),
+          mangledTypeName.size());
 
       SubstGenericParametersFromMetadata substitutions(metadata);
       auto result = swift_getTypeByMangledName(
-          MetadataState::LayoutComplete, mangledTypeName, substitutions.getGenericArgs(),
+          MetadataState::LayoutComplete, mangledTypeName,
+          substitutions.getGenericArgs(),
           [&substitutions](unsigned depth, unsigned index) {
             auto result = substitutions.getMetadata(depth, index).Ptr;
-            LOG("substitutions.getMetadata(%u, %u).Ptr = %p", depth, index, result);
+            LOG("substitutions.getMetadata(%u, %u).Ptr = %p", depth, index,
+                result);
             return result;
           },
           [&substitutions](const Metadata *type, unsigned index) {
             auto result = substitutions.getWitnessTable(type, index);
-            LOG("substitutions.getWitnessTable(%p, %u) = %p", type, index, result);
+            LOG("substitutions.getWitnessTable(%p, %u) = %p", type, index,
+                result);
             return result;
           });
       if (result.isError()) {
@@ -376,7 +392,9 @@ public:
     }
   }
 
-  void initializeEnumMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer, TargetEnumMetadata<Runtime> *metadata) {
+  void
+  initializeEnumMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer,
+                         TargetEnumMetadata<Runtime> *metadata) {
     LOG("Initializing enum");
   }
 
@@ -529,7 +547,9 @@ public:
       if (description->isGeneric()) {
         auto numGenericParams =
             description->getGenericContextHeader().NumParams;
-        auto genericArguments = wordsOffset<ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(metadata, description->getGenericArgumentOffset());
+        auto genericArguments = wordsOffset<
+            ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(
+            metadata, description->getGenericArgumentOffset());
         for (unsigned i = 0; i < numGenericParams; i++) {
           auto arg = metadataBuffer.resolvePointer(&genericArguments[i]);
           print("  genericArg[%u]: ", i);
@@ -548,7 +568,8 @@ public:
           reinterpret_cast<const TargetStructDescriptor<Runtime> *>(
               descriptionBuffer.ptr);
       if (structDescription->hasFieldOffsetVector()) {
-        auto *offsetsStart = wordsOffset<StoredPointer>(metadata, structDescription->FieldOffsetVectorOffset);
+        auto *offsetsStart = wordsOffset<StoredPointer>(
+            metadata, structDescription->FieldOffsetVectorOffset);
         auto *offsets = reinterpret_cast<const uint32_t *>(offsetsStart);
         for (unsigned i = 0; i < structDescription->NumFields; i++)
           print("  fieldOffset[%u]: %" PRIu32 "\n", i, offsets[i]);
@@ -566,7 +587,8 @@ public:
       if (description->hasPayloadSizeOffset()) {
         auto payloadSizeOffset = description->getPayloadSizeOffset();
         print("  offset: %u\n", payloadSizeOffset);
-        auto *payloadSizePtr = wordsOffset<StoredSize *>(metadata, payloadSizeOffset);
+        auto *payloadSizePtr =
+            wordsOffset<StoredSize *>(metadata, payloadSizeOffset);
         print("  payload size: %" PRIu64 "\n", (uint64_t)*payloadSizePtr);
       }
     }
