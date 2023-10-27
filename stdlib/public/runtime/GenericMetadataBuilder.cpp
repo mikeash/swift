@@ -36,6 +36,10 @@ static constexpr T roundUpToAlignment(T offset, T alignment) {
   return (offset + alignment - 1) & ~(alignment - 1);
 }
 
+static size_t roundUpToAlignMask(size_t size, size_t alignMask) {
+  return (size + alignMask) & ~alignMask;
+}
+
 class InProcessReaderWriter {
 public:
   using Runtime = InProcess;
@@ -347,7 +351,7 @@ public:
 
     auto *fieldOffsetsStart = wordsOffset<StoredPointer>(
         metadata, description->FieldOffsetVectorOffset);
-    auto *fieldOffsets = reinterpret_cast<const uint32_t *>(fieldOffsetsStart);
+    auto *fieldOffsets = reinterpret_cast<uint32_t *>(fieldOffsetsStart);
 
     auto numGenericParams = description->getGenericContextHeader().NumParams;
     auto genericArguments =
@@ -365,6 +369,7 @@ public:
           nameBuffer.ptr, (int)mangledTypeName.size(), mangledTypeName.data(),
           mangledTypeName.size());
 
+      // TODO: This needs to work out of process.
       SubstGenericParametersFromMetadata substitutions(metadata);
       auto result = swift_getTypeByMangledName(
           MetadataState::LayoutComplete, mangledTypeName,
@@ -388,7 +393,22 @@ public:
         error->freeErrorString(errorStr);
         abort(); // TODO: fail gracefully
       }
-      LOG("Looked up field type metadata %p", result.getType());
+      auto *fieldType = result.getType().getMetadata();
+      LOG("Looked up field type metadata %p", fieldType);
+
+      // TODO: need to use resolvePointer on a buffer of some sort.
+      auto *witnessTable = asFullMetadata(fieldType)->ValueWitnesses;
+      auto *eltLayout = witnessTable->getTypeLayout();
+      size = roundUpToAlignMask(size, eltLayout->flags.getAlignmentMask());
+
+      fieldOffsets[i] = size;
+
+      size += eltLayout->size;
+      alignMask = std::max(alignMask, eltLayout->flags.getAlignmentMask());
+      if (!eltLayout->flags.isPOD())
+        isPOD = false;
+      if (!eltLayout->flags.isBitwiseTakable())
+        isBitwiseTakable = false;
     }
   }
 
