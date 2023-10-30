@@ -845,6 +845,37 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
 size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description, const GenericMetadataPattern *pattern);
 void swift_initializeGenericValueMetadata(ValueMetadata *metadata);
 
+template <typename T>
+static const T &unwrapVWTField(const T &field) {
+  return field;
+}
+
+static uint32_t unwrapVWTField(const ValueWitnessFlags &field) {
+  return field.getOpaqueValue();
+}
+
+static bool equalVWTs(const ValueWitnessTable *a, const ValueWitnessTable *b) {
+#define WANT_ONLY_REQUIRED_VALUE_WITNESSES
+#define VALUE_WITNESS(LOWER_ID, UPPER_ID) \
+  if (unwrapVWTField(a->LOWER_ID) != unwrapVWTField(b->LOWER_ID)) return false;
+#include "swift/ABI/ValueWitness.def"
+
+  auto *enumA = dyn_cast<EnumValueWitnessTable>(a);
+  auto *enumB = dyn_cast<EnumValueWitnessTable>(b);
+  if (enumA == nullptr && enumB == nullptr) {
+    return true;
+  } else if (enumA != nullptr && enumB != nullptr) {
+#define WANT_ONLY_ENUM_VALUE_WITNESSES
+#define VALUE_WITNESS(LOWER_ID, UPPER_ID) \
+    if (unwrapVWTField(enumA->LOWER_ID) != unwrapVWTField(enumB->LOWER_ID)) return false;
+#include "swift/ABI/ValueWitness.def"
+    return true;
+  } else {
+    // Only one of a and b is an enum table.
+    return false;
+  }
+}
+
 static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, const TypeContextDescriptor *description, const void *arguments) {
   if (auto valueDescriptor = dyn_cast<ValueTypeDescriptor>(description)) {
     if (valueDescriptor->isGeneric()) {
@@ -853,13 +884,11 @@ static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, c
       auto newMetadata = swift_allocateGenericValueMetadata_new(valueDescriptor, arguments, pattern, extraDataSize);
       swift_initializeGenericValueMetadata(newMetadata);
 
-// Skip the VWT pointers when comparing for now.
-//       auto a = asFullMetadata(original);
-//       auto b = asFullMetadata(newMetadata);
-//       size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
-//       if (memcmp(a, b, totalSize)) {
+      auto origVWT = asFullMetadata(original)->ValueWitnesses;
+      auto newVWT = asFullMetadata(newMetadata)->ValueWitnesses;
+
       size_t totalSize = sizeof(ValueMetadata) + extraDataSize;
-      if (memcmp(original, newMetadata, totalSize)) {
+      if (!equalVWTs(origVWT, newVWT) || memcmp(original, newMetadata, totalSize)) {
         printf("Error! Mismatch between new/old metadata builders!\n");
         _swift_dumpMetadata(original);
         _swift_dumpMetadata(newMetadata);

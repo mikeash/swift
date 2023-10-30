@@ -120,6 +120,11 @@ public:
       return {*ptr};
     }
 
+    template <typename U>
+    Buffer<const char> resolveFunctionPointer(const U *ptr) {
+      return {reinterpret_cast<const char *>(*ptr)};
+    }
+
     uint64_t getAddress() { return (uint64_t)ptr; }
   };
 
@@ -521,6 +526,7 @@ public:
       auto valueWitnesses =
           metadataBuffer.resolvePointer(&fullMetadata->ValueWitnesses);
       printPointer("  value witnesses: ", valueWitnesses);
+      dumpVWT(valueWitnesses);
 
       auto kind = fullMetadata->getKind();
       auto kindString = getStringForMetadataKind(kind);
@@ -611,6 +617,43 @@ public:
             wordsOffset<StoredSize *>(metadata, payloadSizeOffset);
         print("  payload size: %" PRIu64 "\n", (uint64_t)*payloadSizePtr);
       }
+    }
+
+    void dumpVWT(Buffer<const TargetValueWitnessTable<Runtime>> vwtBuffer) {
+      auto *vwt = vwtBuffer.ptr;
+
+#define WANT_ONLY_REQUIRED_VALUE_WITNESSES
+#define DATA_VALUE_WITNESS(LOWER_ID, UPPER_ID, TYPE)                           \
+  dumpVWTDataField(#LOWER_ID, vwt->LOWER_ID);
+#define FUNCTION_VALUE_WITNESS(LOWER_ID, UPPER_ID, RETURN_TYPE, PARAM_TYPES)   \
+  dumpVWTFunctionField(vwtBuffer, #LOWER_ID, &vwt->LOWER_ID);
+#include "swift/ABI/ValueWitness.def"
+
+      if (auto *enumVWT = dyn_cast<EnumValueWitnessTable>(vwt)) {
+        // #define WANT_ONLY_ENUM_VALUE_WITNESSES
+        // #define VALUE_WITNESS(LOWER_ID, UPPER_ID) \
+//         dumpVWTField(vwtBuffer, #LOWER_ID, &enumVWT->LOWER_ID);
+        // #include "swift/ABI/ValueWitness.def"
+      }
+    }
+
+    void dumpVWTDataField(const char *name, uint64_t value) {
+      print("    %s: %#" PRIx64 " (%" PRIu64 ")\n", name, value, value);
+    }
+
+    template <typename T>
+    void dumpVWTDataField(const char *name, TargetValueWitnessFlags<T> value) {
+      dumpVWTDataField(name, value.getOpaqueValue());
+    }
+
+    template <typename T>
+    void dumpVWTFunctionField(
+        Buffer<const TargetValueWitnessTable<Runtime>> vwtBuffer,
+        const char *name, T *ptr) {
+      auto function = vwtBuffer.resolveFunctionPointer(ptr);
+      print("    %s: ", name);
+      printPointer(function);
+      print("\n");
     }
   };
 
