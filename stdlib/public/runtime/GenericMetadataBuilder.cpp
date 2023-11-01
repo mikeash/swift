@@ -352,6 +352,13 @@ public:
     return {0, 0, ValueWitnessFlags().withAlignment(1).withPOD(true), 0};
   }
 
+  void installCommonValueWitnesses(
+      const TypeLayout &layout,
+      WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer) {
+    // TODO: expose the various symbols this needs, look them up, and write them
+    // out.
+  }
+
   void initializeStructMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
       TargetStructMetadata<Runtime> *metadata) {
@@ -456,7 +463,7 @@ public:
                        .withPOD(isPOD)
                        .withBitwiseTakable(isBitwiseTakable)
                        .withInlineStorage(isInline);
-    layout.extraInhabitantCount = 0;
+    layout.extraInhabitantCount = extraInhabitantCount;
     layout.stride = std::max(size_t(1), roundUpToAlignMask(size, alignMask));
 
     auto oldVWTBuffer = metadataBuffer.resolvePointer(
@@ -481,6 +488,8 @@ public:
       &newVWT->LOWER_ID,                                                       \
       oldVWTBuffer.resolveFunctionPointer(&oldVWT->LOWER_ID));
 #include "swift/ABI/ValueWitness.def"
+
+    installCommonValueWitnesses(layout, newVWTData);
 
     newVWT->publishLayout(layout);
 

@@ -856,6 +856,8 @@ static uint32_t unwrapVWTField(const ValueWitnessFlags &field) {
 
 static bool equalVWTs(const ValueWitnessTable *a, const ValueWitnessTable *b) {
 #define WANT_ONLY_REQUIRED_VALUE_WITNESSES
+#define FUNCTION_VALUE_WITNESS(LOWER_ID, UPPER_ID, RET, PARAMS) \
+  if (a->LOWER_ID != b->LOWER_ID) printf("Warning: %s fields don't match: %p %p\n", #LOWER_ID, a->LOWER_ID, b->LOWER_ID);
 #define VALUE_WITNESS(LOWER_ID, UPPER_ID) \
   if (unwrapVWTField(a->LOWER_ID) != unwrapVWTField(b->LOWER_ID)) return false;
 #include "swift/ABI/ValueWitness.def"
@@ -887,8 +889,18 @@ static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, c
       auto origVWT = asFullMetadata(original)->ValueWitnesses;
       auto newVWT = asFullMetadata(newMetadata)->ValueWitnesses;
 
+      bool equal = true;
+      if (!equalVWTs(origVWT, newVWT)) {
+        printf("VWTs do not match\n");
+        equal = false;
+      }
       size_t totalSize = sizeof(ValueMetadata) + extraDataSize;
-      if (!equalVWTs(origVWT, newVWT) || memcmp(original, newMetadata, totalSize)) {
+      if (memcmp(original, newMetadata, totalSize)) {
+        printf("Metadatas do not match\n");
+        equal = false;
+      }
+
+      if (!equal) {
         printf("Error! Mismatch between new/old metadata builders!\n");
         printf("Original metadata:\n");
         _swift_dumpMetadata(original);
