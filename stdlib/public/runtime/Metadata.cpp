@@ -843,7 +843,7 @@ swift::swift_allocateGenericValueMetadata(const ValueTypeDescriptor *description
 }
 
 size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description, const GenericMetadataPattern *pattern);
-void swift_initializeGenericValueMetadata(ValueMetadata *metadata);
+void swift_initializeGenericValueMetadata(Metadata *metadata);
 
 template <typename T>
 static const T &unwrapVWTField(const T &field) {
@@ -890,7 +890,9 @@ static void _swift_validateNewGenericMetadataBuilder(const Metadata *original, c
       size_t totalSize = sizeof(ValueMetadata) + extraDataSize;
       if (!equalVWTs(origVWT, newVWT) || memcmp(original, newMetadata, totalSize)) {
         printf("Error! Mismatch between new/old metadata builders!\n");
+        printf("Original metadata:\n");
         _swift_dumpMetadata(original);
+        printf("\nNew metadata builder:\n");
         _swift_dumpMetadata(newMetadata);
         abort();
       }

@@ -57,39 +57,11 @@ public:
     size_t size;
   };
 
-  class WritableData {
-    void checkPtr(void *toCheck) {
-      assert((uintptr_t)toCheck - (uintptr_t)ptr < size);
-    }
-
-  public:
-    WritableData(void *ptr, size_t size) : ptr(ptr), size(size) {}
-
-    void *ptr;
-    size_t size;
-    size_t cursor;
-
-    template <typename T>
-    void writePointer(StoredPointer *to, Buffer<T> target) {
-      checkPtr(to);
-      *to = reinterpret_cast<StoredPointer>(target.ptr);
-    }
-
-    template <typename T>
-    void writePointer(T **to, Buffer<T> target) {
-      checkPtr(to);
-      *to = target.ptr;
-    }
-
-    void writePointer(GenericArgument *to, GenericArgument target) {
-      checkPtr(to);
-      *to = target;
-    }
-  };
-
   template <typename T>
   class Buffer {
   public:
+    Buffer(T *ptr) : ptr(ptr) {}
+
     T *ptr;
 
     T &operator[](size_t i) { return ptr[i]; }
@@ -128,6 +100,47 @@ public:
     uint64_t getAddress() { return (uint64_t)ptr; }
   };
 
+  template <typename T>
+  class WritableData : public Buffer<T> {
+    void checkPtr(void *toCheck) {
+      assert((uintptr_t)toCheck - (uintptr_t)this->ptr < size);
+    }
+
+  public:
+    WritableData(T *ptr, size_t size) : Buffer<T>(ptr), size(size) {}
+
+    size_t size;
+    size_t cursor;
+
+    template <typename U>
+    void writePointer(StoredPointer *to, Buffer<U> target) {
+      checkPtr(to);
+      *to = reinterpret_cast<StoredPointer>(target.ptr);
+    }
+
+    template <typename U>
+    void writePointer(U **to, Buffer<U> &target) {
+      checkPtr(to);
+      *to = target.ptr;
+    }
+
+    template <typename U>
+    void writePointer(const U **to, Buffer<U> &target) {
+      checkPtr(to);
+      *to = target.ptr;
+    }
+
+    void writePointer(GenericArgument *to, GenericArgument target) {
+      checkPtr(to);
+      *to = target;
+    }
+
+    void writeFunctionPointer(void *to, Buffer<const char> target) {
+      checkPtr(to);
+      *reinterpret_cast<const void **>(to) = target.ptr;
+    }
+  };
+
   struct SymbolInfo {
     std::string symbolName;
     std::string libraryName;
@@ -154,19 +167,21 @@ public:
             buffer.getAddress() - (uintptr_t)info.dli_fbase};
   }
 
-  WritableData allocate(size_t size);
+  template <typename T>
+  WritableData<T> allocate(size_t size);
   template <typename T>
   T *read(ReadableData &data, size_t offset);
   void write();
 };
 
-InProcessReaderWriter::WritableData
+template <typename T>
+InProcessReaderWriter::WritableData<T>
 InProcessReaderWriter::allocate(size_t size) {
-  auto bytes =
-      (char *)MetadataAllocator(MetadataAllocatorTags::GenericValueMetadataTag)
-          .Allocate(size, alignof(void *));
+  auto bytes = reinterpret_cast<T *>(
+      MetadataAllocator(MetadataAllocatorTags::GenericValueMetadataTag)
+          .Allocate(size, alignof(void *)));
 
-  return WritableData{bytes, size};
+  return WritableData<T>{bytes, size};
 }
 
 template <typename ReaderWriter>
@@ -183,7 +198,8 @@ class GenericMetadataBuilder {
 
   using Size = typename ReaderWriter::Size;
 
-  using WritableData = typename ReaderWriter::WritableData;
+  template <typename T>
+  using WritableData = typename ReaderWriter::template WritableData<T>;
 
   using StoredPointer = typename ReaderWriter::Runtime::StoredPointer;
 
@@ -211,12 +227,13 @@ class GenericMetadataBuilder {
 
 public:
   void initializeValueMetadataFromPattern(
-      WritableData data, Size metadataOffset,
+      WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
+      Size metadataOffset,
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
       Buffer<const TargetGenericValueMetadataPattern<Runtime>> patternBuffer) {
     const auto *pattern = patternBuffer.ptr;
 
-    char *metadataBase = static_cast<char *>(data.ptr);
+    char *metadataBase = reinterpret_cast<char *>(data.ptr);
     auto metadata =
         reinterpret_cast<ValueMetadata *>(metadataBase + metadataOffset);
     char *rawMetadata = reinterpret_cast<char *>(metadata);
@@ -265,11 +282,12 @@ public:
   }
 
   void installGenericArguments(
-      WritableData data, Size metadataOffset,
+      WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
+      Size metadataOffset,
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
       const GenericArgument *arguments) {
     LOG("Building %s", getDescriptorName(descriptionBuffer));
-    char *metadataBase = static_cast<char *>(data.ptr);
+    char *metadataBase = reinterpret_cast<char *>(data.ptr);
     auto metadata =
         reinterpret_cast<ValueMetadata *>(metadataBase + metadataOffset);
     const auto &genericContext = *descriptionBuffer.ptr->getGenericContext();
@@ -287,7 +305,8 @@ public:
 
   // Returns the constructed metadata, and the offset within the buffer to the
   // start of the ValueMetadata.
-  std::pair<WritableData, Size> buildGenericValueMetadata(
+  std::pair<WritableData<FullMetadata<TargetMetadata<Runtime>>>, Size>
+  buildGenericValueMetadata(
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
       const GenericArgument *arguments,
       Buffer<const TargetGenericValueMetadataPattern<Runtime>> patternBuffer,
@@ -298,10 +317,13 @@ public:
                               pattern->getExtraDataPattern()->SizeInWords) *
                                  sizeof(void *)));
 
-    size_t totalSize = sizeof(FullMetadata<ValueMetadata>) + extraDataSize;
+    size_t totalSize =
+        sizeof(FullMetadata<TargetValueMetadata<Runtime>>) + extraDataSize;
     LOG("Extra data size is %zu, allocating %zu bytes total", extraDataSize,
         totalSize);
-    auto metadataBuffer = readerWriter.allocate(totalSize);
+    auto metadataBuffer =
+        readerWriter.template allocate<FullMetadata<TargetMetadata<Runtime>>>(
+            totalSize);
     auto metadataOffset = sizeof(ValueMetadata::HeaderType);
 
     initializeValueMetadataFromPattern(metadataBuffer, metadataOffset,
@@ -315,12 +337,11 @@ public:
   }
 
   void initializeGenericValueMetadata(
-      Buffer<TargetValueMetadata<Runtime>> metadataBuffer) {
-    if (auto structmd =
-            dyn_cast<TargetStructMetadata<Runtime>>(metadataBuffer.ptr))
+      WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer) {
+    auto *metadata = static_cast<TargetMetadata<Runtime> *>(metadataBuffer.ptr);
+    if (auto structmd = dyn_cast<TargetStructMetadata<Runtime>>(metadata))
       initializeStructMetadata(metadataBuffer, structmd);
-    else if (auto enummd =
-                 dyn_cast<TargetEnumMetadata<Runtime>>(metadataBuffer.ptr))
+    else if (auto enummd = dyn_cast<TargetEnumMetadata<Runtime>>(metadata))
       initializeEnumMetadata(metadataBuffer, enummd);
     else
       LOG("Don't know how to initialize metadata kind %#" PRIx32,
@@ -331,9 +352,9 @@ public:
     return {0, 0, ValueWitnessFlags().withAlignment(1).withPOD(true), 0};
   }
 
-  void
-  initializeStructMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer,
-                           TargetStructMetadata<Runtime> *metadata) {
+  void initializeStructMetadata(
+      WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
+      TargetStructMetadata<Runtime> *metadata) {
     LOG("Initializing struct");
 
     auto descriptionBuffer =
@@ -362,6 +383,10 @@ public:
     auto genericArguments =
         wordsOffset<ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(
             metadata, description->getGenericArgumentOffset());
+
+    // We have extra inhabitants if any element does. Use the field with the
+    // most.
+    unsigned extraInhabitantCount = 0;
 
     for (unsigned i = 0; i != fields.size(); ++i) {
       auto &field = fields[i];
@@ -402,24 +427,70 @@ public:
       LOG("Looked up field type metadata %p", fieldType);
 
       // TODO: need to use resolvePointer on a buffer of some sort.
-      auto *witnessTable = asFullMetadata(fieldType)->ValueWitnesses;
-      auto *eltLayout = witnessTable->getTypeLayout();
-      size = roundUpToAlignMask(size, eltLayout->flags.getAlignmentMask());
+      auto *fieldWitnessTable = asFullMetadata(fieldType)->ValueWitnesses;
+      auto *fieldLayout = fieldWitnessTable->getTypeLayout();
+      size = roundUpToAlignMask(size, fieldLayout->flags.getAlignmentMask());
 
       fieldOffsets[i] = size;
 
-      size += eltLayout->size;
-      alignMask = std::max(alignMask, eltLayout->flags.getAlignmentMask());
-      if (!eltLayout->flags.isPOD())
+      size += fieldLayout->size;
+      alignMask = std::max(alignMask, fieldLayout->flags.getAlignmentMask());
+      if (!fieldLayout->flags.isPOD())
         isPOD = false;
-      if (!eltLayout->flags.isBitwiseTakable())
+      if (!fieldLayout->flags.isBitwiseTakable())
         isBitwiseTakable = false;
+
+      unsigned fieldExtraInhabitantCount =
+          fieldWitnessTable->getNumExtraInhabitants();
+      if (fieldExtraInhabitantCount > extraInhabitantCount) {
+        extraInhabitantCount = fieldExtraInhabitantCount;
+      }
     }
+
+    bool isInline =
+        ValueWitnessTable::isValueInline(isBitwiseTakable, size, alignMask + 1);
+
+    layout.size = size;
+    layout.flags = ValueWitnessFlags()
+                       .withAlignmentMask(alignMask)
+                       .withPOD(isPOD)
+                       .withBitwiseTakable(isBitwiseTakable)
+                       .withInlineStorage(isInline);
+    layout.extraInhabitantCount = 0;
+    layout.stride = std::max(size_t(1), roundUpToAlignMask(size, alignMask));
+
+    auto oldVWTBuffer = metadataBuffer.resolvePointer(
+        &asFullMetadata(metadata)->ValueWitnesses);
+    auto *oldVWT = oldVWTBuffer.ptr;
+
+    auto newVWTData =
+        readerWriter.template allocate<TargetValueWitnessTable<Runtime>>(
+            sizeof(TargetValueWitnessTable<Runtime>));
+    auto *newVWT = newVWTData.ptr;
+
+    // Initialize the new table with the raw contents of the old table first.
+    // This will set the data fields.
+    new (newVWT) TargetValueWitnessTable<Runtime>(*oldVWT);
+
+    // Set all the functions separately so they get the right fixups.
+#define WANT_ONLY_REQUIRED_VALUE_WITNESSES
+#define DATA_VALUE_WITNESS(LOWER_ID, UPPER_ID, TYPE)                           \
+  // This macro intentionally left blank.
+#define FUNCTION_VALUE_WITNESS(LOWER_ID, UPPER_ID, RETURN_TYPE, PARAM_TYPES)   \
+  newVWTData.writeFunctionPointer(                                             \
+      &newVWT->LOWER_ID,                                                       \
+      oldVWTBuffer.resolveFunctionPointer(&oldVWT->LOWER_ID));
+#include "swift/ABI/ValueWitness.def"
+
+    newVWT->publishLayout(layout);
+
+    metadataBuffer.writePointer(&metadataBuffer.ptr->ValueWitnesses,
+                                newVWTData);
   }
 
-  void
-  initializeEnumMetadata(Buffer<TargetValueMetadata<Runtime>> metadataBuffer,
-                         TargetEnumMetadata<Runtime> *metadata) {
+  void initializeEnumMetadata(
+      WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
+      TargetEnumMetadata<Runtime> *metadata) {
     LOG("Initializing enum");
   }
 
@@ -671,13 +742,13 @@ ValueMetadata *swift_allocateGenericValueMetadata_new(
       reinterpret_cast<const InProcessReaderWriter::GenericArgument *>(
           arguments),
       {pattern}, extraDataSize);
-  char *base = static_cast<char *>(data.ptr);
+  char *base = reinterpret_cast<char *>(data.ptr);
   return reinterpret_cast<ValueMetadata *>(base + offset);
 }
 
-void swift_initializeGenericValueMetadata(ValueMetadata *metadata) {
+void swift_initializeGenericValueMetadata(Metadata *metadata) {
   GenericMetadataBuilder<InProcessReaderWriter> builder;
-  builder.initializeGenericValueMetadata({metadata});
+  builder.initializeGenericValueMetadata({asFullMetadata(metadata), -1u});
 }
 
 size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description,
