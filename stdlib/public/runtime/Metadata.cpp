@@ -857,7 +857,8 @@ static uint32_t unwrapVWTField(const ValueWitnessFlags &field) {
 static bool equalVWTs(const ValueWitnessTable *a, const ValueWitnessTable *b) {
 #define WANT_ONLY_REQUIRED_VALUE_WITNESSES
 #define FUNCTION_VALUE_WITNESS(LOWER_ID, UPPER_ID, RET, PARAMS) \
-  if (a->LOWER_ID != b->LOWER_ID) printf("Warning: %s fields don't match: %p %p\n", #LOWER_ID, a->LOWER_ID, b->LOWER_ID);
+  if (a->LOWER_ID != b->LOWER_ID) return false;
+  // printf("Warning: %s fields don't match: %p %p\n", #LOWER_ID, a->LOWER_ID, b->LOWER_ID);
 #define VALUE_WITNESS(LOWER_ID, UPPER_ID) \
   if (unwrapVWTField(a->LOWER_ID) != unwrapVWTField(b->LOWER_ID)) return false;
 #include "swift/ABI/ValueWitness.def"
@@ -2574,7 +2575,8 @@ static constexpr Out pointer_function_cast(In *function) {
   return pointer_function_cast_impl<Out>::perform(function);
 }
 
-static OpaqueValue *pod_indirect_initializeBufferWithCopyOfBuffer(
+SWIFT_RUNTIME_STDLIB_SPI
+OpaqueValue *_swift_pod_indirect_initializeBufferWithCopyOfBuffer(
                     ValueBuffer *dest, ValueBuffer *src, const Metadata *self) {
   auto wtable = self->getValueWitnesses();
   auto *srcReference = *reinterpret_cast<HeapObject**>(src);
@@ -2589,17 +2591,20 @@ static OpaqueValue *pod_indirect_initializeBufferWithCopyOfBuffer(
   return reinterpret_cast<OpaqueValue *>(bytePtr + byteOffset);
 }
 
-static void pod_destroy(OpaqueValue *object, const Metadata *self) {}
+SWIFT_RUNTIME_STDLIB_SPI
+void _swift_pod_destroy(OpaqueValue *object, const Metadata *self) {}
 
-static OpaqueValue *pod_copy(OpaqueValue *dest, OpaqueValue *src,
+SWIFT_RUNTIME_STDLIB_SPI
+OpaqueValue *_swift_pod_copy(OpaqueValue *dest, OpaqueValue *src,
                              const Metadata *self) {
   memcpy(dest, src, self->getValueWitnesses()->size);
   return dest;
 }
 
-static OpaqueValue *pod_direct_initializeBufferWithCopyOfBuffer(
+SWIFT_RUNTIME_STDLIB_SPI
+OpaqueValue *_swift_pod_direct_initializeBufferWithCopyOfBuffer(
                     ValueBuffer *dest, ValueBuffer *src, const Metadata *self) {
-  return pod_copy(reinterpret_cast<OpaqueValue*>(dest),
+  return _swift_pod_copy(reinterpret_cast<OpaqueValue*>(dest),
                   reinterpret_cast<OpaqueValue*>(src),
                   self);
 }
@@ -2626,16 +2631,16 @@ void swift::installCommonValueWitnesses(const TypeLayout &layout,
       // size and alignment.
       if (flags.isInlineStorage()) {
         vwtable->initializeBufferWithCopyOfBuffer =
-          pod_direct_initializeBufferWithCopyOfBuffer;
+          _swift_pod_direct_initializeBufferWithCopyOfBuffer;
       } else {
         vwtable->initializeBufferWithCopyOfBuffer =
-          pod_indirect_initializeBufferWithCopyOfBuffer;
+          _swift_pod_indirect_initializeBufferWithCopyOfBuffer;
       }
-      vwtable->destroy = pod_destroy;
-      vwtable->initializeWithCopy = pod_copy;
-      vwtable->initializeWithTake = pod_copy;
-      vwtable->assignWithCopy = pod_copy;
-      vwtable->assignWithTake = pod_copy;
+      vwtable->destroy = _swift_pod_destroy;
+      vwtable->initializeWithCopy = _swift_pod_copy;
+      vwtable->initializeWithTake = _swift_pod_copy;
+      vwtable->assignWithCopy = _swift_pod_copy;
+      vwtable->assignWithTake = _swift_pod_copy;
       // getEnumTagSinglePayload and storeEnumTagSinglePayload are not
       // interestingly optimizable based on POD-ness.
       return;
@@ -2674,7 +2679,7 @@ void swift::installCommonValueWitnesses(const TypeLayout &layout,
   
   if (flags.isBitwiseTakable()) {
     // Use POD value witnesses for operations that do an initializeWithTake.
-    vwtable->initializeWithTake = pod_copy;
+    vwtable->initializeWithTake = _swift_pod_copy;
     return;
   }
 

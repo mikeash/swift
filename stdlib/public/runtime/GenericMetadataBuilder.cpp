@@ -40,6 +40,12 @@ static size_t roundUpToAlignMask(size_t size, size_t alignMask) {
   return (size + alignMask) & ~alignMask;
 }
 
+static constexpr uint64_t sizeWithAlignmentMask(uint64_t size,
+                                                uint64_t alignmentMask,
+                                                uint64_t hasExtraInhabitants) {
+  return (hasExtraInhabitants << 48) | (size << 16) | alignmentMask;
+}
+
 class InProcessReaderWriter {
 public:
   using Runtime = InProcess;
@@ -61,6 +67,9 @@ public:
   class Buffer {
   public:
     Buffer(T *ptr) : ptr(ptr) {}
+
+    Buffer(Buffer<const char> buffer)
+        : ptr(reinterpret_cast<T *>(buffer.ptr)) {}
 
     T *ptr;
 
@@ -167,6 +176,12 @@ public:
             buffer.getAddress() - (uintptr_t)info.dli_fbase};
   }
 
+  Buffer<const char> getSymbolPointer(const char *name) {
+    void *ptr = dlsym(RTLD_SELF, name);
+    LOG("getSymbolPointer(\"%s\") -> %p\n", name, ptr);
+    return {reinterpret_cast<const char *>(ptr)};
+  }
+
   template <typename T>
   WritableData<T> allocate(size_t size);
   template <typename T>
@@ -186,8 +201,6 @@ InProcessReaderWriter::allocate(size_t size) {
 
 template <typename ReaderWriter>
 class GenericMetadataBuilder {
-  ReaderWriter readerWriter;
-
   using Runtime = typename ReaderWriter::Runtime;
 
   template <typename T>
@@ -206,6 +219,21 @@ class GenericMetadataBuilder {
   using StoredSize = typename Runtime::StoredSize;
 
   using GenericArgument = typename ReaderWriter::GenericArgument;
+
+  ReaderWriter readerWriter;
+
+  Buffer<const char> pod_copy;
+  Buffer<const char> pod_destroy;
+  Buffer<const char> pod_direct_initializeBufferWithCopyOfBuffer;
+  Buffer<const char> pod_indirect_initializeBufferWithCopyOfBuffer;
+
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi8_;
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi16_;
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi32_;
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi64_;
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi128_;
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi256_;
+  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi512_;
 
   template <typename DescriptorType>
   const char *getDescriptorName(Buffer<DescriptorType> descriptionBuffer) {
@@ -226,6 +254,31 @@ class GenericMetadataBuilder {
   }
 
 public:
+  GenericMetadataBuilder(ReaderWriter readerWriter)
+      : readerWriter(readerWriter),
+        pod_copy(readerWriter.getSymbolPointer("_swift_pod_copy")),
+        pod_destroy(readerWriter.getSymbolPointer("_swift_pod_destroy")),
+        pod_direct_initializeBufferWithCopyOfBuffer(
+            readerWriter.getSymbolPointer(
+                "_swift_pod_direct_initializeBufferWithCopyOfBuffer")),
+        pod_indirect_initializeBufferWithCopyOfBuffer(
+            readerWriter.getSymbolPointer(
+                "_swift_pod_indirect_initializeBufferWithCopyOfBuffer")),
+        VWT_Bi8_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi8_)))),
+        VWT_Bi16_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi16_)))),
+        VWT_Bi32_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi32_)))),
+        VWT_Bi64_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi64_)))),
+        VWT_Bi128_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi128_)))),
+        VWT_Bi256_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi256_)))),
+        VWT_Bi512_(readerWriter.getSymbolPointer(
+            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi512_)))) {}
+
   void initializeValueMetadataFromPattern(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
       Size metadataOffset,
@@ -352,11 +405,86 @@ public:
     return {0, 0, ValueWitnessFlags().withAlignment(1).withPOD(true), 0};
   }
 
+  void copyVWT(WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer,
+               Buffer<const TargetValueWitnessTable<Runtime>> from) {
+#define WANT_ONLY_REQUIRED_VALUE_WITNESSES
+#define VALUE_WITNESS(LOWER_ID, UPPER_ID)                                      \
+  auto LOWER_ID##_Buffer = from.resolveFunctionPointer(&from.ptr->LOWER_ID);   \
+  vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->LOWER_ID, LOWER_ID##_Buffer);
+#define DATA_VALUE_WITNESS(LOWER_ID, UPPER_ID, TYPE)
+#include "swift/ABI/ValueWitness.def"
+  }
+
   void installCommonValueWitnesses(
       const TypeLayout &layout,
       WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer) {
     // TODO: expose the various symbols this needs, look them up, and write them
     // out.
+    auto flags = layout.flags;
+    if (flags.isPOD()) {
+      // Use POD value witnesses.
+      // If the value has a common size and alignment, use specialized value
+      // witnesses we already have lying around for the builtin types.
+      bool hasExtraInhabitants = layout.hasExtraInhabitants();
+      switch (sizeWithAlignmentMask(layout.size, flags.getAlignmentMask(),
+                                    hasExtraInhabitants)) {
+      default:
+        // For uncommon layouts, use value witnesses that work with an arbitrary
+        // size and alignment.
+        if (flags.isInlineStorage()) {
+          vwtBuffer.writeFunctionPointer(
+              &vwtBuffer.ptr->initializeBufferWithCopyOfBuffer,
+              pod_direct_initializeBufferWithCopyOfBuffer);
+        } else {
+          vwtBuffer.writeFunctionPointer(
+              &vwtBuffer.ptr->initializeBufferWithCopyOfBuffer,
+              pod_indirect_initializeBufferWithCopyOfBuffer);
+        }
+        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->destroy, pod_destroy);
+        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithCopy,
+                                       pod_copy);
+        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithTake,
+                                       pod_copy);
+        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->assignWithCopy,
+                                       pod_copy);
+        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->assignWithTake,
+                                       pod_copy);
+        // getEnumTagSinglePayload and storeEnumTagSinglePayload are not
+        // interestingly optimizable based on POD-ness.
+        return;
+
+      case sizeWithAlignmentMask(1, 0, 0):
+        copyVWT(vwtBuffer, VWT_Bi8_);
+        break;
+      case sizeWithAlignmentMask(2, 1, 0):
+        copyVWT(vwtBuffer, VWT_Bi16_);
+        break;
+      case sizeWithAlignmentMask(4, 3, 0):
+        copyVWT(vwtBuffer, VWT_Bi32_);
+        break;
+      case sizeWithAlignmentMask(8, 7, 0):
+        copyVWT(vwtBuffer, VWT_Bi64_);
+        break;
+      case sizeWithAlignmentMask(16, 15, 0):
+        copyVWT(vwtBuffer, VWT_Bi128_);
+        break;
+      case sizeWithAlignmentMask(32, 31, 0):
+        copyVWT(vwtBuffer, VWT_Bi256_);
+        break;
+      case sizeWithAlignmentMask(64, 63, 0):
+        copyVWT(vwtBuffer, VWT_Bi512_);
+        break;
+      }
+
+      return;
+    }
+
+    if (flags.isBitwiseTakable()) {
+      // Use POD value witnesses for operations that do an initializeWithTake.
+      vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithTake,
+                                     pod_copy);
+      return;
+    }
   }
 
   void initializeStructMetadata(
@@ -741,11 +869,14 @@ public:
   Dumper(Printer) -> Dumper<Printer>;
 };
 
+template <typename ReaderWriter>
+GenericMetadataBuilder(ReaderWriter) -> GenericMetadataBuilder<ReaderWriter>;
+
 // SWIFT_RUNTIME_EXPORT
 ValueMetadata *swift_allocateGenericValueMetadata_new(
     const ValueTypeDescriptor *description, const void *arguments,
     const GenericValueMetadataPattern *pattern, size_t extraDataSize) {
-  GenericMetadataBuilder<InProcessReaderWriter> builder;
+  GenericMetadataBuilder builder{InProcessReaderWriter()};
   auto [data, offset] = builder.buildGenericValueMetadata(
       {description},
       reinterpret_cast<const InProcessReaderWriter::GenericArgument *>(
@@ -756,13 +887,13 @@ ValueMetadata *swift_allocateGenericValueMetadata_new(
 }
 
 void swift_initializeGenericValueMetadata(Metadata *metadata) {
-  GenericMetadataBuilder<InProcessReaderWriter> builder;
+  GenericMetadataBuilder builder{InProcessReaderWriter()};
   builder.initializeGenericValueMetadata({asFullMetadata(metadata), -1u});
 }
 
 size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description,
                                        const GenericMetadataPattern *pattern) {
-  GenericMetadataBuilder<InProcessReaderWriter> builder;
+  GenericMetadataBuilder builder{InProcessReaderWriter()};
   return builder.extraDataSize({description}, {pattern});
 }
 
