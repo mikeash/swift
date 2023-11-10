@@ -26,6 +26,7 @@
 
 using namespace swift;
 
+#define LOG_ENABLED 1
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #define LOG(fmt, ...)                                                          \
   fprintf(stderr, "%s:%d:%s: " fmt "\n", __FILE_NAME__, __LINE__,              \
@@ -75,6 +76,8 @@ public:
 
     T &operator[](size_t i) { return ptr[i]; }
 
+    operator bool() const { return ptr; }
+
     Buffer<char> resolvePointer(uintptr_t *ptr) {
       return {reinterpret_cast<char *>(*ptr)};
     }
@@ -104,6 +107,12 @@ public:
     template <typename U>
     Buffer<const char> resolveFunctionPointer(const U *ptr) {
       return {reinterpret_cast<const char *>(*ptr)};
+    }
+
+    template <typename U, bool nullable>
+    Buffer<const char> resolveFunctionPointer(
+        TargetCompactFunctionPointer<Runtime, U, nullable> *ptr) {
+      return {reinterpret_cast<const char *>(ptr->get())};
     }
 
     uint64_t getAddress() { return (uint64_t)ptr; }
@@ -178,7 +187,7 @@ public:
 
   Buffer<const char> getSymbolPointer(const char *name) {
     void *ptr = dlsym(RTLD_SELF, name);
-    LOG("getSymbolPointer(\"%s\") -> %p\n", name, ptr);
+    LOG("getSymbolPointer(\"%s\") -> %p", name, ptr);
     return {reinterpret_cast<const char *>(ptr)};
   }
 
@@ -392,6 +401,21 @@ public:
   void initializeGenericValueMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer) {
     auto *metadata = static_cast<TargetMetadata<Runtime> *>(metadataBuffer.ptr);
+    auto *valueMetadata = dyn_cast<TargetValueMetadata<Runtime>>(metadata);
+
+    auto descriptionBuffer =
+        metadataBuffer.resolvePointer(&valueMetadata->Description);
+    auto patternBuffer = descriptionBuffer.resolvePointer(
+        &descriptionBuffer.ptr->getFullGenericContextHeader()
+             .DefaultInstantiationPattern);
+    auto completionFunction = patternBuffer.resolveFunctionPointer(
+        &patternBuffer.ptr->CompletionFunction);
+
+    if (!completionFunction) {
+      LOG("Type has no completion function, skipping initialization");
+      return;
+    }
+
     if (auto structmd = dyn_cast<TargetStructMetadata<Runtime>>(metadata))
       initializeStructMetadata(metadataBuffer, structmd);
     else if (auto enummd = dyn_cast<TargetEnumMetadata<Runtime>>(metadata))
@@ -426,11 +450,17 @@ public:
       // If the value has a common size and alignment, use specialized value
       // witnesses we already have lying around for the builtin types.
       bool hasExtraInhabitants = layout.hasExtraInhabitants();
+      LOG("type isPOD, hasExtraInhabitants=%s layout.size=%zu "
+          "flags.getAlignmentMask=%zu",
+          hasExtraInhabitants ? "true" : "false", (size_t)layout.size,
+          (size_t)flags.getAlignmentMask());
       switch (sizeWithAlignmentMask(layout.size, flags.getAlignmentMask(),
                                     hasExtraInhabitants)) {
       default:
         // For uncommon layouts, use value witnesses that work with an arbitrary
         // size and alignment.
+        LOG("Uncommon layout case, flags.isInlineStorage=%s",
+            flags.isInlineStorage() ? "true" : "false");
         if (flags.isInlineStorage()) {
           vwtBuffer.writeFunctionPointer(
               &vwtBuffer.ptr->initializeBufferWithCopyOfBuffer,
@@ -454,24 +484,31 @@ public:
         return;
 
       case sizeWithAlignmentMask(1, 0, 0):
+        LOG("case sizeWithAlignmentMask(1, 0, 0)");
         copyVWT(vwtBuffer, VWT_Bi8_);
         break;
       case sizeWithAlignmentMask(2, 1, 0):
+        LOG("case sizeWithAlignmentMask(2, 1, 0)");
         copyVWT(vwtBuffer, VWT_Bi16_);
         break;
       case sizeWithAlignmentMask(4, 3, 0):
+        LOG("case sizeWithAlignmentMask(4, 3, 0)");
         copyVWT(vwtBuffer, VWT_Bi32_);
         break;
       case sizeWithAlignmentMask(8, 7, 0):
+        LOG("case sizeWithAlignmentMask(8, 7, 0)");
         copyVWT(vwtBuffer, VWT_Bi64_);
         break;
       case sizeWithAlignmentMask(16, 15, 0):
+        LOG("case sizeWithAlignmentMask(16, 15, 0)");
         copyVWT(vwtBuffer, VWT_Bi128_);
         break;
       case sizeWithAlignmentMask(32, 31, 0):
+        LOG("case sizeWithAlignmentMask(32, 31, 0)");
         copyVWT(vwtBuffer, VWT_Bi256_);
         break;
       case sizeWithAlignmentMask(64, 63, 0):
+        LOG("case sizeWithAlignmentMask(64, 63, 0)");
         copyVWT(vwtBuffer, VWT_Bi512_);
         break;
       }
@@ -480,6 +517,7 @@ public:
     }
 
     if (flags.isBitwiseTakable()) {
+      LOG("Is bitwise takable, setting pod_copy as initializeWithTake");
       // Use POD value witnesses for operations that do an initializeWithTake.
       vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithTake,
                                      pod_copy);
@@ -597,6 +635,14 @@ public:
     auto oldVWTBuffer = metadataBuffer.resolvePointer(
         &asFullMetadata(metadata)->ValueWitnesses);
     auto *oldVWT = oldVWTBuffer.ptr;
+
+    if (LOG_ENABLED) {
+      auto info = readerWriter.getSymbolInfo(oldVWTBuffer);
+      LOG("Initializing new VWT from old VWT %#" PRIx64 " - %s (%s + %" PRIu64
+          ")",
+          oldVWTBuffer.getAddress(), info.symbolName.c_str(),
+          info.libraryName.c_str(), info.pointerOffset);
+    }
 
     auto newVWTData =
         readerWriter.template allocate<TargetValueWitnessTable<Runtime>>(
