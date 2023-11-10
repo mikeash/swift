@@ -67,6 +67,8 @@ public:
   template <typename T>
   class Buffer {
   public:
+    Buffer() : ptr(nullptr) {}
+
     Buffer(T *ptr) : ptr(ptr) {}
 
     Buffer(Buffer<const char> buffer)
@@ -189,6 +191,32 @@ public:
     void *ptr = dlsym(RTLD_SELF, name);
     LOG("getSymbolPointer(\"%s\") -> %p", name, ptr);
     return {reinterpret_cast<const char *>(ptr)};
+  }
+
+  TypeLookupErrorOr<Buffer<const Metadata>> getTypeByMangledName(
+      WritableData<FullMetadata<Metadata>> containingMetadataBuffer,
+      llvm::StringRef mangledTypeName) {
+    auto metadata = static_cast<Metadata *>(containingMetadataBuffer.ptr);
+    SubstGenericParametersFromMetadata substitutions(metadata);
+    auto result = swift_getTypeByMangledName(
+        MetadataState::LayoutComplete, mangledTypeName,
+        substitutions.getGenericArgs(),
+        [&substitutions](unsigned depth, unsigned index) {
+          auto result = substitutions.getMetadata(depth, index).Ptr;
+          LOG("substitutions.getMetadata(%u, %u).Ptr = %p", depth, index,
+              result);
+          return result;
+        },
+        [&substitutions](const Metadata *type, unsigned index) {
+          auto result = substitutions.getWitnessTable(type, index);
+          LOG("substitutions.getWitnessTable(%p, %u) = %p", type, index,
+              result);
+          return result;
+        });
+    if (result.isError())
+      return *result.getError();
+    return TypeLookupErrorOr{
+        Buffer<const Metadata>{result.getType().getMetadata()}};
   }
 
   template <typename T>
@@ -442,8 +470,6 @@ public:
   void installCommonValueWitnesses(
       const TypeLayout &layout,
       WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer) {
-    // TODO: expose the various symbols this needs, look them up, and write them
-    // out.
     auto flags = layout.flags;
     if (flags.isPOD()) {
       // Use POD value witnesses.
@@ -572,23 +598,8 @@ public:
           nameBuffer.ptr, (int)mangledTypeName.size(), mangledTypeName.data(),
           mangledTypeName.size());
 
-      // TODO: This needs to work out of process.
-      SubstGenericParametersFromMetadata substitutions(metadata);
-      auto result = swift_getTypeByMangledName(
-          MetadataState::LayoutComplete, mangledTypeName,
-          substitutions.getGenericArgs(),
-          [&substitutions](unsigned depth, unsigned index) {
-            auto result = substitutions.getMetadata(depth, index).Ptr;
-            LOG("substitutions.getMetadata(%u, %u).Ptr = %p", depth, index,
-                result);
-            return result;
-          },
-          [&substitutions](const Metadata *type, unsigned index) {
-            auto result = substitutions.getWitnessTable(type, index);
-            LOG("substitutions.getWitnessTable(%p, %u) = %p", type, index,
-                result);
-            return result;
-          });
+      auto result =
+          readerWriter.getTypeByMangledName(metadataBuffer, mangledTypeName);
       if (result.isError()) {
         auto *error = result.getError();
         char *errorStr = error->copyErrorString();
@@ -596,7 +607,8 @@ public:
         error->freeErrorString(errorStr);
         abort(); // TODO: fail gracefully
       }
-      auto *fieldType = result.getType().getMetadata();
+      auto fieldTypeBuffer = result.getType();
+      auto *fieldType = fieldTypeBuffer.ptr;
       LOG("Looked up field type metadata %p", fieldType);
 
       // TODO: need to use resolvePointer on a buffer of some sort.
