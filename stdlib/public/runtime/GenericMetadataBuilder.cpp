@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #include <inttypes.h>
 #include <string>
+#include <variant>
 
 using namespace swift;
 
@@ -46,6 +47,65 @@ static constexpr uint64_t sizeWithAlignmentMask(uint64_t size,
                                                 uint64_t hasExtraInhabitants) {
   return (hasExtraInhabitants << 48) | (size << 16) | alignmentMask;
 }
+
+class BuilderError {
+  std::string errorString;
+
+public:
+  BuilderError(std::string string) : errorString(string) {}
+  BuilderError(char *string) : errorString(string) {}
+
+  template <typename Fn>
+  BuilderError(const Fn &makeString) {
+    char *string = nullptr;
+    makeString(&string);
+    if (string)
+      errorString = string;
+    else
+      errorString = "<could not create error string>";
+    free(string);
+  }
+
+  std::string getErrorString() const { return errorString; }
+
+  const char *cStr() const { return errorString.c_str(); }
+};
+
+#pragma clang diagnostic ignored                                               \
+    "-Wgnu-statement-expression-from-macro-expansion"
+#define MAKE_ERROR(...)                                                        \
+  BuilderError([=](char **ptr) { asprintf(ptr, __VA_ARGS__); })
+
+template <typename T>
+class [[nodiscard]] BuilderErrorOr {
+  std::variant<T, BuilderError> storage;
+
+public:
+  BuilderErrorOr(const T &value) : storage(value) {}
+  BuilderErrorOr(const BuilderError &error) : storage(error) {}
+
+  static BuilderErrorOr success(const T &value) {
+    return BuilderErrorOr{value};
+  }
+
+  BuilderErrorOr(const TypeLookupError &error) {
+    char *errorStr = error.copyErrorString();
+    storage = BuilderError(errorStr);
+    error.freeErrorString(errorStr);
+  }
+
+  T *getValue() { return std::get_if<T>(&storage); }
+
+  BuilderError *getError() { return std::get_if<BuilderError>(&storage); }
+};
+
+#define ERROR_CHECK(errorOrT)                                                  \
+  ({                                                                           \
+    auto error_check_tmp = (errorOrT);                                         \
+    if (auto *error = error_check_tmp.getError())                              \
+      return *error;                                                           \
+    *error_check_tmp.getValue();                                               \
+  })
 
 class InProcessReaderWriter {
 public:
@@ -80,41 +140,42 @@ public:
 
     operator bool() const { return ptr; }
 
-    Buffer<char> resolvePointer(uintptr_t *ptr) {
-      return {reinterpret_cast<char *>(*ptr)};
+    BuilderErrorOr<Buffer<char>> resolvePointer(uintptr_t *ptr) {
+      return Buffer<char>{reinterpret_cast<char *>(*ptr)};
     }
 
     template <typename U, bool Nullable>
-    Buffer<U> resolvePointer(const RelativeDirectPointer<U, Nullable> *ptr) {
-      return {ptr->get()};
+    BuilderErrorOr<Buffer<U>>
+    resolvePointer(const RelativeDirectPointer<U, Nullable> *ptr) {
+      return Buffer<U>{ptr->get()};
     }
 
     template <typename U, bool Nullable>
-    Buffer<U>
+    BuilderErrorOr<Buffer<U>>
     resolvePointer(const RelativeIndirectablePointer<U, Nullable> *ptr) {
       return {ptr->get()};
     }
 
     template <typename U, bool Nullable>
-    Buffer<const U>
+    BuilderErrorOr<Buffer<const U>>
     resolvePointer(const RelativeIndirectablePointer<const U, Nullable> *ptr) {
-      return {ptr->get()};
+      return BuilderErrorOr<Buffer<const U>>::success(ptr->get());
     }
 
     template <typename U>
-    Buffer<const U> resolvePointer(const U *const *ptr) {
-      return {*ptr};
+    BuilderErrorOr<Buffer<const U>> resolvePointer(const U *const *ptr) {
+      return Buffer<const U>{*ptr};
     }
 
     template <typename U>
-    Buffer<const char> resolveFunctionPointer(const U *ptr) {
-      return {reinterpret_cast<const char *>(*ptr)};
+    BuilderErrorOr<Buffer<const char>> resolveFunctionPointer(const U *ptr) {
+      return Buffer<const char>{reinterpret_cast<const char *>(*ptr)};
     }
 
     template <typename U, bool nullable>
-    Buffer<const char> resolveFunctionPointer(
+    BuilderErrorOr<Buffer<const char>> resolveFunctionPointer(
         TargetCompactFunctionPointer<Runtime, U, nullable> *ptr) {
-      return {reinterpret_cast<const char *>(ptr->get())};
+      return Buffer<const char>{reinterpret_cast<const char *>(ptr->get())};
     }
 
     uint64_t getAddress() { return (uint64_t)ptr; }
@@ -193,7 +254,7 @@ public:
     return {reinterpret_cast<const char *>(ptr)};
   }
 
-  TypeLookupErrorOr<Buffer<const Metadata>> getTypeByMangledName(
+  BuilderErrorOr<Buffer<const Metadata>> getTypeByMangledName(
       WritableData<FullMetadata<Metadata>> containingMetadataBuffer,
       llvm::StringRef mangledTypeName) {
     auto metadata = static_cast<Metadata *>(containingMetadataBuffer.ptr);
@@ -213,10 +274,10 @@ public:
               result);
           return result;
         });
-    if (result.isError())
+    if (result.isError()) {
       return *result.getError();
-    return TypeLookupErrorOr{
-        Buffer<const Metadata>{result.getType().getMetadata()}};
+    }
+    return Buffer<const Metadata>{result.getType().getMetadata()};
   }
 
   template <typename T>
@@ -273,8 +334,10 @@ class GenericMetadataBuilder {
   Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi512_;
 
   template <typename DescriptorType>
-  const char *getDescriptorName(Buffer<DescriptorType> descriptionBuffer) {
-    auto name = descriptionBuffer.resolvePointer(&descriptionBuffer.ptr->Name);
+  BuilderErrorOr<const char *>
+  getDescriptorName(Buffer<DescriptorType> descriptionBuffer) {
+    auto name = ERROR_CHECK(
+        descriptionBuffer.resolvePointer(&descriptionBuffer.ptr->Name));
     return name.ptr ? name.ptr : "<unknown>";
   }
 
@@ -291,6 +354,11 @@ class GenericMetadataBuilder {
   }
 
 public:
+  struct ConstructedMetadata {
+    WritableData<FullMetadata<TargetMetadata<Runtime>>> data;
+    Size offset;
+  };
+
   GenericMetadataBuilder(ReaderWriter readerWriter)
       : readerWriter(readerWriter),
         pod_copy(readerWriter.getSymbolPointer("_swift_pod_copy")),
@@ -316,7 +384,7 @@ public:
         VWT_Bi512_(readerWriter.getSymbolPointer(
             MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi512_)))) {}
 
-  void initializeValueMetadataFromPattern(
+  BuilderErrorOr<std::monostate> initializeValueMetadataFromPattern(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
       Size metadataOffset,
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
@@ -344,10 +412,10 @@ public:
       LOG("Writing %" PRIu16 "words of extra data from offset %" PRIu16,
           extraDataPattern->SizeInWords, extraDataPattern->OffsetInWords);
       auto patternPointers =
-          patternBuffer.resolvePointer(&extraDataPattern->Pattern);
+          ERROR_CHECK(patternBuffer.resolvePointer(&extraDataPattern->Pattern));
       for (unsigned i = 0; i < extraDataPattern->SizeInWords; i++) {
         auto patternPointer =
-            patternPointers.resolvePointer(&patternPointers[i]);
+            ERROR_CHECK(patternPointers.resolvePointer(&patternPointers[i]));
         data.writePointer(
             &metadataExtraData[i + extraDataPattern->OffsetInWords],
             patternPointer);
@@ -358,7 +426,7 @@ public:
     // The various initialization functions will instantiate this as
     // necessary.
     auto valueWitnesses =
-        patternBuffer.resolvePointer(&pattern->ValueWitnesses);
+        ERROR_CHECK(patternBuffer.resolvePointer(&pattern->ValueWitnesses));
     LOG("Setting initial value witnesses");
     data.writePointer(&fullMetadata->ValueWitnesses, valueWitnesses);
 
@@ -369,14 +437,16 @@ public:
     // Set the type descriptor.
     LOG("Setting descriptor");
     data.writePointer(&metadata->Description, descriptionBuffer);
+
+    return {{}};
   }
 
-  void installGenericArguments(
+  BuilderErrorOr<std::monostate> installGenericArguments(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
       Size metadataOffset,
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
       const GenericArgument *arguments) {
-    LOG("Building %s", getDescriptorName(descriptionBuffer));
+    LOG("Building %s", ERROR_CHECK(getDescriptorName(descriptionBuffer)));
     char *metadataBase = reinterpret_cast<char *>(data.ptr);
     auto metadata =
         reinterpret_cast<ValueMetadata *>(metadataBase + metadataOffset);
@@ -391,12 +461,13 @@ public:
       data.writePointer(&dst[i], arguments[i]);
 
     // TODO: parameter pack support.
+
+    return {{}};
   }
 
   // Returns the constructed metadata, and the offset within the buffer to the
   // start of the ValueMetadata.
-  std::pair<WritableData<FullMetadata<TargetMetadata<Runtime>>>, Size>
-  buildGenericValueMetadata(
+  BuilderErrorOr<ConstructedMetadata> buildGenericValueMetadata(
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
       const GenericArgument *arguments,
       Buffer<const TargetGenericValueMetadataPattern<Runtime>> patternBuffer,
@@ -416,58 +487,63 @@ public:
             totalSize);
     auto metadataOffset = sizeof(ValueMetadata::HeaderType);
 
-    initializeValueMetadataFromPattern(metadataBuffer, metadataOffset,
-                                       descriptionBuffer, patternBuffer);
+    ERROR_CHECK(initializeValueMetadataFromPattern(
+        metadataBuffer, metadataOffset, descriptionBuffer, patternBuffer));
 
     // Copy the generic arguments into place.
-    installGenericArguments(metadataBuffer, metadataOffset, descriptionBuffer,
-                            arguments);
+    ERROR_CHECK(installGenericArguments(metadataBuffer, metadataOffset,
+                                        descriptionBuffer, arguments));
 
-    return {metadataBuffer, metadataOffset};
+    return ConstructedMetadata{metadataBuffer, metadataOffset};
   }
 
-  void initializeGenericValueMetadata(
+  BuilderErrorOr<std::monostate> initializeGenericValueMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer) {
     auto *metadata = static_cast<TargetMetadata<Runtime> *>(metadataBuffer.ptr);
     auto *valueMetadata = dyn_cast<TargetValueMetadata<Runtime>>(metadata);
 
     auto descriptionBuffer =
-        metadataBuffer.resolvePointer(&valueMetadata->Description);
-    auto patternBuffer = descriptionBuffer.resolvePointer(
+        ERROR_CHECK(metadataBuffer.resolvePointer(&valueMetadata->Description));
+    auto patternBuffer = ERROR_CHECK(descriptionBuffer.resolvePointer(
         &descriptionBuffer.ptr->getFullGenericContextHeader()
-             .DefaultInstantiationPattern);
-    auto completionFunction = patternBuffer.resolveFunctionPointer(
-        &patternBuffer.ptr->CompletionFunction);
+             .DefaultInstantiationPattern));
+    auto completionFunction = ERROR_CHECK(patternBuffer.resolveFunctionPointer(
+        &patternBuffer.ptr->CompletionFunction));
 
     if (!completionFunction) {
       LOG("Type has no completion function, skipping initialization");
-      return;
+      return {{}};
     }
 
     if (auto structmd = dyn_cast<TargetStructMetadata<Runtime>>(metadata))
-      initializeStructMetadata(metadataBuffer, structmd);
+      ERROR_CHECK(initializeStructMetadata(metadataBuffer, structmd));
     else if (auto enummd = dyn_cast<TargetEnumMetadata<Runtime>>(metadata))
-      initializeEnumMetadata(metadataBuffer, enummd);
+      ERROR_CHECK(initializeEnumMetadata(metadataBuffer, enummd));
     else
-      LOG("Don't know how to initialize metadata kind %#" PRIx32,
-          static_cast<uint32_t>(metadataBuffer.ptr->getKind()));
+      return MAKE_ERROR("Don't know how to initialize metadata kind %#" PRIx32,
+                        static_cast<uint32_t>(metadataBuffer.ptr->getKind()));
+    return {{}};
   }
 
   static constexpr TypeLayout getInitialLayoutForValueType() {
     return {0, 0, ValueWitnessFlags().withAlignment(1).withPOD(true), 0};
   }
 
-  void copyVWT(WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer,
-               Buffer<const TargetValueWitnessTable<Runtime>> from) {
+  BuilderErrorOr<std::monostate>
+  copyVWT(WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer,
+          Buffer<const TargetValueWitnessTable<Runtime>> from) {
 #define WANT_ONLY_REQUIRED_VALUE_WITNESSES
 #define VALUE_WITNESS(LOWER_ID, UPPER_ID)                                      \
-  auto LOWER_ID##_Buffer = from.resolveFunctionPointer(&from.ptr->LOWER_ID);   \
+  auto LOWER_ID##_Buffer =                                                     \
+      ERROR_CHECK(from.resolveFunctionPointer(&from.ptr->LOWER_ID));           \
   vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->LOWER_ID, LOWER_ID##_Buffer);
 #define DATA_VALUE_WITNESS(LOWER_ID, UPPER_ID, TYPE)
 #include "swift/ABI/ValueWitness.def"
+
+    return {{}}; // success
   }
 
-  void installCommonValueWitnesses(
+  BuilderErrorOr<std::monostate> installCommonValueWitnesses(
       const TypeLayout &layout,
       WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer) {
     auto flags = layout.flags;
@@ -507,39 +583,39 @@ public:
                                        pod_copy);
         // getEnumTagSinglePayload and storeEnumTagSinglePayload are not
         // interestingly optimizable based on POD-ness.
-        return;
+        return {{}};
 
       case sizeWithAlignmentMask(1, 0, 0):
         LOG("case sizeWithAlignmentMask(1, 0, 0)");
-        copyVWT(vwtBuffer, VWT_Bi8_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi8_));
         break;
       case sizeWithAlignmentMask(2, 1, 0):
         LOG("case sizeWithAlignmentMask(2, 1, 0)");
-        copyVWT(vwtBuffer, VWT_Bi16_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi16_));
         break;
       case sizeWithAlignmentMask(4, 3, 0):
         LOG("case sizeWithAlignmentMask(4, 3, 0)");
-        copyVWT(vwtBuffer, VWT_Bi32_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi32_));
         break;
       case sizeWithAlignmentMask(8, 7, 0):
         LOG("case sizeWithAlignmentMask(8, 7, 0)");
-        copyVWT(vwtBuffer, VWT_Bi64_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi64_));
         break;
       case sizeWithAlignmentMask(16, 15, 0):
         LOG("case sizeWithAlignmentMask(16, 15, 0)");
-        copyVWT(vwtBuffer, VWT_Bi128_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi128_));
         break;
       case sizeWithAlignmentMask(32, 31, 0):
         LOG("case sizeWithAlignmentMask(32, 31, 0)");
-        copyVWT(vwtBuffer, VWT_Bi256_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi256_));
         break;
       case sizeWithAlignmentMask(64, 63, 0):
         LOG("case sizeWithAlignmentMask(64, 63, 0)");
-        copyVWT(vwtBuffer, VWT_Bi512_);
+        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi512_));
         break;
       }
 
-      return;
+      return {{}};
     }
 
     if (flags.isBitwiseTakable()) {
@@ -547,23 +623,23 @@ public:
       // Use POD value witnesses for operations that do an initializeWithTake.
       vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithTake,
                                      pod_copy);
-      return;
     }
+    return {{}};
   }
 
-  void initializeStructMetadata(
+  BuilderErrorOr<std::monostate> initializeStructMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
       TargetStructMetadata<Runtime> *metadata) {
     LOG("Initializing struct");
 
     auto descriptionBuffer =
-        metadataBuffer.resolvePointer(&metadata->Description);
+        ERROR_CHECK(metadataBuffer.resolvePointer(&metadata->Description));
     auto description =
         reinterpret_cast<const TargetStructDescriptor<Runtime> *>(
             descriptionBuffer.ptr);
 
     auto fieldDescriptorBuffer =
-        descriptionBuffer.resolvePointer(&description->Fields);
+        ERROR_CHECK(descriptionBuffer.resolvePointer(&description->Fields));
     auto fieldDescriptor = fieldDescriptorBuffer.ptr;
     auto fields = fieldDescriptor->getFields();
     LOG("%zu fields", fields.size());
@@ -578,41 +654,30 @@ public:
         metadata, description->FieldOffsetVectorOffset);
     auto *fieldOffsets = reinterpret_cast<uint32_t *>(fieldOffsetsStart);
 
-    auto numGenericParams = description->getGenericContextHeader().NumParams;
-    auto genericArguments =
-        wordsOffset<ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(
-            metadata, description->getGenericArgumentOffset());
-
     // We have extra inhabitants if any element does. Use the field with the
     // most.
     unsigned extraInhabitantCount = 0;
 
     for (unsigned i = 0; i != fields.size(); ++i) {
       auto &field = fields[i];
-      auto nameBuffer = fieldDescriptorBuffer.resolvePointer(&field.FieldName);
-      auto mangledTypeNameBuffer =
-          fieldDescriptorBuffer.resolvePointer(&field.MangledTypeName);
+      auto nameBuffer =
+          ERROR_CHECK(fieldDescriptorBuffer.resolvePointer(&field.FieldName));
+      auto mangledTypeNameBuffer = ERROR_CHECK(
+          fieldDescriptorBuffer.resolvePointer(&field.MangledTypeName));
       auto mangledTypeName =
           Demangle::makeSymbolicMangledNameStringRef(mangledTypeNameBuffer.ptr);
       LOG("Examining field %u '%s' type '%.*s' (mangled name is %zu bytes)", i,
           nameBuffer.ptr, (int)mangledTypeName.size(), mangledTypeName.data(),
           mangledTypeName.size());
 
-      auto result =
-          readerWriter.getTypeByMangledName(metadataBuffer, mangledTypeName);
-      if (result.isError()) {
-        auto *error = result.getError();
-        char *errorStr = error->copyErrorString();
-        LOG("Failed to look up field: %s", errorStr);
-        error->freeErrorString(errorStr);
-        abort(); // TODO: fail gracefully
-      }
-      auto fieldTypeBuffer = result.getType();
+      auto fieldTypeBuffer = ERROR_CHECK(
+          readerWriter.getTypeByMangledName(metadataBuffer, mangledTypeName));
       auto *fieldType = fieldTypeBuffer.ptr;
       LOG("Looked up field type metadata %p", fieldType);
 
-      // TODO: need to use resolvePointer on a buffer of some sort.
-      auto *fieldWitnessTable = asFullMetadata(fieldType)->ValueWitnesses;
+      auto fieldWitnessTableBuffer = ERROR_CHECK(fieldTypeBuffer.resolvePointer(
+          &asFullMetadata(fieldType)->ValueWitnesses));
+      auto *fieldWitnessTable = fieldWitnessTableBuffer.ptr;
       auto *fieldLayout = fieldWitnessTable->getTypeLayout();
       size = roundUpToAlignMask(size, fieldLayout->flags.getAlignmentMask());
 
@@ -644,8 +709,8 @@ public:
     layout.extraInhabitantCount = extraInhabitantCount;
     layout.stride = std::max(size_t(1), roundUpToAlignMask(size, alignMask));
 
-    auto oldVWTBuffer = metadataBuffer.resolvePointer(
-        &asFullMetadata(metadata)->ValueWitnesses);
+    auto oldVWTBuffer = ERROR_CHECK(metadataBuffer.resolvePointer(
+        &asFullMetadata(metadata)->ValueWitnesses));
     auto *oldVWT = oldVWTBuffer.ptr;
 
     if (LOG_ENABLED) {
@@ -672,27 +737,30 @@ public:
 #define FUNCTION_VALUE_WITNESS(LOWER_ID, UPPER_ID, RETURN_TYPE, PARAM_TYPES)   \
   newVWTData.writeFunctionPointer(                                             \
       &newVWT->LOWER_ID,                                                       \
-      oldVWTBuffer.resolveFunctionPointer(&oldVWT->LOWER_ID));
+      ERROR_CHECK(oldVWTBuffer.resolveFunctionPointer(&oldVWT->LOWER_ID)));
 #include "swift/ABI/ValueWitness.def"
 
-    installCommonValueWitnesses(layout, newVWTData);
+    ERROR_CHECK(installCommonValueWitnesses(layout, newVWTData));
 
     newVWT->publishLayout(layout);
 
     metadataBuffer.writePointer(&metadataBuffer.ptr->ValueWitnesses,
                                 newVWTData);
+    return {{}}; // success
   }
 
-  void initializeEnumMetadata(
+  BuilderErrorOr<std::monostate> initializeEnumMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
       TargetEnumMetadata<Runtime> *metadata) {
     LOG("Initializing enum");
+    return MAKE_ERROR("Don't know how to initialize enum metadata yet");
   }
 
-  size_t extraDataSize(
+  BuilderErrorOr<size_t> extraDataSize(
       Buffer<const TargetTypeContextDescriptor<Runtime>> descriptionBuffer,
       Buffer<const TargetGenericMetadataPattern<Runtime>> patternBuffer) {
-    LOG("Getting extra data size for %s", getDescriptorName(descriptionBuffer));
+    LOG("Getting extra data size for %s",
+        ERROR_CHECK(getDescriptorName(descriptionBuffer)));
 
     auto *pattern = patternBuffer.ptr;
 
@@ -757,7 +825,9 @@ public:
       }
     }
 
-    abort();
+    return MAKE_ERROR(
+        "Unable to compute extra data size of descriptor with kind %u",
+        static_cast<unsigned>(description->getKind()));
   }
 
   template <typename Printer>
@@ -784,15 +854,16 @@ public:
   public:
     Dumper(Printer print) : print(print) {}
 
-    void dumpMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer) {
+    BuilderErrorOr<std::monostate>
+    dumpMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer) {
       printPointer("Metadata ", metadataBuffer);
 
       auto fullMetadata = asFullMetadata(metadataBuffer.ptr);
 
-      auto valueWitnesses =
-          metadataBuffer.resolvePointer(&fullMetadata->ValueWitnesses);
+      auto valueWitnesses = ERROR_CHECK(
+          metadataBuffer.resolvePointer(&fullMetadata->ValueWitnesses));
       printPointer("  value witnesses: ", valueWitnesses);
-      dumpVWT(valueWitnesses);
+      ERROR_CHECK(dumpVWT(valueWitnesses));
 
       auto kind = fullMetadata->getKind();
       auto kindString = getStringForMetadataKind(kind);
@@ -801,40 +872,46 @@ public:
 
       if (auto classmd =
               dyn_cast<TargetClassMetadataType<Runtime>>(metadataBuffer.ptr))
-        dumpClassMetadata(metadataBuffer, classmd);
+        ERROR_CHECK(dumpClassMetadata(metadataBuffer, classmd));
       else if (auto valuemd =
                    dyn_cast<TargetValueMetadata<Runtime>>(metadataBuffer.ptr))
-        dumpValueMetadata(metadataBuffer, valuemd);
+        ERROR_CHECK(dumpValueMetadata(metadataBuffer, valuemd));
+
+      return {{}};
     }
 
-    void dumpClassMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
-                           const TargetClassMetadataType<Runtime> *metadata) {
+    BuilderErrorOr<std::monostate>
+    dumpClassMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
+                      const TargetClassMetadataType<Runtime> *metadata) {
       print("  TODO class dumping\n");
+      return {{}};
     }
 
-    void dumpValueMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
-                           const TargetValueMetadata<Runtime> *metadata) {
+    BuilderErrorOr<std::monostate>
+    dumpValueMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
+                      const TargetValueMetadata<Runtime> *metadata) {
       auto descriptionBuffer =
-          metadataBuffer.resolvePointer(&metadata->Description);
+          ERROR_CHECK(metadataBuffer.resolvePointer(&metadata->Description));
       auto description = descriptionBuffer.ptr;
       printPointer("  description: ", descriptionBuffer);
 
       if (description->hasLayoutString()) {
-        auto layoutStringBuffer = metadataBuffer.resolvePointer(
-            &asFullMetadata(metadata)->layoutString);
+        auto layoutStringBuffer = ERROR_CHECK(metadataBuffer.resolvePointer(
+            &asFullMetadata(metadata)->layoutString));
         printPointer("  layout string: ", layoutStringBuffer);
       }
 
-      auto name = descriptionBuffer.resolvePointer(&description->Name);
+      auto name =
+          ERROR_CHECK(descriptionBuffer.resolvePointer(&description->Name));
       printPointer("  name: ", name);
       print("        \"%s\"\n", name.ptr);
 
       if (auto structmd =
               dyn_cast<TargetStructMetadata<Runtime>>(metadataBuffer.ptr))
-        dumpStructMetadata(metadataBuffer, structmd);
+        ERROR_CHECK(dumpStructMetadata(metadataBuffer, structmd));
       else if (auto enummd =
                    dyn_cast<TargetEnumMetadata<Runtime>>(metadataBuffer.ptr))
-        dumpEnumMetadata(metadataBuffer, enummd);
+        ERROR_CHECK(dumpEnumMetadata(metadataBuffer, enummd));
 
       if (description->isGeneric()) {
         auto numGenericParams =
@@ -843,19 +920,22 @@ public:
             ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>>(
             metadata, description->getGenericArgumentOffset());
         for (unsigned i = 0; i < numGenericParams; i++) {
-          auto arg = metadataBuffer.resolvePointer(&genericArguments[i]);
+          auto arg =
+              ERROR_CHECK(metadataBuffer.resolvePointer(&genericArguments[i]));
           print("  genericArg[%u]: ", i);
           printPointer(arg);
           print("\n");
         }
       }
+
+      return {{}};
     }
 
-    void
+    BuilderErrorOr<std::monostate>
     dumpStructMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
                        const TargetStructMetadata<Runtime> *metadata) {
       auto descriptionBuffer =
-          metadataBuffer.resolvePointer(&metadata->Description);
+          ERROR_CHECK(metadataBuffer.resolvePointer(&metadata->Description));
       auto structDescription =
           reinterpret_cast<const TargetStructDescriptor<Runtime> *>(
               descriptionBuffer.ptr);
@@ -866,12 +946,14 @@ public:
         for (unsigned i = 0; i < structDescription->NumFields; i++)
           print("  fieldOffset[%u]: %" PRIu32 "\n", i, offsets[i]);
       }
+      return {{}};
     }
 
-    void dumpEnumMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
-                          const TargetEnumMetadata<Runtime> *metadata) {
+    BuilderErrorOr<std::monostate>
+    dumpEnumMetadata(Buffer<const TargetMetadata<Runtime>> metadataBuffer,
+                     const TargetEnumMetadata<Runtime> *metadata) {
       auto descriptionBuffer =
-          metadataBuffer.resolvePointer(&metadata->Description);
+          ERROR_CHECK(metadataBuffer.resolvePointer(&metadata->Description));
       auto description =
           reinterpret_cast<const TargetEnumDescriptor<Runtime> *>(
               descriptionBuffer.ptr);
@@ -883,16 +965,19 @@ public:
             wordsOffset<StoredSize *>(metadata, payloadSizeOffset);
         print("  payload size: %" PRIu64 "\n", (uint64_t)*payloadSizePtr);
       }
+
+      return {{}};
     }
 
-    void dumpVWT(Buffer<const TargetValueWitnessTable<Runtime>> vwtBuffer) {
+    BuilderErrorOr<std::monostate>
+    dumpVWT(Buffer<const TargetValueWitnessTable<Runtime>> vwtBuffer) {
       auto *vwt = vwtBuffer.ptr;
 
 #define WANT_ONLY_REQUIRED_VALUE_WITNESSES
 #define DATA_VALUE_WITNESS(LOWER_ID, UPPER_ID, TYPE)                           \
-  dumpVWTDataField(#LOWER_ID, vwt->LOWER_ID);
+  ERROR_CHECK(dumpVWTDataField(#LOWER_ID, vwt->LOWER_ID));
 #define FUNCTION_VALUE_WITNESS(LOWER_ID, UPPER_ID, RETURN_TYPE, PARAM_TYPES)   \
-  dumpVWTFunctionField(vwtBuffer, #LOWER_ID, &vwt->LOWER_ID);
+  ERROR_CHECK(dumpVWTFunctionField(vwtBuffer, #LOWER_ID, &vwt->LOWER_ID));
 #include "swift/ABI/ValueWitness.def"
 
       if (auto *enumVWT = dyn_cast<EnumValueWitnessTable>(vwt)) {
@@ -901,25 +986,32 @@ public:
 //         dumpVWTField(vwtBuffer, #LOWER_ID, &enumVWT->LOWER_ID);
         // #include "swift/ABI/ValueWitness.def"
       }
+
+      return {{}};
     }
 
-    void dumpVWTDataField(const char *name, uint64_t value) {
+    BuilderErrorOr<std::monostate> dumpVWTDataField(const char *name,
+                                                    uint64_t value) {
       print("    %s: %#" PRIx64 " (%" PRIu64 ")\n", name, value, value);
+      return {{}};
     }
 
     template <typename T>
-    void dumpVWTDataField(const char *name, TargetValueWitnessFlags<T> value) {
-      dumpVWTDataField(name, value.getOpaqueValue());
+    BuilderErrorOr<std::monostate>
+    dumpVWTDataField(const char *name, TargetValueWitnessFlags<T> value) {
+      return dumpVWTDataField(name, value.getOpaqueValue());
     }
 
     template <typename T>
-    void dumpVWTFunctionField(
+    BuilderErrorOr<std::monostate> dumpVWTFunctionField(
         Buffer<const TargetValueWitnessTable<Runtime>> vwtBuffer,
         const char *name, T *ptr) {
-      auto function = vwtBuffer.resolveFunctionPointer(ptr);
+      auto function = ERROR_CHECK(vwtBuffer.resolveFunctionPointer(ptr));
       print("    %s: ", name);
       printPointer(function);
       print("\n");
+
+      return {{}};
     }
   };
 
@@ -935,27 +1027,48 @@ ValueMetadata *swift_allocateGenericValueMetadata_new(
     const ValueTypeDescriptor *description, const void *arguments,
     const GenericValueMetadataPattern *pattern, size_t extraDataSize) {
   GenericMetadataBuilder builder{InProcessReaderWriter()};
-  auto [data, offset] = builder.buildGenericValueMetadata(
+  auto result = builder.buildGenericValueMetadata(
       {description},
       reinterpret_cast<const InProcessReaderWriter::GenericArgument *>(
           arguments),
       {pattern}, extraDataSize);
-  char *base = reinterpret_cast<char *>(data.ptr);
-  return reinterpret_cast<ValueMetadata *>(base + offset);
+  if (auto *error = result.getError()) {
+    LOG("%s", error->cStr());
+    return nullptr;
+  }
+
+  auto built = *result.getValue();
+  char *base = reinterpret_cast<char *>(built.data.ptr);
+  return reinterpret_cast<ValueMetadata *>(base + built.offset);
 }
 
 void swift_initializeGenericValueMetadata(Metadata *metadata) {
   GenericMetadataBuilder builder{InProcessReaderWriter()};
-  builder.initializeGenericValueMetadata({asFullMetadata(metadata), -1u});
+
+  auto result =
+      builder.initializeGenericValueMetadata({asFullMetadata(metadata), -1u});
+  if (auto *error = result.getError()) {
+    LOG("%s", error->cStr());
+    // TODO: better
+    abort();
+  }
 }
 
 size_t swift_genericValueDataExtraSize(const ValueTypeDescriptor *description,
                                        const GenericMetadataPattern *pattern) {
   GenericMetadataBuilder builder{InProcessReaderWriter()};
-  return builder.extraDataSize({description}, {pattern});
+  auto result = builder.extraDataSize({description}, {pattern});
+  if (auto *error = result.getError()) {
+    LOG("%s", error->cStr());
+    return -1000000; // TODO: better
+  }
+  return *result.getValue();
 }
 
 void _swift_dumpMetadata(const Metadata *metadata) {
   GenericMetadataBuilder<InProcessReaderWriter>::Dumper dumper(printf);
-  dumper.dumpMetadata({metadata});
+  auto result = dumper.dumpMetadata({metadata});
+  if (auto *error = result.getError()) {
+    printf("error: %s", error->cStr());
+  }
 }
