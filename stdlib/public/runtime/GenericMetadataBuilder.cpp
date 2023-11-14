@@ -27,12 +27,17 @@
 
 using namespace swift;
 
-#define LOG_ENABLED 1
+// Logging macro. Currently we always enable logs, but we'll want to make this
+// conditional eventually. LOG_ENABLED can be used to gate work that's needed
+// for log statements but not for anything else.
+static const bool loggingEnabled = true;
+#define LOG_ENABLED loggingEnabled
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #define LOG(fmt, ...)                                                          \
   fprintf(stderr, "%s:%d:%s: " fmt "\n", __FILE_NAME__, __LINE__,              \
           __func__ __VA_OPT__(, ) __VA_ARGS__)
 
+// Helper functions for working with pointer alignment.
 template <class T>
 static constexpr T roundUpToAlignment(T offset, T alignment) {
   return (offset + alignment - 1) & ~(alignment - 1);
@@ -48,6 +53,8 @@ static constexpr uint64_t sizeWithAlignmentMask(uint64_t size,
   return (hasExtraInhabitants << 48) | (size << 16) | alignmentMask;
 }
 
+/// An error produced when building metadata. This is a small wrapper around
+/// a std::string which describes the error.
 class BuilderError {
   std::string errorString;
 
@@ -55,6 +62,10 @@ public:
   BuilderError(std::string string) : errorString(string) {}
   BuilderError(char *string) : errorString(string) {}
 
+  /// This helper constructor takes a callable which is passed a char**, and
+  /// places the error string into that pointer. This is intended to be used
+  /// with a lambda that calls asprintf, and exists for the use of the
+  /// MAKE_ERROR macro.
   template <typename Fn>
   BuilderError(const Fn &makeString) {
     char *string = nullptr;
@@ -71,11 +82,19 @@ public:
   const char *cStr() const { return errorString.c_str(); }
 };
 
+/// Make a BuilderError using a standard printf format string and arguments.
 #pragma clang diagnostic ignored                                               \
     "-Wgnu-statement-expression-from-macro-expansion"
 #define MAKE_ERROR(...)                                                        \
   BuilderError([=](char **ptr) { asprintf(ptr, __VA_ARGS__); })
 
+/// A value that's either a BuilderError or some other success value. Use this
+/// as the return type from any function that could return an error.
+///
+/// If the function returns no value on success, use
+/// BuilderErrorOr<std::monostate>. To return success, write `return {{}}` which
+/// constructs a BuilderErrorOr with the singular monostate value. This looks
+/// weird but it works.
 template <typename T>
 class [[nodiscard]] BuilderErrorOr {
   std::variant<T, BuilderError> storage;
@@ -84,21 +103,30 @@ public:
   BuilderErrorOr(const T &value) : storage(value) {}
   BuilderErrorOr(const BuilderError &error) : storage(error) {}
 
-  static BuilderErrorOr success(const T &value) {
-    return BuilderErrorOr{value};
-  }
-
+  /// Create a BuilderErrorOr from a TypeLookupError returned by runtime type
+  /// lookup.
   BuilderErrorOr(const TypeLookupError &error) {
     char *errorStr = error.copyErrorString();
     storage = BuilderError(errorStr);
     error.freeErrorString(errorStr);
   }
 
+  /// Get a pointer to the wrapped success value, or NULL if the value is an
+  /// error.
   T *getValue() { return std::get_if<T>(&storage); }
 
+  /// Get a pointer to the wrapped error, or NULL if the value is a success
+  /// value.
   BuilderError *getError() { return std::get_if<BuilderError>(&storage); }
 };
 
+/// This macro takes a value of BuilderErrorOr<T>. and produces an expression of
+/// type T. If this value is success, then the value of the expression is the
+/// wrapped success value. If it's an error, then this expression immediately
+/// returns the error from the enclosing function. This works by doing a return
+/// from the middle of a statement expression, which is scary, but works. We
+/// ultimately end up with something that looks a bit like a Swift `try`
+/// expression. Like Swift, we avoid using exceptions to propagate the error.
 #define ERROR_CHECK(errorOrT)                                                  \
   ({                                                                           \
     auto error_check_tmp = (errorOrT);                                         \
@@ -107,6 +135,9 @@ public:
     *error_check_tmp.getValue();                                               \
   })
 
+/// A ReaderWriter (as used by GenericMetadataBuilder) that works in-process.
+/// Pointer writing and pointer resolution are just raw pointer operations. Type
+/// lookup is done by asking the runtime. Symbol lookup uses `dlsym`.
 class InProcessReaderWriter {
 public:
   using Runtime = InProcess;
@@ -115,15 +146,7 @@ public:
   using StoredPointer = typename Runtime::StoredPointer;
   using GenericArgument = void *;
 
-  template <typename T>
-  class Buffer;
-
-  class ReadableData {
-  public:
-    void *ptr;
-    size_t size;
-  };
-
+  /// A typed buffer which wraps a value, or values, of type T.
   template <typename T>
   class Buffer {
   public:
@@ -131,14 +154,20 @@ public:
 
     Buffer(T *ptr) : ptr(ptr) {}
 
+    /// Construct an arbitrarily typed buffer from a Buffer<const char>, using
+    /// const char as an "untyped" buffer type.
     Buffer(Buffer<const char> buffer)
         : ptr(reinterpret_cast<T *>(buffer.ptr)) {}
 
+    /// The pointer to the buffer's underlying storage.
     T *ptr;
 
-    T &operator[](size_t i) { return ptr[i]; }
+    bool isNull() const { return ptr; }
 
-    operator bool() const { return ptr; }
+    /// The various resolvePointer functions take a pointer to a pointer within
+    /// the buffer, and dereference it. In-process, this is a simple operation,
+    /// basically just wrapping the * operator or get() function. This
+    /// abstraction is needed for out-of-process operations.
 
     BuilderErrorOr<Buffer<char>> resolvePointer(uintptr_t *ptr) {
       return Buffer<char>{reinterpret_cast<char *>(*ptr)};
@@ -159,7 +188,7 @@ public:
     template <typename U, bool Nullable>
     BuilderErrorOr<Buffer<const U>>
     resolvePointer(const RelativeIndirectablePointer<const U, Nullable> *ptr) {
-      return BuilderErrorOr<Buffer<const U>>::success(ptr->get());
+      return Buffer<const U>{ptr->get()};
     }
 
     template <typename U>
@@ -178,11 +207,14 @@ public:
       return Buffer<const char>{reinterpret_cast<const char *>(ptr->get())};
     }
 
+    /// Get an address value for the buffer, for logging purposes.
     uint64_t getAddress() { return (uint64_t)ptr; }
   };
 
+  /// WritableData is a mutable Buffer subclass.
   template <typename T>
   class WritableData : public Buffer<T> {
+    /// Check that the given pointer lies within memory of this data object.
     void checkPtr(void *toCheck) {
       assert((uintptr_t)toCheck - (uintptr_t)this->ptr < size);
     }
@@ -191,7 +223,11 @@ public:
     WritableData(T *ptr, size_t size) : Buffer<T>(ptr), size(size) {}
 
     size_t size;
-    size_t cursor;
+
+    /// The various writePointer functions take a pointer to a pointer within
+    /// the data, and a target, and set the pointer to the target. When done
+    /// in-process, this is just a wrapper around the * and = operators. This
+    /// abstracted is needed for out-of-process work.
 
     template <typename U>
     void writePointer(StoredPointer *to, Buffer<U> target) {
@@ -222,12 +258,16 @@ public:
     }
   };
 
+  /// Basic info about a symbol.
   struct SymbolInfo {
     std::string symbolName;
     std::string libraryName;
     uint64_t pointerOffset;
   };
 
+  /// Get info about the symbol corresponding to the given buffer. If no
+  /// information can be retrieved, the result is filled with "<unknown>"
+  /// strings and a 0 offset.
   template <typename T>
   SymbolInfo getSymbolInfo(Buffer<T> buffer) {
     Dl_info info;
@@ -248,6 +288,7 @@ public:
             buffer.getAddress() - (uintptr_t)info.dli_fbase};
   }
 
+  /// Given a symbol name, retrieve a buffer pointing to the symbol's data.
   template <typename T = char>
   BuilderErrorOr<Buffer<const T>> getSymbolPointer(const char *name) {
     void *ptr = dlsym(RTLD_SELF, name);
@@ -257,6 +298,9 @@ public:
     return Buffer<const T>{reinterpret_cast<const T *>(ptr)};
   }
 
+  /// Look up a type with a given mangled name, in the context of the given
+  /// metadata. The metadata's generic arguments must already be installed. Used
+  /// for retrieving metadata for field records.
   BuilderErrorOr<Buffer<const Metadata>> getTypeByMangledName(
       WritableData<FullMetadata<Metadata>> containingMetadataBuffer,
       llvm::StringRef mangledTypeName) {
@@ -283,23 +327,21 @@ public:
     return Buffer<const Metadata>{result.getType().getMetadata()};
   }
 
+  /// Allocate a WritableData with the given size.
   template <typename T>
-  WritableData<T> allocate(size_t size);
-  template <typename T>
-  T *read(ReadableData &data, size_t offset);
-  void write();
+  WritableData<T> allocate(size_t size) {
+    auto bytes = reinterpret_cast<T *>(
+        MetadataAllocator(MetadataAllocatorTags::GenericValueMetadataTag)
+            .Allocate(size, alignof(void *)));
+
+    return WritableData<T>{bytes, size};
+  }
 };
 
-template <typename T>
-InProcessReaderWriter::WritableData<T>
-InProcessReaderWriter::allocate(size_t size) {
-  auto bytes = reinterpret_cast<T *>(
-      MetadataAllocator(MetadataAllocatorTags::GenericValueMetadataTag)
-          .Allocate(size, alignof(void *)));
-
-  return WritableData<T>{bytes, size};
-}
-
+/// A generic metadata builder. This is templatized on a ReaderWriter, which
+/// abstracts the various operations we need for building generic metadata, such
+/// as allocating memory, reading and writing pointers, looking up symbols,
+/// looking up type metadata by name, etc.
 template <typename ReaderWriter>
 class GenericMetadataBuilder {
   using Runtime = typename ReaderWriter::Runtime;
@@ -323,6 +365,12 @@ class GenericMetadataBuilder {
 
   ReaderWriter readerWriter;
 
+  // Various functions and witness tables needed from the Swift runtime. These
+  // are used to create the witness table for certain kinds of newly constructed
+  // metadata. These are stored as BuilderErrorOr because it's not a totally
+  // fatal error if we fail to look these up. If one of these symbols can't be
+  // found, then we're unable to build metadata that needs it, but we can still
+  // build other metadata.
   BuilderErrorOr<Buffer<const char>> pod_copy;
   BuilderErrorOr<Buffer<const char>> pod_destroy;
   BuilderErrorOr<Buffer<const char>>
@@ -337,6 +385,7 @@ class GenericMetadataBuilder {
   BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi256_;
   BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi512_;
 
+  /// Read the name from a given type descriptor.
   template <typename DescriptorType>
   BuilderErrorOr<const char *>
   getDescriptorName(Buffer<DescriptorType> descriptionBuffer) {
@@ -345,12 +394,17 @@ class GenericMetadataBuilder {
     return name.ptr ? name.ptr : "<unknown>";
   }
 
+  /// Utility function for getting the location of an offset into a given
+  /// pointer, when the offset is given in terms of a number of integer words.
+  /// This is used with various metadata values which are given in terms of
+  /// 32-bit or pointer-sized words from the start of the metadata.
   template <typename Word>
   static Word *wordsOffset(void *from, size_t offset) {
     auto asWords = reinterpret_cast<Word *>(from);
     return asWords + offset;
   }
 
+  /// Const version of wordsOffset.
   template <typename Word>
   static const Word *wordsOffset(const void *from, size_t offset) {
     auto asWords = reinterpret_cast<const Word *>(from);
@@ -358,6 +412,8 @@ class GenericMetadataBuilder {
   }
 
 public:
+  /// A fully constructed metadata, which consists of the data buffer and the
+  /// offset to the metadata's address point within it.
   struct ConstructedMetadata {
     WritableData<FullMetadata<TargetMetadata<Runtime>>> data;
     Size offset;
@@ -402,6 +458,7 @@ public:
                 .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
                     MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi512_)))) {}
 
+  /// Initialize an already-allocated generic value metadata.
   BuilderErrorOr<std::monostate> initializeValueMetadataFromPattern(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
       Size metadataOffset,
@@ -432,8 +489,8 @@ public:
       auto patternPointers =
           ERROR_CHECK(patternBuffer.resolvePointer(&extraDataPattern->Pattern));
       for (unsigned i = 0; i < extraDataPattern->SizeInWords; i++) {
-        auto patternPointer =
-            ERROR_CHECK(patternPointers.resolvePointer(&patternPointers[i]));
+        auto patternPointer = ERROR_CHECK(
+            patternPointers.resolvePointer(&patternPointers.ptr[i]));
         data.writePointer(
             &metadataExtraData[i + extraDataPattern->OffsetInWords],
             patternPointer);
@@ -459,6 +516,7 @@ public:
     return {{}};
   }
 
+  /// Install the generic arguments in a metadata structure.
   BuilderErrorOr<std::monostate> installGenericArguments(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
       Size metadataOffset,
@@ -483,8 +541,7 @@ public:
     return {{}};
   }
 
-  // Returns the constructed metadata, and the offset within the buffer to the
-  // start of the ValueMetadata.
+  /// Allocate and build a matadata structure.
   BuilderErrorOr<ConstructedMetadata> buildGenericValueMetadata(
       Buffer<const TargetValueTypeDescriptor<Runtime>> descriptionBuffer,
       const GenericArgument *arguments,
@@ -515,6 +572,7 @@ public:
     return ConstructedMetadata{metadataBuffer, metadataOffset};
   }
 
+  /// Initialize a generic value metadata structure.
   BuilderErrorOr<std::monostate> initializeGenericValueMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer) {
     auto *metadata = static_cast<TargetMetadata<Runtime> *>(metadataBuffer.ptr);
@@ -528,7 +586,7 @@ public:
     auto completionFunction = ERROR_CHECK(patternBuffer.resolveFunctionPointer(
         &patternBuffer.ptr->CompletionFunction));
 
-    if (!completionFunction) {
+    if (!completionFunction.isNull()) {
       LOG("Type has no completion function, skipping initialization");
       return {{}};
     }
@@ -547,6 +605,7 @@ public:
     return {0, 0, ValueWitnessFlags().withAlignment(1).withPOD(true), 0};
   }
 
+  /// Copy the contents of a given value witness table into a new one.
   BuilderErrorOr<std::monostate>
   copyVWT(WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer,
           Buffer<const TargetValueWitnessTable<Runtime>> from) {
@@ -561,6 +620,8 @@ public:
     return {{}}; // success
   }
 
+  /// Install common value witness functions for POD and bitwise-takable
+  /// metadata.
   BuilderErrorOr<std::monostate> installCommonValueWitnesses(
       const TypeLayout &layout,
       WritableData<TargetValueWitnessTable<Runtime>> vwtBuffer) {
@@ -646,6 +707,7 @@ public:
     return {{}};
   }
 
+  /// Initialize generic struct metadata.
   BuilderErrorOr<std::monostate> initializeStructMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
       TargetStructMetadata<Runtime> *metadata) {
@@ -768,6 +830,7 @@ public:
     return {{}}; // success
   }
 
+  /// Initialize generic enum metadata.
   BuilderErrorOr<std::monostate> initializeEnumMetadata(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> metadataBuffer,
       TargetEnumMetadata<Runtime> *metadata) {
@@ -775,6 +838,8 @@ public:
     return MAKE_ERROR("Don't know how to initialize enum metadata yet");
   }
 
+  /// Get the extra data size required to allocate a new metadata structure for
+  /// the given description and pattern.
   BuilderErrorOr<size_t> extraDataSize(
       Buffer<const TargetTypeContextDescriptor<Runtime>> descriptionBuffer,
       Buffer<const TargetGenericMetadataPattern<Runtime>> patternBuffer) {
@@ -849,6 +914,7 @@ public:
         static_cast<unsigned>(description->getKind()));
   }
 
+  /// A class that can dump generic metadata structures.
   template <typename Printer>
   class Dumper {
     Printer print;
