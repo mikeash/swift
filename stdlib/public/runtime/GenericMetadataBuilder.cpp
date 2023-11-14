@@ -248,10 +248,13 @@ public:
             buffer.getAddress() - (uintptr_t)info.dli_fbase};
   }
 
-  Buffer<const char> getSymbolPointer(const char *name) {
+  template <typename T = char>
+  BuilderErrorOr<Buffer<const T>> getSymbolPointer(const char *name) {
     void *ptr = dlsym(RTLD_SELF, name);
     LOG("getSymbolPointer(\"%s\") -> %p", name, ptr);
-    return {reinterpret_cast<const char *>(ptr)};
+    if (!ptr)
+      return MAKE_ERROR("dlsym could not find symbol '%s'", name);
+    return Buffer<const T>{reinterpret_cast<const T *>(ptr)};
   }
 
   BuilderErrorOr<Buffer<const Metadata>> getTypeByMangledName(
@@ -320,18 +323,19 @@ class GenericMetadataBuilder {
 
   ReaderWriter readerWriter;
 
-  Buffer<const char> pod_copy;
-  Buffer<const char> pod_destroy;
-  Buffer<const char> pod_direct_initializeBufferWithCopyOfBuffer;
-  Buffer<const char> pod_indirect_initializeBufferWithCopyOfBuffer;
-
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi8_;
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi16_;
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi32_;
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi64_;
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi128_;
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi256_;
-  Buffer<const TargetValueWitnessTable<Runtime>> VWT_Bi512_;
+  BuilderErrorOr<Buffer<const char>> pod_copy;
+  BuilderErrorOr<Buffer<const char>> pod_destroy;
+  BuilderErrorOr<Buffer<const char>>
+      pod_direct_initializeBufferWithCopyOfBuffer;
+  BuilderErrorOr<Buffer<const char>>
+      pod_indirect_initializeBufferWithCopyOfBuffer;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi8_;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi16_;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi32_;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi64_;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi128_;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi256_;
+  BuilderErrorOr<Buffer<const TargetValueWitnessTable<Runtime>>> VWT_Bi512_;
 
   template <typename DescriptorType>
   BuilderErrorOr<const char *>
@@ -369,20 +373,34 @@ public:
         pod_indirect_initializeBufferWithCopyOfBuffer(
             readerWriter.getSymbolPointer(
                 "_swift_pod_indirect_initializeBufferWithCopyOfBuffer")),
-        VWT_Bi8_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi8_)))),
-        VWT_Bi16_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi16_)))),
-        VWT_Bi32_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi32_)))),
-        VWT_Bi64_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi64_)))),
-        VWT_Bi128_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi128_)))),
-        VWT_Bi256_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi256_)))),
-        VWT_Bi512_(readerWriter.getSymbolPointer(
-            MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi512_)))) {}
+        VWT_Bi8_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi8_)))),
+        VWT_Bi16_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi16_)))),
+        VWT_Bi32_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi32_)))),
+        VWT_Bi64_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi64_)))),
+        VWT_Bi128_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi128_)))),
+        VWT_Bi256_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi256_)))),
+        VWT_Bi512_(
+            readerWriter
+                .template getSymbolPointer<TargetValueWitnessTable<Runtime>>(
+                    MANGLE_AS_STRING(VALUE_WITNESS_SYM(Bi512_)))) {}
 
   BuilderErrorOr<std::monostate> initializeValueMetadataFromPattern(
       WritableData<FullMetadata<TargetMetadata<Runtime>>> data,
@@ -566,52 +584,53 @@ public:
         if (flags.isInlineStorage()) {
           vwtBuffer.writeFunctionPointer(
               &vwtBuffer.ptr->initializeBufferWithCopyOfBuffer,
-              pod_direct_initializeBufferWithCopyOfBuffer);
+              ERROR_CHECK(pod_direct_initializeBufferWithCopyOfBuffer));
         } else {
           vwtBuffer.writeFunctionPointer(
               &vwtBuffer.ptr->initializeBufferWithCopyOfBuffer,
-              pod_indirect_initializeBufferWithCopyOfBuffer);
+              ERROR_CHECK(pod_indirect_initializeBufferWithCopyOfBuffer));
         }
-        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->destroy, pod_destroy);
+        vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->destroy,
+                                       ERROR_CHECK(pod_destroy));
         vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithCopy,
-                                       pod_copy);
+                                       ERROR_CHECK(pod_copy));
         vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithTake,
-                                       pod_copy);
+                                       ERROR_CHECK(pod_copy));
         vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->assignWithCopy,
-                                       pod_copy);
+                                       ERROR_CHECK(pod_copy));
         vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->assignWithTake,
-                                       pod_copy);
+                                       ERROR_CHECK(pod_copy));
         // getEnumTagSinglePayload and storeEnumTagSinglePayload are not
         // interestingly optimizable based on POD-ness.
         return {{}};
 
       case sizeWithAlignmentMask(1, 0, 0):
         LOG("case sizeWithAlignmentMask(1, 0, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi8_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi8_)));
         break;
       case sizeWithAlignmentMask(2, 1, 0):
         LOG("case sizeWithAlignmentMask(2, 1, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi16_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi16_)));
         break;
       case sizeWithAlignmentMask(4, 3, 0):
         LOG("case sizeWithAlignmentMask(4, 3, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi32_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi32_)));
         break;
       case sizeWithAlignmentMask(8, 7, 0):
         LOG("case sizeWithAlignmentMask(8, 7, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi64_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi64_)));
         break;
       case sizeWithAlignmentMask(16, 15, 0):
         LOG("case sizeWithAlignmentMask(16, 15, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi128_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi128_)));
         break;
       case sizeWithAlignmentMask(32, 31, 0):
         LOG("case sizeWithAlignmentMask(32, 31, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi256_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi256_)));
         break;
       case sizeWithAlignmentMask(64, 63, 0):
         LOG("case sizeWithAlignmentMask(64, 63, 0)");
-        ERROR_CHECK(copyVWT(vwtBuffer, VWT_Bi512_));
+        ERROR_CHECK(copyVWT(vwtBuffer, ERROR_CHECK(VWT_Bi512_)));
         break;
       }
 
@@ -622,7 +641,7 @@ public:
       LOG("Is bitwise takable, setting pod_copy as initializeWithTake");
       // Use POD value witnesses for operations that do an initializeWithTake.
       vwtBuffer.writeFunctionPointer(&vwtBuffer.ptr->initializeWithTake,
-                                     pod_copy);
+                                     ERROR_CHECK(pod_copy));
     }
     return {{}};
   }
