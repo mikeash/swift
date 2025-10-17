@@ -251,40 +251,48 @@ void AccessSet::forEach(std::function<void(Access *)> action) {
 ///
 /// This may cause a runtime failure if an incompatible access is
 /// already underway.
-void swift::swift_beginAccess(void *pointer, ValueBuffer *buffer,
-                              ExclusivityFlags flags, void *pc) {
-  assert(pointer && "beginning an access on a null pointer?");
-
-  Access *access = reinterpret_cast<Access*>(buffer);
-
-  // If exclusivity checking is disabled, record in the access buffer that we
-  // didn't track anything. pc is currently undefined in this case.
-  if (_swift_disableExclusivityChecking) {
-    access->Pointer = nullptr;
-    return;
-  }
-
-  // If the provided `pc` is null, then the runtime may override it for
-  // diagnostics.
-  if (!pc)
-    pc = get_return_address();
-
-  if (!SwiftTLSContext::get().accessSet.insert(access, pc, pointer, flags))
-    access->Pointer = nullptr;
-}
+// void swift::swift_beginAccess(void *pointer, ValueBuffer *buffer,
+//                               ExclusivityFlags flags, void *pc) {
+//   assert(pointer && "beginning an access on a null pointer?");
+//
+//   Access *access = reinterpret_cast<Access*>(buffer);
+//
+//   // If exclusivity checking is disabled, record in the access buffer that we
+//   // didn't track anything. pc is currently undefined in this case.
+//   if (_swift_disableExclusivityChecking) {
+//     access->Pointer = nullptr;
+//     return;
+//   }
+//
+//   // If the provided `pc` is null, then the runtime may override it for
+//   // diagnostics.
+//   if (!pc)
+//     pc = get_return_address();
+//
+//   if (!SwiftTLSContext::get().accessSet.insert(access, pc, pointer, flags))
+//     access->Pointer = nullptr;
+// }
 
 /// End tracking a dynamic access.
-void swift::swift_endAccess(ValueBuffer *buffer) {
-  Access *access = reinterpret_cast<Access*>(buffer);
-  auto pointer = access->Pointer;
+// void swift::swift_endAccess(ValueBuffer *buffer) {
+//   Access *access = reinterpret_cast<Access*>(buffer);
+//   auto pointer = access->Pointer;
+//
+//   // If the pointer in the access is null, we must've declined
+//   // to track it because exclusivity tracking was disabled.
+//   if (!pointer) {
+//     return;
+//   }
+//
+//   SwiftTLSContext::get().accessSet.remove(access);
+// }
 
-  // If the pointer in the access is null, we must've declined
-  // to track it because exclusivity tracking was disabled.
-  if (!pointer) {
-    return;
-  }
+extern "C" void *_swift_getExclusivityTLS() {
+  return *(void **)&SwiftTLSContext::get().accessSet;
+}
 
-  SwiftTLSContext::get().accessSet.remove(access);
+extern "C" void _swift_setExclusivityTLS(void *value) {
+  *(void **)&SwiftTLSContext::get().accessSet = value;
 }
 
 #ifndef NDEBUG
