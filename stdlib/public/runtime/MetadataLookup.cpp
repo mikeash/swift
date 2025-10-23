@@ -1849,7 +1849,7 @@ public:
                     unsigned ordinal) {
     auto descriptor = _findOpaqueTypeDescriptor(opaqueDecl, demangler);
     if (!descriptor)
-      return BuiltType();
+      return TypeLookupError("Unable to find opaque type descriptor");
     auto outerContext = descriptor->Parent.get();
 
     llvm::SmallVector<MetadataPackOrValue, 8> allGenericArgs;
@@ -1925,10 +1925,13 @@ public:
   createObjCClassType(const std::string &mangledName) const {
 #if SWIFT_OBJC_INTEROP
     auto objcClass = objc_getClass(mangledName.c_str());
+    if (objcClass == nullptr)
+      return TypeLookupError(
+          [=] { return "Objective-C class " + mangledName + " not found"; });
     return BuiltType(
         swift_getObjCClassMetadata((const ClassMetadata *)objcClass));
 #else
-    return BuiltType();
+    return TypeLoookupError("createObjCClassType called with no ObjC interop");
 #endif
   }
 
@@ -1963,8 +1966,7 @@ public:
     if (!typeDecl) {
       if (auto protocol = dyn_cast<ProtocolDescriptor>(anyTypeDecl))
         return BuiltType(_getSimpleProtocolTypeMetadata(protocol));
-
-      return BuiltType();
+      return TypeLookupError("No type or protocol for bound generic");
     }
 
     if (!parent.isMetadataOrNull()) {
@@ -1985,8 +1987,10 @@ public:
 
     // Call the access function.
     auto accessFunction = typeDecl->getAccessFunction();
-    if (!accessFunction) return BuiltType();
-
+    if (!accessFunction)
+      return TYPE_LOOKUP_ERROR_FMT(
+          "NULL access function for type descriptor %s %p",
+          typeDecl->Name.get(), typeDecl);
     return BuiltType(accessFunction(MetadataState::Abstract,
                                     allGenericArgsVec));
   }
@@ -2063,7 +2067,7 @@ public:
 #define BUILTIN_VECTOR_TYPE(ElementSymbol, ElementName, Width)
 #endif
 #include "swift/Runtime/BuiltinTypes.def"
-    return BuiltType();
+    return TypeLookupError("Could not find builtin type");
   }
 
   TypeLookupErrorOr<BuiltType>
@@ -2126,12 +2130,12 @@ public:
       llvm::ArrayRef<BuiltRequirement> rs,
       llvm::ArrayRef<BuiltInverseRequirement> InverseRequirements) const {
     // FIXME: Runtime plumbing.
-    return BuiltType();
+    return TypeLookupError("createConstrainedExistentialType is unimplemented");
   }
 
   TypeLookupErrorOr<BuiltType> createDynamicSelfType(BuiltType selfType) const {
     // Free-standing mangled type strings should not contain DynamicSelfType.
-    return BuiltType();
+    return TypeLookupError("createDynamicSelfType is unimplemented");
   }
 
   void pushGenericParams(llvm::ArrayRef<std::pair<unsigned, unsigned>> parameterPacks) {}
@@ -2222,7 +2226,7 @@ public:
       std::optional<Demangle::ImplFunctionResult<BuiltType>> errorResult,
       ImplFunctionTypeFlags flags) {
     // We can't realize the metadata for a SILFunctionType.
-    return BuiltType();
+    return TypeLookupError("createImplFunctionType is unimplemented");
   }
 
   TypeLookupErrorOr<BuiltType>
@@ -2333,19 +2337,25 @@ public:
                             BuiltProtocolDecl protocol) const {
 #if SWIFT_OBJC_INTEROP
     if (protocol.isObjC())
-      return BuiltType();
+      return TypeLookupError(
+          "createDependentMemberType called with ObjC protocol");
 #endif
 
     auto swiftProtocol = protocol.getSwiftProtocol();
 
     // Look for the named associated type within the protocol.
     auto assocType = findAssociatedTypeByName(swiftProtocol, name);
-    if (!assocType) return BuiltType();
+    if (!assocType)
+      return TypeLookupError("Unable to find associated type");
 
-    auto projectDependentMemberType = [&](const Metadata *baseMetadata) -> const Metadata * {
+    auto projectDependentMemberType = [&](const Metadata *baseMetadata)
+        -> TypeLookupErrorOr<const Metadata *> {
       auto witnessTable = swift_conformsToProtocolCommon(baseMetadata, swiftProtocol);
       if (!witnessTable)
-        return nullptr;
+        return TYPE_LOOKUP_ERROR_FMT(
+            "Base metadata %s %p does not conform to required protocol %s %p",
+            swift_getTypeName(baseMetadata, true).data, baseMetadata,
+            swiftProtocol->Name.get(), swiftProtocol);
 
       // Call the associated type access function.
   #if SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES
@@ -2368,14 +2378,20 @@ public:
     };
 
     if (base.isMetadata()) {
-      return BuiltType(projectDependentMemberType(base.getMetadata()));
+      auto result = projectDependentMemberType(base.getMetadata());
+      if (auto *error = result.getError())
+        return *error;
+      return BuiltType(result.getType());
     } else {
       MetadataPackPointer basePack = base.getMetadataPack();
 
       llvm::SmallVector<const Metadata *, 4> packElts;
       for (size_t i = 0, e = basePack.getNumElements(); i < e; ++i) {
-        auto *projectedElt = projectDependentMemberType(basePack.getElements()[i]);
-        packElts.push_back(projectedElt);
+        auto projectedElt =
+            projectDependentMemberType(basePack.getElements()[i]);
+        if (auto *error = projectedElt.getError())
+          return *error;
+        packElts.push_back(projectedElt.getType());
       }
 
       return BuiltType(swift_allocateMetadataPack(packElts.data(), packElts.size()));
@@ -2391,7 +2407,7 @@ public:
 
   TypeLookupErrorOr<BuiltType> createSILBoxType(BuiltType base) const {
     // FIXME: Implement.
-    return BuiltType();
+    return TypeLookupError("createSILBoxType is unimplemented");
   }
 
   struct BuiltSILBoxField {
@@ -2422,7 +2438,7 @@ public:
       llvm::ArrayRef<BuiltRequirement> Requirements,
       llvm::ArrayRef<BuiltInverseRequirement> InverseRequirements) const {
     // FIXME: Implement.
-    return BuiltType();
+    return TypeLookupError("createSILBoxTypeWithLayout is unimplemented");
   }
 
   bool isExistential(BuiltType) {
@@ -2436,29 +2452,29 @@ public:
 
   TypeLookupErrorOr<BuiltType> createOptionalType(BuiltType base) {
     // Mangled types for building metadata don't contain sugared types
-    return BuiltType();
+    return TypeLookupError("createOptionalType should not be called");
   }
 
   TypeLookupErrorOr<BuiltType> createArrayType(BuiltType base) {
     // Mangled types for building metadata don't contain sugared types
-    return BuiltType();
+    return TypeLookupError("createArrayType should not be called");
   }
 
   TypeLookupErrorOr<BuiltType> createInlineArrayType(BuiltType count,
                                                      BuiltType element) {
     // Mangled types for building metadata don't contain sugared types
-    return BuiltType();
+    return TypeLookupError("createInlineArrayType should not be called");
   }
 
   TypeLookupErrorOr<BuiltType> createDictionaryType(BuiltType key,
                                                     BuiltType value) {
     // Mangled types for building metadata don't contain sugared types
-    return BuiltType();
+    return TypeLookupError("createDictionaryType should not be called");
   }
 
   TypeLookupErrorOr<BuiltType> createParenType(BuiltType base) {
     // Mangled types for building metadata don't contain sugared types
-    return BuiltType();
+    return TypeLookupError("createParenType should not be called");
   }
 
   TypeLookupErrorOr<BuiltType> createIntegerType(intptr_t value) {
