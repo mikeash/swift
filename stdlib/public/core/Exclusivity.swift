@@ -67,14 +67,20 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
   }
 
   @inline(__always)
-  static func remove(access: AccessPointer, head: UnsafeMutablePointer<AccessPointer?>) {
+  static func remove(access: AccessPointer, head: inout AccessPointer?) {
     var cursor = unsafe head
-    while let nextPtr = unsafe cursor.pointee {
+    var previous: AccessPointer? = nil
+    while let nextPtr = unsafe cursor {
       if unsafe nextPtr == access {
-        unsafe cursor.pointee = access.pointee.next
+        if let previous = unsafe previous {
+          unsafe previous.pointee.next = access.pointee.next
+        } else {
+          unsafe head = access.pointee.next
+        }
         return
       }
-      unsafe cursor = nextPtr.pointer(to: \.next)!
+      unsafe previous = nextPtr
+      unsafe cursor = nextPtr.pointee.next
     }
 
     unsafe fatalError("Didn't find exclusive access buffer \(access)")
