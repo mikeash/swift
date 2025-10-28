@@ -4,7 +4,7 @@ fileprivate let TrackingFlag: UInt = 0x20
 fileprivate let ActionMask: UInt = 0x1
 
 fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
-@unsafe fileprivate struct Access: ~Copyable {
+@unsafe fileprivate struct Access {
 
   enum Action: UInt {
     case read
@@ -29,7 +29,7 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
     }
   }
 
-  var pointer: UnsafeRawPointer?
+  var location: UnsafeRawPointer?
   var pc: UnsafeRawPointer?
   var nextAndAction: NextAndAction
 
@@ -48,28 +48,36 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
     return unsafe rawPointer.assumingMemoryBound(to: Access.self)
   }
 
+  @inline(__always)
   static func search(access: AccessPointer, inserting: Bool, head: inout AccessPointer?) {
-    if let head = unsafe head {
-      if unsafe head.pointee.pointer == access.pointee.pointer {
-        if unsafe head.pointee.action == Action.modify || access.pointee.action == Action.modify {
+    var cursor = unsafe head
+    while let nextPtr = unsafe cursor {
+      if unsafe nextPtr.pointee.location == access.pointee.location {
+        if unsafe nextPtr.pointee.action == Action.modify || access.pointee.action == Action.modify {
           fatalError("exclusive access collision eep!")
         }
       }
-      unsafe search(access: access, inserting: inserting, head: &head.pointee.next)
-    } else if inserting {
-      unsafe access.pointee.next = nil
+      unsafe cursor = nextPtr.pointee.next
+    }
+
+    if inserting {
+      unsafe access.pointee.next = head
       unsafe head = access
     }
   }
 
-  static func remove(access: AccessPointer, head: inout AccessPointer?) {
-    if unsafe head == nil {
-      unsafe fatalError("Didn't find exclusive access buffer \(access)")
-    } else if unsafe head == access {
-      unsafe head = access.pointee.next
-    } else {
-      unsafe remove(access: access, head: &head!.pointee.next)
+  @inline(__always)
+  static func remove(access: AccessPointer, head: UnsafeMutablePointer<AccessPointer?>) {
+    var cursor = unsafe head
+    while let nextPtr = unsafe cursor.pointee {
+      if unsafe nextPtr == access {
+        unsafe cursor.pointee = access.pointee.next
+        return
+      }
+      unsafe cursor = nextPtr.pointer(to: \.next)!
     }
+
+    unsafe fatalError("Didn't find exclusive access buffer \(access)")
   }
 }
 
@@ -102,8 +110,8 @@ internal func swift_beginAccess(
     fatalError("Unable to construct action from flags \(flags)")
   }
 
-  unsafe access.pointee.pointer = pointer
-  unsafe access.pointee.pc = nil
+  unsafe access.pointee.location = pointer
+  unsafe access.pointee.pc = pc
   unsafe access.pointee.action = action
 
   let isTracking = (flags & TrackingFlag) != 0
