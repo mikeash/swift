@@ -1,3 +1,5 @@
+import SwiftShims
+
 fileprivate let ValueBufferSize = unsafe 3 * MemoryLayout<UnsafeRawPointer>.stride
 
 fileprivate let TrackingFlag: UInt = 0x20
@@ -54,7 +56,7 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
     while let nextPtr = unsafe cursor {
       if unsafe nextPtr.pointee.location == access.pointee.location {
         if unsafe nextPtr.pointee.action == Action.modify || access.pointee.action == Action.modify {
-          fatalError("exclusive access collision eep!")
+          simultaneousAccess()
         }
       }
       unsafe cursor = nextPtr.pointee.next
@@ -83,15 +85,9 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
       unsafe cursor = nextPtr.pointee.next
     }
 
-    unsafe fatalError("Didn't find exclusive access buffer \(access)")
+    unsafe accessNotFound(access)
   }
 }
-
-@_extern(c, "_swift_getExclusivityTLS")
-fileprivate func _swift_getExclusivityTLS() -> UnsafeMutableRawPointer?
-
-@_extern(c, "_swift_setExclusivityTLS")
-fileprivate func _swift_setExclusivityTLS(_:UnsafeMutableRawPointer?)
 
 fileprivate var accessHead: AccessPointer? {
   get { unsafe Access.from(rawPointer: _swift_getExclusivityTLS()) }
@@ -109,11 +105,11 @@ internal func swift_beginAccess(
   precondition(unsafe MemoryLayout<Access>.size <= ValueBufferSize)
 
   guard let access = unsafe Access.from(rawPointer: buffer) else {
-    fatalError("NULL access buffer")
+    nullAccessBuffer()
   }
 
   guard let action = Access.Action(rawValue: flags & ActionMask) else {
-    fatalError("Unable to construct action from flags \(flags)")
+    invalidFlags(flags)
   }
 
   unsafe access.pointee.location = pointer
@@ -130,7 +126,27 @@ internal func swift_beginAccess(
 @unsafe
 internal func swift_endAccess(buffer: UnsafeMutableRawPointer) {
   guard let access = unsafe Access.from(rawPointer: buffer) else {
-    fatalError("NULL access buffer")
+    nullAccessBuffer()
   }
   unsafe Access.remove(access: access, head: &accessHead)
+}
+
+@inline(never)
+fileprivate func simultaneousAccess() -> Never {
+  fatalError("exclusive access collision eep!")
+}
+
+@inline(never)
+fileprivate func invalidFlags(_ flags: UInt) -> Never {
+  fatalError("Unable to construct action from flags \(flags)")
+}
+
+@inline(never)
+fileprivate func accessNotFound(_ access: AccessPointer) -> Never {
+  unsafe fatalError("Didn't find exclusive access buffer \(access)")
+}
+
+@inline(never)
+fileprivate func nullAccessBuffer() -> Never {
+  fatalError("NULL access buffer")
 }

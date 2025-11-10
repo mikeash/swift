@@ -18,4 +18,19 @@
 SWIFT_RUNTIME_STDLIB_INTERNAL
 void * _Nonnull _swift_stdlib_threadLocalStorageGet(void);
 
+static inline void * _Nullable * _Nonnull _swift_getExclusivityTLSPointer() {
+	unsigned long tsd;
+	__asm__ ("mrs %0, TPIDRRO_EL0" : "=r" (tsd));
+	void **base = (void **)tsd;
+  return &base[106];
+}
+
+static inline void * _Nullable _swift_getExclusivityTLS() {
+  return *_swift_getExclusivityTLSPointer();
+}
+
+static inline void _swift_setExclusivityTLS(void * _Nullable newValue) {
+  *_swift_getExclusivityTLSPointer() = newValue;
+}
+
 #endif // SWIFT_STDLIB_SHIMS_THREADLOCALSTORAGE_H
