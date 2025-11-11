@@ -87,6 +87,14 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
 
     unsafe accessNotFound(access)
   }
+
+  static func forEach(_ head: AccessPointer?, _ action: (Access) -> Void) {
+    var cursor = unsafe head
+    while let nextPtr = unsafe cursor {
+      unsafe action(nextPtr.pointee)
+      unsafe cursor = nextPtr.pointee.next
+    }
+  }
 }
 
 fileprivate var accessHead: AccessPointer? {
@@ -129,6 +137,22 @@ internal func swift_endAccess(buffer: UnsafeMutableRawPointer) {
     nullAccessBuffer()
   }
   unsafe Access.remove(access: access, head: &accessHead)
+}
+
+@_cdecl("swift_dumpTrackedAccesses")
+@usableFromInline
+@unsafe
+internal func swift_dumpTrackedAccesses() {
+  if let head = unsafe accessHead {
+    unsafe Access.forEach(head) {
+      unsafe _swift_stdlib_fputs_stderr("        Access. " +
+          "Pointer: \($0.location, default: "<null>")." +
+          "PC: \($0.pc, default: "<null>"). " +
+          "AccessAction: \($0.action)\n")
+    }
+  } else {
+    unsafe _swift_stdlib_fputs_stderr("        No Accesses.\n")
+  }
 }
 
 @inline(never)
