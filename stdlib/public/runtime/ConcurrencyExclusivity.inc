@@ -251,8 +251,9 @@ struct SwiftTaskThreadLocalContext {
 
 // See algorithm description on SwiftTaskThreadLocalContext.
 void swift::swift_task_enterThreadLocalContext(char *state) {
+  LocalAccessSet localAccessSet;
+  auto &tlsCtxAccessSet = localAccessSet.getSet();
   auto &taskCtx = *reinterpret_cast<SwiftTaskThreadLocalContext *>(state);
-  auto &tlsCtxAccessSet = SwiftTLSContext::get().accessSet;
 
 #ifndef NDEBUG
   if (isExclusivityLoggingEnabled()) {
@@ -341,8 +342,10 @@ void swift::swift_task_enterThreadLocalContext(char *state) {
 
 // See algorithm description on SwiftTaskThreadLocalContext.
 void swift::swift_task_exitThreadLocalContext(char *state) {
+  LocalAccessSet localAccessSet;
+  auto &tlsCtxAccessSet = localAccessSet.getSet();
+
   auto &taskCtx = *reinterpret_cast<SwiftTaskThreadLocalContext *>(state);
-  auto &tlsCtxAccessSet = SwiftTLSContext::get().accessSet;
 
 #ifndef NDEBUG
   if (isExclusivityLoggingEnabled()) {

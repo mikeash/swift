@@ -234,5 +234,39 @@ void AccessSet::remove(Access *access) {
   swift_unreachable("access not found in set");
 }
 
+static SWIFT_THREAD_LOCAL_TYPE(void *, swift::tls_key::exclusivity) AccessSetValue;
+
+SWIFT_RUNTIME_STDLIB_INTERNAL
+void * _Nullable _swift_getExclusivityTLSImpl() {
+  return AccessSetValue.get();
+}
+
+SWIFT_RUNTIME_STDLIB_INTERNAL
+void _swift_setExclusivityTLSImpl(void * _Nullable newValue) {
+  AccessSetValue.set(newValue);
+}
+
+class LocalAccessSet {
+  AccessSet set;
+
+public:
+  LocalAccessSet() {
+    void *value = AccessSetValue.get();
+    memcpy(&set, &value, sizeof(value));
+  }
+
+  ~LocalAccessSet() {
+    void *value;
+    memcpy(&value, &set, sizeof(value));
+    AccessSetValue.set(value);
+  }
+
+  LocalAccessSet(const LocalAccessSet &other) = delete;
+
+  AccessSet &getSet() {
+    return set;
+  }
+};
+
 // Bring in the concurrency-specific exclusivity code.
 #include "ConcurrencyExclusivity.inc"
