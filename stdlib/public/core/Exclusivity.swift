@@ -56,7 +56,12 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
     while let nextPtr = unsafe cursor {
       if unsafe nextPtr.pointee.location == access.pointee.location {
         if unsafe nextPtr.pointee.action == Action.modify || access.pointee.action == Action.modify {
-          simultaneousAccess()
+          unsafe _swift_reportExclusivityConflict(
+            nextPtr.pointee.action.rawValue,
+            nextPtr.pointee.pc,
+            access.pointee.action.rawValue,
+            access.pointee.pc,
+            access.pointee.location)
         }
       }
       unsafe cursor = nextPtr.pointee.next
@@ -109,7 +114,7 @@ internal func swift_beginAccess(
   pointer: UnsafeRawPointer,
   buffer: UnsafeMutableRawPointer,
   flags: UInt,
-  pc: UnsafeRawPointer) {
+  pc: UnsafeRawPointer?) {
   precondition(unsafe MemoryLayout<Access>.size <= ValueBufferSize)
 
   guard let access = unsafe Access.from(rawPointer: buffer) else {
@@ -121,7 +126,7 @@ internal func swift_beginAccess(
   }
 
   unsafe access.pointee.location = pointer
-  unsafe access.pointee.pc = pc
+  unsafe access.pointee.pc = pc ?? _swift_stdlib_get_return_address()
   unsafe access.pointee.action = action
 
   let isTracking = (flags & TrackingFlag) != 0
@@ -156,21 +161,29 @@ internal func swift_dumpTrackedAccesses() {
 }
 
 @inline(never)
-fileprivate func simultaneousAccess() -> Never {
-  fatalError("exclusive access collision eep!")
-}
-
-@inline(never)
 fileprivate func invalidFlags(_ flags: UInt) -> Never {
-  fatalError("Unable to construct action from flags \(flags)")
+  reportExclusivityError("Internal exclusivity error", "unable to construct action from flags \(flags)")
 }
 
 @inline(never)
 fileprivate func accessNotFound(_ access: AccessPointer) -> Never {
-  unsafe fatalError("Didn't find exclusive access buffer \(access)")
+  unsafe reportExclusivityError("Internal exclusivity error", "didn't find exclusive access buffer \(access)")
 }
 
 @inline(never)
 fileprivate func nullAccessBuffer() -> Never {
-  fatalError("NULL access buffer")
+  reportExclusivityError("Internal exclusivity error", "NULL access buffer")
+}
+
+fileprivate func reportExclusivityError(_ prefix: StaticString, _ message: String) -> Never {
+  prefix.withUTF8Buffer { prefixBuffer in
+    var message = message
+    message.withUTF8 { messageBuffer in
+      unsafe _swift_stdlib_reportFatalError(
+          prefixBuffer.baseAddress!, CInt(prefixBuffer.count),
+          messageBuffer.baseAddress!, CInt(messageBuffer.count),
+          0)
+    }
+  }
+  Builtin.int_trap()
 }

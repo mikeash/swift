@@ -158,6 +158,14 @@ static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
   _swift_reportToDebugger(RuntimeErrorFlagFatal, message, &details);
 }
 
+SWIFT_RUNTIME_STDLIB_INTERNAL
+void _swift_reportExclusivityConflict(uintptr_t oldAction, void *oldPC,
+                                      uintptr_t newFlags, void *newPC,
+                                      void *pointer) {
+  reportExclusivityConflict((ExclusivityFlags)oldAction, oldPC,
+                            (ExclusivityFlags)newFlags, newPC, pointer);
+}
+
 bool AccessSet::insert(Access *access, void *pc, void *pointer,
                        ExclusivityFlags flags) {
 #ifndef NDEBUG
