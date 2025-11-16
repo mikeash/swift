@@ -51,23 +51,38 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
   }
 
   @inline(__always)
-  static func search(access: AccessPointer, inserting: Bool, head: inout AccessPointer?) {
+  static func search(
+    buffer: UnsafeMutableRawPointer,
+    location: UnsafeRawPointer,
+    pc: UnsafeRawPointer?,
+    action: Action,
+    inserting: Bool,
+    head: inout AccessPointer?
+  ) {
     var cursor = unsafe head
     while let nextPtr = unsafe cursor {
-      if unsafe nextPtr.pointee.location == access.pointee.location {
-        if unsafe nextPtr.pointee.action == Action.modify || access.pointee.action == Action.modify {
+      if unsafe nextPtr.pointee.location == location {
+        if unsafe nextPtr.pointee.action == Action.modify || action == Action.modify {
           unsafe _swift_reportExclusivityConflict(
             nextPtr.pointee.action.rawValue,
             nextPtr.pointee.pc,
-            access.pointee.action.rawValue,
-            access.pointee.pc,
-            access.pointee.location)
+            action.rawValue,
+            pc,
+            location)
         }
       }
       unsafe cursor = nextPtr.pointee.next
     }
 
     if inserting {
+      guard let access = unsafe Access.from(rawPointer: buffer) else {
+        nullAccessBuffer()
+      }
+
+      unsafe access.pointee.location = location
+      unsafe access.pointee.pc = pc
+      unsafe access.pointee.action = action
+
       unsafe access.pointee.next = head
       unsafe head = access
     }
@@ -117,21 +132,19 @@ internal func swift_beginAccess(
   pc: UnsafeRawPointer?) {
   precondition(unsafe MemoryLayout<Access>.size <= ValueBufferSize)
 
-  guard let access = unsafe Access.from(rawPointer: buffer) else {
-    nullAccessBuffer()
-  }
-
   guard let action = Access.Action(rawValue: flags & ActionMask) else {
     invalidFlags(flags)
   }
 
-  unsafe access.pointee.location = pointer
-  unsafe access.pointee.pc = pc ?? _swift_stdlib_get_return_address()
-  unsafe access.pointee.action = action
-
   let isTracking = (flags & TrackingFlag) != 0
 
-  unsafe Access.search(access: access, inserting: isTracking, head: &accessHead)
+    unsafe Access.search(
+      buffer: buffer,
+      location: pointer,
+      pc: pc ?? _swift_stdlib_get_return_address(),
+      action: action,
+      inserting: isTracking,
+      head: &accessHead)
 }
 
 @_cdecl("swift_endAccess")
