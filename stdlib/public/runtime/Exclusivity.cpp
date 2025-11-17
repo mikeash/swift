@@ -166,82 +166,6 @@ void _swift_reportExclusivityConflict(uintptr_t oldAction, void *oldPC,
                             (ExclusivityFlags)newFlags, newPC, pointer);
 }
 
-bool AccessSet::insert(Access *access, void *pc, void *pointer,
-                       ExclusivityFlags flags) {
-#ifndef NDEBUG
-  if (isExclusivityLoggingEnabled()) {
-    withLoggingLock(
-        [&]() { fprintf(stderr, "Inserting new access: %p\n", access); });
-  }
-#endif
-  auto action = getAccessAction(flags);
-
-  for (Access *cur = Head; cur != nullptr; cur = cur->getNext()) {
-    // Ignore accesses to different values.
-    if (cur->Pointer != pointer)
-      continue;
-
-    // If both accesses are reads, it's not a conflict.
-    if (action == ExclusivityFlags::Read && action == cur->getAccessAction())
-      continue;
-
-    // Otherwise, it's a conflict.
-    reportExclusivityConflict(cur->getAccessAction(), cur->PC, flags, pc,
-                              pointer);
-
-    // 0 means no backtrace will be printed.
-    fatalError(0, "Fatal access conflict detected.\n");
-  }
-  if (!isTracking(flags)) {
-#ifndef NDEBUG
-    if (isExclusivityLoggingEnabled()) {
-      withLoggingLock([&]() { fprintf(stderr, "  Not tracking!\n"); });
-    }
-#endif
-    return false;
-  }
-
-  // Insert to the front of the array so that remove tends to find it faster.
-  access->initialize(pc, pointer, Head, action);
-  Head = access;
-#ifndef NDEBUG
-  if (isExclusivityLoggingEnabled()) {
-    withLoggingLock([&]() {
-      fprintf(stderr, "  Tracking!\n");
-      swift_dumpTrackedAccesses();
-    });
-  }
-#endif
-  return true;
-}
-
-void AccessSet::remove(Access *access) {
-  assert(Head && "removal from empty AccessSet");
-#ifndef NDEBUG
-  if (isExclusivityLoggingEnabled()) {
-    withLoggingLock(
-        [&]() { fprintf(stderr, "Removing access: %p\n", access); });
-  }
-#endif
-  auto cur = Head;
-  // Fast path: stack discipline.
-  if (cur == access) {
-    Head = cur->getNext();
-    return;
-  }
-
-  Access *last = cur;
-  for (cur = cur->getNext(); cur != nullptr; last = cur, cur = cur->getNext()) {
-    assert(last->getNext() == cur);
-    if (cur == access) {
-      last->setNext(cur->getNext());
-      return;
-    }
-  }
-
-  swift_unreachable("access not found in set");
-}
-
 static SWIFT_THREAD_LOCAL_TYPE(void *, swift::tls_key::exclusivity) AccessSetValue;
 
 SWIFT_RUNTIME_STDLIB_INTERNAL
@@ -254,27 +178,12 @@ void _swift_setExclusivityTLSImpl(void * _Nullable newValue) {
   AccessSetValue.set(newValue);
 }
 
-class LocalAccessSet {
-  AccessSet set;
-
-public:
-  LocalAccessSet() {
-    void *value = AccessSetValue.get();
-    memcpy(&set, &value, sizeof(value));
-  }
-
-  ~LocalAccessSet() {
-    void *value;
-    memcpy(&value, &set, sizeof(value));
-    AccessSetValue.set(value);
-  }
-
-  LocalAccessSet(const LocalAccessSet &other) = delete;
-
-  AccessSet &getSet() {
-    return set;
-  }
-};
+// Declare two internal helpers from the Swift implementation that are used by
+// the concurrency-specific code.
+extern "C" void _swift_exclusivityAccessSetNext(void *access,
+                                                void *_Nullable next);
+extern "C" void *_swift_exclusivityAccessGetParent(void *access,
+                                                   void *_Nullable child);
 
 // Bring in the concurrency-specific exclusivity code.
 #include "ConcurrencyExclusivity.inc"

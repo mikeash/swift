@@ -108,6 +108,25 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
     unsafe accessNotFound(access)
   }
 
+  @inline(__always)
+  static func findParent(access: AccessPointer, child: AccessPointer?) -> AccessPointer? {
+    var cursor = unsafe access
+    while let next = unsafe cursor.pointee.next {
+      if unsafe next == child {
+        return unsafe cursor
+      }
+      unsafe cursor = next
+    }
+
+    // If we were searching for nil, then we found it.
+    if unsafe child == nil {
+      return unsafe cursor
+    }
+
+    // If we were searching for a non-nil node, we didn't find it.
+    return nil
+  }
+
   static func forEach(_ head: AccessPointer?, _ action: (Access) -> Void) {
     var cursor = unsafe head
     while let nextPtr = unsafe cursor {
@@ -157,6 +176,16 @@ internal func swift_endAccess(buffer: UnsafeMutableRawPointer) {
   unsafe Access.remove(access: access, head: &accessHead)
 }
 
+@_cdecl("_swift_exclusivityAccessSetNext")
+@usableFromInline
+@unsafe
+internal func _swift_exclusivityAccessSetNext(
+  access: UnsafeMutableRawPointer,
+  next: UnsafeMutableRawPointer
+) {
+  unsafe Access.from(rawPointer: access)?.pointee.next = Access.from(rawPointer: next)
+}
+
 @_cdecl("swift_dumpTrackedAccesses")
 @usableFromInline
 @unsafe
@@ -171,6 +200,22 @@ internal func swift_dumpTrackedAccesses() {
   } else {
     unsafe _swift_stdlib_fputs_stderr("        No Accesses.\n")
   }
+}
+
+/// Starting from `access`, find the access that is the parent node of `child`. If `child` is `nil`,
+/// find the last access in the list.
+@_cdecl("_swift_exclusivityAccessGetParent")
+@usableFromInline
+@unsafe
+internal func _swift_exclusivityAccessGetParent(
+  access: UnsafeMutableRawPointer?,
+  child: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
+    if let access = unsafe Access.from(rawPointer: access) {
+      let result = unsafe Access.findParent(
+        access: access, child: Access.from(rawPointer: child))
+      return UnsafeMutableRawPointer(result)
+    }
+    return nil
 }
 
 @inline(never)

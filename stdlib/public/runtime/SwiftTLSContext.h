@@ -13,8 +13,6 @@
 #ifndef SWIFT_RUNTIME_SWIFTTLSCONTEXT_H
 #define SWIFT_RUNTIME_SWIFTTLSCONTEXT_H
 
-#include "ExclusivityPrivate.h"
-
 namespace swift {
 namespace runtime {
 
