@@ -62,7 +62,8 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
     var cursor = unsafe head
     while let nextPtr = unsafe cursor {
       if unsafe nextPtr.pointee.location == location {
-        if unsafe nextPtr.pointee.action == Action.modify || action == Action.modify {
+        if unsafe nextPtr.pointee.action == Action.modify
+            || action == Action.modify {
           unsafe _swift_reportExclusivityConflict(
             nextPtr.pointee.action.rawValue,
             nextPtr.pointee.pc,
@@ -109,7 +110,10 @@ fileprivate typealias AccessPointer = UnsafeMutablePointer<Access>
   }
 
   @inline(__always)
-  static func findParent(access: AccessPointer, child: AccessPointer?) -> AccessPointer? {
+  static func findParent(
+    access: AccessPointer,
+    child: AccessPointer?
+  ) -> AccessPointer? {
     var cursor = unsafe access
     while let next = unsafe cursor.pointee.next {
       if unsafe next == child {
@@ -183,7 +187,9 @@ internal func _swift_exclusivityAccessSetNext(
   access: UnsafeMutableRawPointer,
   next: UnsafeMutableRawPointer
 ) {
-  unsafe Access.from(rawPointer: access)?.pointee.next = Access.from(rawPointer: next)
+  let access = unsafe Access.from(rawPointer: access)
+  let next = unsafe Access.from(rawPointer: next)
+  unsafe access?.pointee.next = next
 }
 
 @_cdecl("swift_dumpTrackedAccesses")
@@ -220,12 +226,14 @@ internal func _swift_exclusivityAccessGetParent(
 
 @inline(never)
 fileprivate func invalidFlags(_ flags: UInt) -> Never {
-  reportExclusivityError("Internal exclusivity error", "unable to construct action from flags \(flags)")
+  reportExclusivityError("Internal exclusivity error",
+                         "unable to construct action from flags \(flags)")
 }
 
 @inline(never)
 fileprivate func accessNotFound(_ access: AccessPointer) -> Never {
-  unsafe reportExclusivityError("Internal exclusivity error", "didn't find exclusive access buffer \(access)")
+  unsafe reportExclusivityError("Internal exclusivity error",
+                                "didn't find exclusive access buffer \(access)")
 }
 
 @inline(never)
@@ -233,7 +241,9 @@ fileprivate func nullAccessBuffer() -> Never {
   reportExclusivityError("Internal exclusivity error", "NULL access buffer")
 }
 
-fileprivate func reportExclusivityError(_ prefix: StaticString, _ message: String) -> Never {
+fileprivate func reportExclusivityError(
+  _ prefix: StaticString, _ message: String
+) -> Never {
   prefix.withUTF8Buffer { prefixBuffer in
     var message = message
     message.withUTF8 { messageBuffer in
