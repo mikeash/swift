@@ -156,6 +156,7 @@ static void reportExclusivityConflict(ExclusivityFlags oldAction, void *oldPC,
     .notes = nullptr,
   };
   _swift_reportToDebugger(RuntimeErrorFlagFatal, message, &details);
+  fatalError(0, "Fatal access conflict detected.\n");
 }
 
 SWIFT_RUNTIME_STDLIB_INTERNAL
