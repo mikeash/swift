@@ -178,7 +178,10 @@ DemangleToMetadataTests.test("existential metatype types") {
 
 struct S {
   struct Nested { }
+  fileprivate struct NestedPrivate { }
 }
+
+private struct SPrivate { }
 
 enum E { case e }
 
@@ -581,6 +584,27 @@ if #available(SwiftStdlib 6.1, *) {
     if let t {
       expectEqual(type(of: S()), t)
     }
+  }
+}
+
+if #available(SwiftStdlib 6.4, *) {
+  DemangleToMetadataTests.test("Private types") {
+    // Private types and types nested in functions have mangled names that
+    // contain the address of anonymous context descriptors, which will vary
+    // from run to run. So we can't write a literal string for the type names.
+    // Instead, ensure that they roundtrip.
+    expectEqual(S.NestedPrivate.self, _typeByName(_mangledTypeName(S.NestedPrivate.self)!))
+    expectEqual(SPrivate.self, _typeByName(_mangledTypeName(SPrivate.self)!))
+
+    func localFunction() {
+      struct SNestedInFunction { }
+      expectEqual(SNestedInFunction.self, _typeByName(_mangledTypeName(SNestedInFunction.self)!))
+
+      // Make sure we don't fuzzy match a mangled name that just specifies a
+      // nested type without specifying what it's nested in.
+      expectEqual(nil, _typeByName("4mainyycfU24_17SNestedInFunctionL_V"))
+    }
+    localFunction()
   }
 }
 

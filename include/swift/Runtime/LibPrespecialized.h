@@ -175,6 +175,11 @@ buildSimplifiedDescriptorDemangling(Demangle::NodePointer node,
   // Walk down the input node tree.
   while (current) {
     switch (current->getKind()) {
+    case Kind::AnonymousContext: {
+      // Anonymous contexts don't have a mangling that's stable across runs, so
+      // we can't build a simplified mangling for lookup.
+      return nullptr;
+    }
     case Kind::Extension: {
       // Extensions are copied across. The new extension node has the module
       // from the original, and the second child will be added as we traverse

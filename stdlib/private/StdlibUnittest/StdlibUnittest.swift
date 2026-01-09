@@ -396,7 +396,7 @@ public func expectOptionalEqual<T>(
 }
 
 public func expectEqual(
-  _ first: Any.Type, _ second: Any.Type,
+  _ first: Any.Type?, _ second: Any.Type?,
   _ message: @autoclosure () -> String = "",
   stackTrace: SourceLocStack = SourceLocStack(),
   showFrame: Bool = true,

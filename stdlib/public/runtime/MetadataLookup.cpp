@@ -628,7 +628,7 @@ swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
   while (context) {
     if (node->getKind() == Demangle::Node::Kind::Type)
       node = node->getChild(0);
-    
+
     // We can directly match symbolic references to the current context.
     if (node) {
       if (node->getKind() == Demangle::Node::Kind::TypeSymbolicReference
@@ -725,6 +725,35 @@ swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
       }
       return false;
 
+    case ContextDescriptorKind::Anonymous: {
+      if (node->getKind() == Demangle::Node::Kind::AnonymousContext) {
+        if (node->getNumChildren() < 2)
+          return false;
+
+        auto identifierNode = node->getChild(0);
+        if (identifierNode->getKind() != Demangle::Node::Kind::Identifier)
+          return false;
+
+        // Extract the $xxxx address from the text. Any other kind of identifier
+        // is something we can't match.
+        auto text = identifierNode->getText();
+        if (!text.starts_with("$"))
+          return false;
+
+        uintptr_t extractedAddress;
+        if (text.drop_front().getAsInteger(16, extractedAddress))
+          return false;
+
+        if (extractedAddress != (uintptr_t)context)
+          return false;
+
+        node = node->getChild(1);
+        break;
+      }
+
+      return false;
+    }
+
     default:
       if (auto type = llvm::dyn_cast<TypeContextDescriptor>(context)) {
         std::optional<ParsedTypeIdentity> _identity;
@@ -784,11 +813,11 @@ swift::_contextDescriptorMatchesMangling(const ContextDescriptor *context,
         if (nameNode->getKind() == Demangle::Node::Kind::Identifier) {
           if (nameNode->getText() != getIdentity().getABIName())
             return false;
-          
+
           node = node->getChild(0);
           break;
         }
-        
+
         return false;
 
       }
