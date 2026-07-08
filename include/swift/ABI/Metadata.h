@@ -2973,9 +2973,20 @@ public:
   /// The context will be populated with any information that needs to be
   /// checked before this witness table can be used within a given execution
   /// context.
+  ///
+  /// \param maxRecursionDepth bounds how deeply the check of this conformance's
+  /// conditional requirements may recurse into further conformance checks. If
+  /// the limit is reached, this returns null; defaults to SIZE_MAX i.e. no real
+  /// limit.
+  ///
+  /// \param outExceededDepth when non-NULL, set to true if the null result is
+  /// because the check bailed out at maxRecursionDepth rather than because the
+  /// conditional requirements were definitively not satisfied.
   const swift::TargetWitnessTable<Runtime> *
   getWitnessTable(const TargetMetadata<Runtime> *type,
-                  ConformanceExecutionContext &context) const;
+                  ConformanceExecutionContext &context,
+                  size_t maxRecursionDepth = SIZE_MAX,
+                  bool *outExceededDepth = nullptr) const;
 
   /// Retrieve the resilient witnesses.
   llvm::ArrayRef<ResilientWitness> getResilientWitnesses() const {

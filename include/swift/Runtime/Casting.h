@@ -274,6 +274,27 @@ swift_conformsToProtocolWithExecutionContext(
     const ProtocolDescriptor *protocol,
     ConformanceExecutionContext *context);
 
+/// Check whether a type conforms to a given native Swift protocol, bounding
+/// the amount of recursion the check may perform. This behaves like
+/// swift_conformsToProtocolWithExecutionContext, except that resolving a
+/// conformance's conditional requirements (which may itself require checking
+/// further conformances) may descend at most \p maxRecursionDepth levels deep.
+///
+/// If the limit is reached, the check fails gracefully rather than risking a
+/// stack overflow: it returns NULL and, when \p outExceededDepth is non-NULL,
+/// sets *outExceededDepth to true. A NULL result with *outExceededDepth set
+/// means "gave up", which is distinct from a NULL result with it left false,
+/// which means "definitively does not conform". Results that hit the limit are
+/// never cached, so a subsequent call with a larger limit can still find the
+/// conformance.
+SWIFT_RUNTIME_EXPORT
+const WitnessTable *
+swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+    const Metadata *type,
+    const ProtocolDescriptor *protocol,
+    ConformanceExecutionContext *context,
+    size_t maxRecursionDepth,
+    bool *outExceededDepth);
 /// Determine whether this function is being executed within the execution
 /// context for a conformance. For example, if the conformance is
 /// isolated to a given global actor, checks whether this code is running on

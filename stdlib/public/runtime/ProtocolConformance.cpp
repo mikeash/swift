@@ -349,6 +349,12 @@ struct ConformanceLookupResult {
   /// of globalActorIsolationType to GlobalActor.
   const WitnessTable *globalActorIsolationWitnessTable = nullptr;
 
+  /// Set to true if computing this result gave up because it exhausted the
+  /// allowed recursion depth. When true, a null witnessTable means the check
+  /// bailed out, not that the type definitively fails to conform, so the
+  /// result must not be cached.
+  bool hitRecursionLimit = false;
+
   ConformanceLookupResult() { }
 
   ConformanceLookupResult(std::nullptr_t) { }
@@ -364,9 +370,14 @@ struct ConformanceLookupResult {
 
   /// Given a type and conformance descriptor, form a conformance lookup
   /// result.
+  ///
+  /// \param maxRecursionDepth bounds how deeply resolving the conformance's
+  /// conditional requirements may recurse; if the limit is reached, the
+  /// returned result has hitRecursionLimit set and a null witness table.
   static ConformanceLookupResult fromConformance(
       const Metadata *type,
-      const ProtocolConformanceDescriptor *conformanceDescriptor);
+      const ProtocolConformanceDescriptor *conformanceDescriptor,
+      size_t maxRecursionDepth = SIZE_MAX);
 };
 
 }
@@ -386,7 +397,9 @@ template<>
 const WitnessTable *
 ProtocolConformanceDescriptor::getWitnessTable(
     const Metadata *type,
-    ConformanceExecutionContext &context
+    ConformanceExecutionContext &context,
+    size_t maxRecursionDepth,
+    bool *outExceededDepth
 ) const {
   // If needed, check the conditional requirements.
   llvm::SmallVector<const void *, 8> conditionalArgs;
@@ -408,7 +421,7 @@ ProtocolConformanceDescriptor::getWitnessTable(
         [&substitutions](const Metadata *type, unsigned index) {
           return substitutions.getWitnessTable(type, index);
         },
-        &context);
+        &context, maxRecursionDepth, outExceededDepth);
     if (error)
       return nullptr;
   }
@@ -433,14 +446,19 @@ ProtocolConformanceDescriptor::getWitnessTable(
 
 ConformanceLookupResult ConformanceLookupResult::fromConformance(
     const Metadata *type,
-    const ProtocolConformanceDescriptor *conformanceDescriptor) {
+    const ProtocolConformanceDescriptor *conformanceDescriptor,
+    size_t maxRecursionDepth) {
   ConformanceExecutionContext context;
-  auto wtable = conformanceDescriptor->getWitnessTable(type, context);
-  return {
+  bool exceededDepth = false;
+  auto wtable = conformanceDescriptor->getWitnessTable(
+      type, context, maxRecursionDepth, &exceededDepth);
+  ConformanceLookupResult result{
     wtable,
     context.globalActorIsolationType,
     context.globalActorIsolationWitnessTable
   };
+  result.hitRecursionLimit = exceededDepth;
+  return result;
 }
 
 /// Determine the global actor isolation for the given witness table.
@@ -1351,8 +1369,14 @@ findConformanceWithDyld(ConformanceState &C, const Metadata *type,
 static std::pair<ConformanceLookupResult, bool>
 swift_conformsToProtocolMaybeInstantiateSuperclasses(
     const Metadata *const type, const ProtocolDescriptor *protocol,
-    bool instantiateSuperclassMetadata) {
+    bool instantiateSuperclassMetadata, size_t maxRecursionDepth) {
   auto &C = Conformances.get();
+
+  // Set to true if resolving a candidate conformance's conditional
+  // requirements exhausted the recursion budget. Such results are not
+  // authoritative: we neither cache them nor treat a miss as a definitive
+  // negative, and we report the condition back to the caller.
+  bool hitRecursionLimit = false;
 
   ConformanceLookupResult dyldCachedWitnessTable;
   const ProtocolConformanceDescriptor *dyldCachedConformanceDescriptor =
@@ -1451,11 +1475,15 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
         candidate.getMatchingType(type, instantiateSuperclassMetadata));
     assert(matchingType);
     auto witness = ConformanceLookupResult::fromConformance(
-        matchingType, dyldCachedConformanceDescriptor);
-    bool allowSaveDescriptor = false; // already have it in the dyld cache
-    C.cacheResult(type, protocol, witness, /*always cache*/ 0, allowSaveDescriptor);
-    DYLD_CONFORMANCES_LOG("Caching generic conformance to %s found by DYLD",
-                          protocol->Name.get());
+        matchingType, dyldCachedConformanceDescriptor, maxRecursionDepth);
+    // Don't cache (or report as a hit) a result that bailed out due to the
+    // recursion limit; let the caller decide how to proceed.
+    if (!witness.hitRecursionLimit) {
+      bool allowSaveDescriptor = false; // already have it in the dyld cache
+      C.cacheResult(type, protocol, witness, /*always cache*/ 0, allowSaveDescriptor);
+      DYLD_CONFORMANCES_LOG("Caching generic conformance to %s found by DYLD",
+                            protocol->Name.get());
+    }
     return {witness, false};
   }
 
@@ -1479,10 +1507,18 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
       noteFinalMetadataState(finalState);
       if (matchingType) {
         auto witness = ConformanceLookupResult::fromConformance(
-            matchingType, &descriptor);
-        bool allowSaveDescriptor = true;
-        C.cacheResult(matchingType, protocol, witness, /*always cache*/ 0, allowSaveDescriptor);
-        foundWitnesses.insert({matchingType, witness});
+            matchingType, &descriptor, maxRecursionDepth);
+        // If resolving this conformance's conditional requirements ran out of
+        // recursion budget, the null witness is not authoritative: don't cache
+        // it or record it as a found (negative) witness. Just remember that we
+        // bailed so the overall lookup is reported as a graceful failure.
+        if (witness.hitRecursionLimit) {
+          hitRecursionLimit = true;
+        } else {
+          bool allowSaveDescriptor = true;
+          C.cacheResult(matchingType, protocol, witness, /*always cache*/ 0, allowSaveDescriptor);
+          foundWitnesses.insert({matchingType, witness});
+        }
       }
     };
 
@@ -1541,7 +1577,9 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   if (foundType != type)
     // Do not cache negative results if there were uninstantiated superclasses
     // we didn't search. They might have a conformance that will be found later.
-    if (foundWitness || !hasUninstantiatedSuperclass)
+    // Likewise, do not cache a negative result that only arose because we ran
+    // out of recursion budget while checking conditional requirements.
+    if (foundWitness || (!hasUninstantiatedSuperclass && !hitRecursionLimit))
       C.cacheResult(type, protocol, foundWitness, snapshot.count(), /* allowSaveDescriptor */ false);
 
   // A negative result can be overridden by a result from dyld.
@@ -1552,14 +1590,27 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
     }
   }
   debugLogResult(static_cast<bool>(foundWitness), "section scan");
+  foundWitness.hitRecursionLimit = hitRecursionLimit;
   return {foundWitness, hasUninstantiatedSuperclass};
 }
 
-static const WitnessTable *
-swift_conformsToProtocolWithExecutionContextImpl(
+SWIFT_RUNTIME_EXPORT
+const WitnessTable *
+swift_conformsToProtocolWithExecutionContextAndMaxDepth(
     const Metadata *const type,
     const ProtocolDescriptor *protocol,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t maxRecursionDepth,
+    bool *outExceededDepth) {
+  // Fail gracefully if we've run out of recursion budget rather than risk
+  // overflowing the stack. A null result here is not a definitive negative
+  // and is never cached; the caller can tell via *outExceededDepth.
+  if (maxRecursionDepth == 0) {
+    if (outExceededDepth)
+      *outExceededDepth = true;
+    return nullptr;
+  }
+
   ConformanceLookupResult found;
   bool hasUninstantiatedSuperclass;
 
@@ -1569,17 +1620,29 @@ swift_conformsToProtocolWithExecutionContextImpl(
   // in the chain before we get to an uninstantiated superclass) so this search
   // will succeed without trying to instantiate Super while it's already being
   // instantiated.=
+  //
+  // Nested conformance checks (performed while resolving conditional
+  // requirements) get one less than our remaining budget.
   std::tie(found, hasUninstantiatedSuperclass) =
       swift_conformsToProtocolMaybeInstantiateSuperclasses(
-          type, protocol, false /*instantiateSuperclassMetadata*/);
+          type, protocol, false /*instantiateSuperclassMetadata*/,
+          maxRecursionDepth - 1);
+  bool exceededDepth = found.hitRecursionLimit;
 
   // If no conformance was found, and there is an uninstantiated superclass that
   // was not searched, then try the search again and instantiate all
   // superclasses.
-  if (!found && hasUninstantiatedSuperclass)
+  if (!found && hasUninstantiatedSuperclass) {
     std::tie(found, hasUninstantiatedSuperclass) =
         swift_conformsToProtocolMaybeInstantiateSuperclasses(
-            type, protocol, true /*instantiateSuperclassMetadata*/);
+            type, protocol, true /*instantiateSuperclassMetadata*/,
+            maxRecursionDepth - 1);
+    exceededDepth = exceededDepth || found.hitRecursionLimit;
+  }
+
+  // Report a graceful recursion-limit failure to our caller.
+  if (outExceededDepth)
+    *outExceededDepth = exceededDepth;
 
   // Check for isolated conformances.
   if (found.globalActorIsolationType && context) {
@@ -1596,6 +1659,15 @@ swift_conformsToProtocolWithExecutionContextImpl(
   }
 
   return found.witnessTable;
+}
+
+static const WitnessTable *
+swift_conformsToProtocolWithExecutionContextImpl(
+    const Metadata *const type,
+    const ProtocolDescriptor *protocol,
+    ConformanceExecutionContext *context) {
+  return swift::swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+      type, protocol, context, SIZE_MAX, /*outExceededDepth*/ nullptr);
 }
 
 static const WitnessTable *
@@ -1803,7 +1875,9 @@ checkGenericRequirement(
     SubstGenericParameterFn substGenericParam,
     SubstDependentWitnessTableFn substWitnessTable,
     llvm::SmallVectorImpl<InvertibleProtocolSet> &suppressed,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t maxRecursionDepth,
+    bool *outExceededDepth) {
   assert(!req.getFlags().isPackRequirement());
 
   // Make sure we understand the requirement we're dealing with.
@@ -1823,7 +1897,8 @@ checkGenericRequirement(
   case GenericRequirementKind::Protocol: {
     const WitnessTable *witnessTable = nullptr;
     if (!_conformsToProtocol(nullptr, subjectType, req.getProtocol(),
-                             &witnessTable, context)) {
+                             &witnessTable, context, maxRecursionDepth,
+                             outExceededDepth)) {
       const char *protoName =
           req.getProtocol() ? req.getProtocol().getName() : "<null>";
       return TYPE_LOOKUP_ERROR_FMT(
@@ -1921,7 +1996,9 @@ checkGenericPackRequirement(
     SubstGenericParameterFn substGenericParam,
     SubstDependentWitnessTableFn substWitnessTable,
     llvm::SmallVectorImpl<InvertibleProtocolSet> &suppressed,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t maxRecursionDepth,
+    bool *outExceededDepth) {
   assert(req.getFlags().isPackRequirement());
 
   // Make sure we understand the requirement we're dealing with.
@@ -1948,7 +2025,8 @@ checkGenericPackRequirement(
 
       const WitnessTable *witnessTable = nullptr;
       if (!_conformsToProtocol(nullptr, elt, req.getProtocol(),
-                               &witnessTable, context)) {
+                               &witnessTable, context, maxRecursionDepth,
+                               outExceededDepth)) {
         const char *protoName =
             req.getProtocol() ? req.getProtocol().getName() : "<null>";
         return TYPE_LOOKUP_ERROR_FMT(
@@ -2384,7 +2462,9 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
     SubstGenericParameterFn substGenericParam,
     SubstGenericParameterOrdinalFn substGenericParamOrdinal,
     SubstDependentWitnessTableFn substWitnessTable,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t maxRecursionDepth,
+    bool *outExceededDepth) {
   // The suppressed conformances for each generic parameter.
   llvm::SmallVector<InvertibleProtocolSet, 4> allSuppressed;
 
@@ -2394,7 +2474,9 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
                                                substGenericParam,
                                                substWitnessTable,
                                                allSuppressed,
-                                               context);
+                                               context,
+                                               maxRecursionDepth,
+                                               outExceededDepth);
       if (error)
         return error;
     } else if (req.getFlags().isValueRequirement()) {
@@ -2409,7 +2491,9 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
                                            substGenericParam,
                                            substWitnessTable,
                                            allSuppressed,
-                                           context);
+                                           context,
+                                           maxRecursionDepth,
+                                           outExceededDepth);
       if (error)
         return error;
     }

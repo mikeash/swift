@@ -578,7 +578,9 @@ public:
       SubstGenericParameterFn substGenericParam,
       SubstGenericParameterOrdinalFn substGenericParamOrdinal,
       SubstDependentWitnessTableFn substWitnessTable,
-      ConformanceExecutionContext *context);
+      ConformanceExecutionContext *context,
+      size_t maxRecursionDepth = SIZE_MAX,
+      bool *outExceededDepth = nullptr);
 
   /// A helper function which avoids performing a store if the destination
   /// address already contains the source value.  This is useful when
@@ -705,12 +707,26 @@ public:
   ///   table will be placed here
   /// \param context - when non-NULL, receives any information about the
   /// required execution context for this conformance.
+  ///
+  /// \param maxRecursionDepth - the maximum number of nested conformance
+  /// checks (each level corresponds to resolving one conformance's conditional
+  /// requirements) that may be performed. If the limit is reached, the check
+  /// fails gracefully: it returns false rather than recursing further. The
+  /// default of SIZE_MAX imposes no practical limit and preserves the
+  /// historical behavior.
+  ///
+  /// \param outExceededDepth - when non-NULL, set to true if the check bailed
+  /// out because it reached maxRecursionDepth. A false return with this set to
+  /// true means "gave up", which is distinct from a false return with it left
+  /// false, which means "definitively does not conform".
   bool _conformsToProtocol(
       const OpaqueValue *value,
       const Metadata *type,
       ProtocolDescriptorRef protocol,
       const WitnessTable **conformance,
-      ConformanceExecutionContext *context);
+      ConformanceExecutionContext *context,
+      size_t maxRecursionDepth = SIZE_MAX,
+      bool *outExceededDepth = nullptr);
 
   /// Check whether a type conforms to a value within the currently-executing
   /// context.
