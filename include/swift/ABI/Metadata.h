@@ -3010,9 +3010,14 @@ public:
   /// The context will be populated with any information that needs to be
   /// checked before this witness table can be used within a given execution
   /// context.
+  ///
+  /// \p remainingDepth is the recursion budget for checking the conditional
+  /// requirements, or null for no limit. Exhausting it sets it to 0 and
+  /// returns null.
   const swift::TargetWitnessTable<Runtime> *
   getWitnessTable(const TargetMetadata<Runtime> *type,
-                  ConformanceExecutionContext &context) const;
+                  ConformanceExecutionContext &context,
+                  size_t *remainingDepth = nullptr) const;
 
   /// Retrieve the resilient witnesses.
   llvm::ArrayRef<ResilientWitness> getResilientWitnesses() const {

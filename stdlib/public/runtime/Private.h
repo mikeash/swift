@@ -322,6 +322,47 @@ public:
       llvm::function_ref<const WitnessTable *(const Metadata *type,
                                               unsigned index)>;
 
+  /// Whether a recursion budget (see RecursionDepthScope) has run out.
+  inline bool isRecursionDepthExhausted(const size_t *remainingDepth) {
+    return remainingDepth && *remainingDepth == 0;
+  }
+
+  /// One level taken from a recursion budget shared by a chain of nested type
+  /// lookups and conformance checks.
+  ///
+  /// The budget is the depth the outermost caller allows, counting the
+  /// outermost call itself, so a scope can be entered only while it is at
+  /// least 2. Entering a scope takes one level and leaving it gives the level
+  /// back. A scope that can't take a level is exhausted and sets the budget to
+  /// 0, which stays 0 from then on, so the outermost caller sees 0 exactly when
+  /// the budget ran out. A null budget is unlimited.
+  class RecursionDepthScope {
+    size_t *remainingDepth;
+
+  public:
+    explicit RecursionDepthScope(size_t *remainingDepth)
+        : remainingDepth(remainingDepth) {
+      if (!remainingDepth)
+        return;
+      if (*remainingDepth <= 1)
+        *remainingDepth = 0;
+      else
+        --*remainingDepth;
+    }
+
+    ~RecursionDepthScope() {
+      if (remainingDepth && *remainingDepth != 0)
+        ++*remainingDepth;
+    }
+
+    RecursionDepthScope(const RecursionDepthScope &) = delete;
+    RecursionDepthScope &operator=(const RecursionDepthScope &) = delete;
+
+    bool isExhausted() const {
+      return isRecursionDepthExhausted(remainingDepth);
+    }
+  };
+
   /// A pointer to type metadata or a heap-allocated metadata pack.
   struct SWIFT_RUNTIME_LIBRARY_VISIBILITY MetadataPackOrValue {
     const void *Ptr;
@@ -517,6 +558,31 @@ public:
                                SubstGenericParameterFn substGenericParam,
                                SubstDependentWitnessTableFn substWitnessTable);
 
+  /// swift_getTypeByMangledNode, drawing on the recursion budget
+  /// \p remainingDepth (see RecursionDepthScope). Exhausting the budget fails
+  /// the lookup. A null budget calls swift_getTypeByMangledNode.
+  SWIFT_RUNTIME_LIBRARY_VISIBILITY
+  TypeLookupErrorOr<TypeInfo> getTypeByMangledNodeWithMaxDepth(
+                               MetadataRequest request,
+                               Demangler &demangler,
+                               Demangle::NodePointer node,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable,
+                               size_t *remainingDepth);
+
+  /// swift_getTypeByMangledName, drawing on the recursion budget
+  /// \p remainingDepth (see RecursionDepthScope). Exhausting the budget fails
+  /// the lookup. A null budget calls swift_getTypeByMangledName.
+  SWIFT_RUNTIME_LIBRARY_VISIBILITY
+  TypeLookupErrorOr<TypeInfo> getTypeByMangledNameWithMaxDepth(
+                               MetadataRequest request,
+                               StringRef typeName,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable,
+                               size_t *remainingDepth);
+
   /// Retrieve the type metadata pack described by the given type name.
   ///
   /// \p substGenericParam Function that provides generic argument metadata
@@ -528,7 +594,8 @@ public:
                                StringRef typeName,
                                const void * const *arguments,
                                SubstGenericParameterFn substGenericParam,
-                               SubstDependentWitnessTableFn substWitnessTable);
+                               SubstDependentWitnessTableFn substWitnessTable,
+                               size_t *remainingDepth = nullptr);
 
   /// Retrieve the type value described by the given type name.
   ///
@@ -588,6 +655,9 @@ public:
   /// parameters whose arguments are not checked against the implicit
   /// invertible protocol requirements (Copyable, Escapable).
   ///
+  /// \param remainingDepth The recursion budget for the check, or null for no
+  /// limit (see RecursionDepthScope). Exhausting it fails the check.
+  ///
   /// \returns the error if an error occurred, None otherwise.
   std::optional<TypeLookupError> _checkGenericRequirements(
       llvm::ArrayRef<GenericParamDescriptor> genericParams,
@@ -597,7 +667,8 @@ public:
       SubstGenericParameterOrdinalRefFn substGenericParamOrdinal,
       SubstDependentWitnessTableRefFn substWitnessTable,
       ConformanceExecutionContext *context,
-      unsigned numParamsExemptFromInvertibleChecks = 0);
+      unsigned numParamsExemptFromInvertibleChecks = 0,
+      size_t *remainingDepth = nullptr);
 
   /// A helper function which avoids performing a store if the destination
   /// address already contains the source value.  This is useful when
@@ -734,12 +805,15 @@ public:
   ///   table will be placed here
   /// \param context - when non-NULL, receives any information about the
   /// required execution context for this conformance.
+  /// \param remainingDepth - the recursion budget for the check, or null for
+  /// no limit (see RecursionDepthScope). Exhausting it fails the check.
   bool _conformsToProtocol(
       const OpaqueValue *value,
       const Metadata *type,
       ProtocolDescriptorRef protocol,
       const WitnessTable **conformance,
-      ConformanceExecutionContext *context);
+      ConformanceExecutionContext *context,
+      size_t *remainingDepth = nullptr);
 
   /// Check whether a type conforms to a value within the currently-executing
   /// context.
@@ -829,7 +903,8 @@ public:
   /// `ignored`. Returns an error if the type fails to conform to one of them.
   std::optional<TypeLookupError>
   checkInvertibleRequirements(const Metadata *type,
-                              InvertibleProtocolSet ignored);
+                              InvertibleProtocolSet ignored,
+                              size_t *remainingDepth = nullptr);
 
   /// Hook function that calls into the concurrency library to check whether
   /// we are currently executing the given global actor.

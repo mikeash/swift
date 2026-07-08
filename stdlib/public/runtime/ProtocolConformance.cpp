@@ -378,7 +378,8 @@ struct ConformanceLookupResult {
   /// result.
   static ConformanceLookupResult fromConformance(
       const Metadata *type,
-      const ProtocolConformanceDescriptor *conformanceDescriptor);
+      const ProtocolConformanceDescriptor *conformanceDescriptor,
+      size_t *remainingDepth = nullptr);
 };
 
 }
@@ -398,7 +399,8 @@ template<>
 const WitnessTable *
 ProtocolConformanceDescriptor::getWitnessTable(
     const Metadata *type,
-    ConformanceExecutionContext &context
+    ConformanceExecutionContext &context,
+    size_t *remainingDepth
 ) const {
   // If needed, check the conditional requirements.
   llvm::SmallVector<const void *, 2> conditionalArgs;
@@ -420,7 +422,7 @@ ProtocolConformanceDescriptor::getWitnessTable(
         [&substitutions](const Metadata *type, unsigned index) {
           return substitutions.getWitnessTable(type, index);
         },
-        &context);
+        &context, /*numParamsExemptFromInvertibleChecks=*/0, remainingDepth);
     if (error)
       return nullptr;
   }
@@ -445,9 +447,11 @@ ProtocolConformanceDescriptor::getWitnessTable(
 
 ConformanceLookupResult ConformanceLookupResult::fromConformance(
     const Metadata *type,
-    const ProtocolConformanceDescriptor *conformanceDescriptor) {
+    const ProtocolConformanceDescriptor *conformanceDescriptor,
+    size_t *remainingDepth) {
   ConformanceExecutionContext context;
-  auto wtable = conformanceDescriptor->getWitnessTable(type, context);
+  auto wtable =
+      conformanceDescriptor->getWitnessTable(type, context, remainingDepth);
   return {
     wtable,
     context.globalActorIsolationType,
@@ -1028,7 +1032,8 @@ struct SearchInConformanceCacheResult {
 static SearchInConformanceCacheResult
 searchInConformanceCache(const Metadata *type,
                          const ProtocolDescriptor *protocol,
-                         bool instantiateSuperclassMetadata) {
+                         bool instantiateSuperclassMetadata,
+                         size_t *remainingDepth) {
   auto &C = Conformances.get();
   auto origType = type;
   auto snapshot = C.Cache.snapshot();
@@ -1048,8 +1053,8 @@ searchInConformanceCache(const Metadata *type,
       if (!cacheEntry)
         continue;
       auto conformanceDescriptor = cacheEntry->Conformance;
-      auto result =
-          ConformanceLookupResult::fromConformance(type, conformanceDescriptor);
+      auto result = ConformanceLookupResult::fromConformance(
+          type, conformanceDescriptor, remainingDepth);
       // In case we couldn't get a witness table from the cached conformance
       // for this type. While it's possible we could find another conformance
       // that satisfies the requirements, we do NOT attempt to find it.
@@ -1064,10 +1069,13 @@ searchInConformanceCache(const Metadata *type,
       // witness in `foundWitnesses` in order of hierarchy even if it's null.
       // See the test case `(GenericSubClass<Int>() as Any as! Hello).hello()`
       // in `test/multifile/protocol-conformance-redundant.swift` for example.
-      auto sectionsCount = C.SectionsToScan.snapshot().count();
-      bool allowSaveDescriptor = false;
-      C.cacheResult(type, protocol, result, sectionsCount,
-                    allowSaveDescriptor);
+      // A negative from running out of depth isn't cached.
+      if (result || !isRecursionDepthExhausted(remainingDepth)) {
+        auto sectionsCount = C.SectionsToScan.snapshot().count();
+        bool allowSaveDescriptor = false;
+        C.cacheResult(type, protocol, result, sectionsCount,
+                      allowSaveDescriptor);
+      }
       auto isAuthoritative = origType == type;
       return SearchInConformanceCacheResult(
           isAuthoritative, result,
@@ -1417,7 +1425,7 @@ findConformanceWithDyld(ConformanceState &C, const Metadata *type,
 static std::pair<ConformanceLookupResult, bool>
 swift_conformsToProtocolMaybeInstantiateSuperclasses(
     const Metadata *const type, const ProtocolDescriptor *protocol,
-    bool instantiateSuperclassMetadata) {
+    bool instantiateSuperclassMetadata, size_t *remainingDepth) {
   auto &C = Conformances.get();
 
   ConformanceLookupResult dyldCachedWitnessTable;
@@ -1486,7 +1494,7 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   // ConcurrentReadableHashMap data structure allows us to search the map
   // concurrently without locking.
   if (auto cacheSearchResult = searchInConformanceCache(
-          type, protocol, instantiateSuperclassMetadata);
+          type, protocol, instantiateSuperclassMetadata, remainingDepth);
       cacheSearchResult.IsAuthoritative) {
     // An authoritative negative result can be overridden by a result from dyld.
     if (!cacheSearchResult.Result.witnessTable) {
@@ -1517,11 +1525,14 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
         candidate.getMatchingType(type, instantiateSuperclassMetadata));
     assert(matchingType);
     auto witness = ConformanceLookupResult::fromConformance(
-        matchingType, dyldCachedConformanceDescriptor);
-    bool allowSaveDescriptor = false; // already have it in the dyld cache
-    C.cacheResult(type, protocol, witness, /*always cache*/ 0, allowSaveDescriptor);
-    DYLD_CONFORMANCES_LOG("Caching generic conformance to %s found by DYLD",
-                          protocol->Name.get());
+        matchingType, dyldCachedConformanceDescriptor, remainingDepth);
+    // A negative from running out of depth isn't authoritative.
+    if (witness || !isRecursionDepthExhausted(remainingDepth)) {
+      bool allowSaveDescriptor = false; // already have it in the dyld cache
+      C.cacheResult(type, protocol, witness, /*always cache*/ 0, allowSaveDescriptor);
+      DYLD_CONFORMANCES_LOG("Caching generic conformance to %s found by DYLD",
+                            protocol->Name.get());
+    }
     return {witness, false};
   }
 
@@ -1595,13 +1606,16 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   // Resolve the witness table for the most specific match now that the scan is
   // complete.
   ConformanceLookupResult foundWitness = nullptr;
+  bool depthExhausted = false;
   if (foundType) {
-    foundWitness =
-        ConformanceLookupResult::fromConformance(foundType, foundDescriptor);
-    // The match is exact, so it can't go stale; always cache it and save the
-    // descriptor.
-    C.cacheResult(foundType, protocol, foundWitness, /*always cache*/ 0,
-                  /*allowSaveDescriptor*/ true);
+    foundWitness = ConformanceLookupResult::fromConformance(
+        foundType, foundDescriptor, remainingDepth);
+    depthExhausted = isRecursionDepthExhausted(remainingDepth);
+    // The match is exact, so it can't go stale; cache it and save the
+    // descriptor, unless it's a negative from running out of depth.
+    if (foundWitness || !depthExhausted)
+      C.cacheResult(foundType, protocol, foundWitness, /*always cache*/ 0,
+                    /*allowSaveDescriptor*/ true);
   }
 
   traceState.end(foundWitness.witnessTable);
@@ -1611,7 +1625,8 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   if (foundType != type)
     // Do not cache negative results if there were uninstantiated superclasses
     // we didn't search. They might have a conformance that will be found later.
-    if (foundWitness || !hasUninstantiatedSuperclass)
+    // Nor if we ran out of depth.
+    if (foundWitness || (!hasUninstantiatedSuperclass && !depthExhausted))
       C.cacheResult(type, protocol, foundWitness, snapshot.count(), /* allowSaveDescriptor */ false);
 
   // A negative result can be overridden by a result from dyld.
@@ -1625,11 +1640,13 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   return {foundWitness, hasUninstantiatedSuperclass};
 }
 
-static const WitnessTable *
-swift_conformsToProtocolWithExecutionContextImpl(
+SWIFT_RUNTIME_EXPORT
+const WitnessTable *
+swift_conformsToProtocolWithExecutionContextAndMaxDepth(
     const Metadata *const type,
     const ProtocolDescriptor *protocol,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t *remainingDepth) {
   ConformanceLookupResult found;
   bool hasUninstantiatedSuperclass;
 
@@ -1641,7 +1658,8 @@ swift_conformsToProtocolWithExecutionContextImpl(
   // instantiated.=
   std::tie(found, hasUninstantiatedSuperclass) =
       swift_conformsToProtocolMaybeInstantiateSuperclasses(
-          type, protocol, false /*instantiateSuperclassMetadata*/);
+          type, protocol, false /*instantiateSuperclassMetadata*/,
+          remainingDepth);
 
   // If no conformance was found, and there is an uninstantiated superclass that
   // was not searched, then try the search again and instantiate all
@@ -1649,7 +1667,8 @@ swift_conformsToProtocolWithExecutionContextImpl(
   if (!found && hasUninstantiatedSuperclass)
     std::tie(found, hasUninstantiatedSuperclass) =
         swift_conformsToProtocolMaybeInstantiateSuperclasses(
-            type, protocol, true /*instantiateSuperclassMetadata*/);
+            type, protocol, true /*instantiateSuperclassMetadata*/,
+            remainingDepth);
 
   // Check for isolated conformances.
   if (found.globalActorIsolationType && context) {
@@ -1666,6 +1685,15 @@ swift_conformsToProtocolWithExecutionContextImpl(
   }
 
   return found.witnessTable;
+}
+
+static const WitnessTable *
+swift_conformsToProtocolWithExecutionContextImpl(
+    const Metadata *const type,
+    const ProtocolDescriptor *protocol,
+    ConformanceExecutionContext *context) {
+  return swift::swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+      type, protocol, context, /*remainingDepth=*/nullptr);
 }
 
 static const WitnessTable *
@@ -1869,20 +1897,21 @@ bool swift::_swift_class_isSubclass(const Metadata *subclass,
 /// Resolve a mangled type name for a generic requirement check.
 ///
 /// This is deliberately kept out-of-line: it constructs the `std::function`
-/// adaptors needed to call `swift_getTypeByMangledName` (which takes them by
-/// value) and uses demangler scratch space, none of which is live across the
-/// recursive conformance check that `checkGenericRequirement` performs
-/// afterwards. Keeping it in its own frame prevents that scratch from being
-/// held on the stack across the recursion, which matters on deeply nested
+/// adaptors needed to call `getTypeByMangledNameWithMaxDepth` (which takes
+/// them by value) and uses demangler scratch space, none of which is live
+/// across the recursive conformance check that `checkGenericRequirement`
+/// performs afterwards. Keeping it in its own frame prevents that scratch from
+/// being held on the stack across the recursion, which matters on deeply nested
 /// conditional-conformance chains.
 static SWIFT_NOINLINE TypeLookupErrorOr<TypeInfo>
 resolveTypeForRequirementCheck(
     llvm::StringRef mangledName, const void *const *extraArguments,
     SubstGenericParameterRefFn substGenericParam,
-    SubstDependentWitnessTableRefFn substWitnessTable) {
-  return swift_getTypeByMangledName(MetadataState::Abstract, mangledName,
-                                    extraArguments, substGenericParam,
-                                    substWitnessTable);
+    SubstDependentWitnessTableRefFn substWitnessTable,
+    size_t *remainingDepth) {
+  return getTypeByMangledNameWithMaxDepth(MetadataState::Abstract, mangledName,
+                                          extraArguments, substGenericParam,
+                                          substWitnessTable, remainingDepth);
 }
 
 static std::optional<TypeLookupError> checkGenericRequirement(
@@ -1891,7 +1920,8 @@ static std::optional<TypeLookupError> checkGenericRequirement(
     SubstGenericParameterRefFn substGenericParam,
     SubstDependentWitnessTableRefFn substWitnessTable,
     llvm::SmallVectorImpl<InvertibleProtocolSet> &suppressed,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t *remainingDepth) {
   assert(!req.getFlags().isPackRequirement());
 
   // Make sure we understand the requirement we're dealing with.
@@ -1901,7 +1931,8 @@ static std::optional<TypeLookupError> checkGenericRequirement(
   // Resolve the subject generic parameter.
   auto result =
       resolveTypeForRequirementCheck(req.getParam(), extraArguments.data(),
-                                     substGenericParam, substWitnessTable);
+                                     substGenericParam, substWitnessTable,
+                                     remainingDepth);
   if (result.getError())
     return *result.getError();
   const Metadata *subjectType = result.getType().getMetadata();
@@ -1911,7 +1942,7 @@ static std::optional<TypeLookupError> checkGenericRequirement(
   case GenericRequirementKind::Protocol: {
     const WitnessTable *witnessTable = nullptr;
     if (!_conformsToProtocol(nullptr, subjectType, req.getProtocol(),
-                             &witnessTable, context)) {
+                             &witnessTable, context, remainingDepth)) {
       const char *protoName =
           req.getProtocol() ? req.getProtocol().getName() : "<null>";
       return TYPE_LOOKUP_ERROR_FMT(
@@ -1932,7 +1963,7 @@ static std::optional<TypeLookupError> checkGenericRequirement(
     // Demangle the second type under the given substitutions.
     auto result = resolveTypeForRequirementCheck(
         req.getMangledTypeName(), extraArguments.data(), substGenericParam,
-        substWitnessTable);
+        substWitnessTable, remainingDepth);
     if (result.getError())
       return *result.getError();
     auto otherType = result.getType().getMetadata();
@@ -1956,7 +1987,7 @@ static std::optional<TypeLookupError> checkGenericRequirement(
     // Demangle the base type under the given substitutions.
     auto result = resolveTypeForRequirementCheck(
         req.getMangledTypeName(), extraArguments.data(), substGenericParam,
-        substWitnessTable);
+        substWitnessTable, remainingDepth);
     if (result.getError())
       return *result.getError();
     auto baseType = result.getType().getMetadata();
@@ -1983,7 +2014,8 @@ static std::optional<TypeLookupError> checkGenericRequirement(
     uint16_t index = req.getInvertedProtocolsGenericParamIndex();
     if (index == 0xFFFF) {
       return checkInvertibleRequirements(subjectType,
-                                         req.getInvertedProtocols());
+                                         req.getInvertedProtocols(),
+                                         remainingDepth);
     }
 
     // Expand the suppression set so we can record these protocols.
@@ -2009,7 +2041,8 @@ checkGenericPackRequirement(
     SubstGenericParameterRefFn substGenericParam,
     SubstDependentWitnessTableRefFn substWitnessTable,
     llvm::SmallVectorImpl<InvertibleProtocolSet> &suppressed,
-    ConformanceExecutionContext *context) {
+    ConformanceExecutionContext *context,
+    size_t *remainingDepth) {
   assert(req.getFlags().isPackRequirement());
 
   // Make sure we understand the requirement we're dealing with.
@@ -2019,7 +2052,7 @@ checkGenericPackRequirement(
   // Resolve the subject generic parameter.
   auto result = swift::getTypePackByMangledName(
       req.getParam(), extraArguments.data(),
-      substGenericParam, substWitnessTable);
+      substGenericParam, substWitnessTable, remainingDepth);
   if (result.getError())
     return *result.getError();
   MetadataPackPointer subjectType = result.getType();
@@ -2036,7 +2069,7 @@ checkGenericPackRequirement(
 
       const WitnessTable *witnessTable = nullptr;
       if (!_conformsToProtocol(nullptr, elt, req.getProtocol(),
-                               &witnessTable, context)) {
+                               &witnessTable, context, remainingDepth)) {
         const char *protoName =
             req.getProtocol() ? req.getProtocol().getName() : "<null>";
         return TYPE_LOOKUP_ERROR_FMT(
@@ -2063,7 +2096,7 @@ checkGenericPackRequirement(
     // Resolve the constraint generic parameter.
     auto result = swift::getTypePackByMangledName(
         req.getMangledTypeName(), extraArguments.data(),
-        substGenericParam, substWitnessTable);
+        substGenericParam, substWitnessTable, remainingDepth);
     if (result.getError())
       return *result.getError();
     MetadataPackPointer constraintType = result.getType();
@@ -2104,9 +2137,10 @@ checkGenericPackRequirement(
 
   case GenericRequirementKind::BaseClass: {
     // Demangle the base type under the given substitutions.
-    auto result = swift_getTypeByMangledName(
+    auto result = getTypeByMangledNameWithMaxDepth(
         MetadataState::Abstract, req.getMangledTypeName(),
-        extraArguments.data(), substGenericParam, substWitnessTable);
+        extraArguments.data(), substGenericParam, substWitnessTable,
+        remainingDepth);
     if (result.getError())
       return *result.getError();
     auto baseType = result.getType().getMetadata();
@@ -2134,7 +2168,7 @@ checkGenericPackRequirement(
   case GenericRequirementKind::SameShape: {
     auto result = swift::getTypePackByMangledName(
         req.getMangledTypeName(), extraArguments.data(),
-        substGenericParam, substWitnessTable);
+        substGenericParam, substWitnessTable, remainingDepth);
     if (result.getError())
       return *result.getError();
     MetadataPackPointer otherType = result.getType();
@@ -2158,7 +2192,7 @@ checkGenericPackRequirement(
         const Metadata *elt = subjectType.getElements()[i];
 
         if (auto error = checkInvertibleRequirements(
-                elt, req.getInvertedProtocols()))
+                elt, req.getInvertedProtocols(), remainingDepth))
           return error;
       }
 
@@ -2237,7 +2271,8 @@ checkGenericValueRequirement(
 
 static std::optional<TypeLookupError>
 checkInvertibleRequirementsStructural(const Metadata *type,
-                                        InvertibleProtocolSet ignored) {
+                                      InvertibleProtocolSet ignored,
+                                      size_t *remainingDepth) {
   switch (type->getKind()) {
   case MetadataKind::Class:
   case MetadataKind::Struct:
@@ -2260,12 +2295,16 @@ checkInvertibleRequirementsStructural(const Metadata *type,
     return std::nullopt;
 
   case MetadataKind::Tuple: {
+    RecursionDepthScope depthScope(remainingDepth);
+    if (depthScope.isExhausted())
+      return TypeLookupError("recursion depth limit reached");
+
     // Check every element type in the tuple.
     auto tupleMetadata = cast<TupleTypeMetadata>(type);
     for (unsigned i = 0, n = tupleMetadata->NumElements; i != n; ++i) {
       if (auto error =
               checkInvertibleRequirements(&*tupleMetadata->getElement(i).Type,
-                                            ignored))
+                                          ignored, remainingDepth))
         return error;
     }
     return std::nullopt;
@@ -2380,10 +2419,11 @@ checkInvertibleRequirementsStructural(const Metadata *type,
 /// that haven't been explicitly suppressed by `ignored`.
 std::optional<TypeLookupError>
 swift::checkInvertibleRequirements(const Metadata *type,
-                                   InvertibleProtocolSet ignored) {
+                                   InvertibleProtocolSet ignored,
+                                   size_t *remainingDepth) {
   auto contextDescriptor = type->getTypeContextDescriptor();
   if (!contextDescriptor)
-    return checkInvertibleRequirementsStructural(type, ignored);
+    return checkInvertibleRequirementsStructural(type, ignored, remainingDepth);
 
   // If no conformances are suppressed, then it conforms to everything.
   if (!contextDescriptor->hasInvertibleProtocols()) {
@@ -2458,7 +2498,7 @@ swift::checkInvertibleRequirements(const Metadata *type,
         [&substFn](const Metadata *type, unsigned index) {
           return substFn.getWitnessTable(type, index);
         },
-        nullptr);
+        nullptr, /*numParamsExemptFromInvertibleChecks=*/0, remainingDepth);
     if (error)
       return error;
   }
@@ -2474,7 +2514,12 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
     SubstGenericParameterOrdinalRefFn substGenericParamOrdinal,
     SubstDependentWitnessTableRefFn substWitnessTable,
     ConformanceExecutionContext *context,
-    unsigned numParamsExemptFromInvertibleChecks) {
+    unsigned numParamsExemptFromInvertibleChecks,
+    size_t *remainingDepth) {
+  RecursionDepthScope depthScope(remainingDepth);
+  if (depthScope.isExhausted())
+    return TypeLookupError("recursion depth limit reached");
+
   // The suppressed conformances for each generic parameter.
   llvm::SmallVector<InvertibleProtocolSet, 4> allSuppressed;
 
@@ -2484,7 +2529,8 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
                                                substGenericParam,
                                                substWitnessTable,
                                                allSuppressed,
-                                               context);
+                                               context,
+                                               remainingDepth);
       if (error)
         return error;
     } else if (req.getFlags().isValueRequirement()) {
@@ -2499,7 +2545,8 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
                                            substGenericParam,
                                            substWitnessTable,
                                            allSuppressed,
-                                           context);
+                                           context,
+                                           remainingDepth);
       if (error)
         return error;
     }
@@ -2532,7 +2579,8 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
       }
 
       auto metadata = MetadataPackOrValue.getMetadata();
-      if (auto error = checkInvertibleRequirements(metadata, suppressed))
+      if (auto error = checkInvertibleRequirements(metadata, suppressed,
+                                                   remainingDepth))
         return error;
 
       break;
@@ -2553,7 +2601,8 @@ std::optional<TypeLookupError> swift::_checkGenericRequirements(
         llvm::ArrayRef<const Metadata *> elements(
             pack.getElements(), pack.getNumElements());
         for (auto element : elements) {
-          if (auto error = checkInvertibleRequirements(element, suppressed))
+          if (auto error = checkInvertibleRequirements(element, suppressed,
+                                                       remainingDepth))
             return error;
         }
       }

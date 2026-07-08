@@ -1394,3 +1394,8 @@ Added: _$ss9ConstCellVMn
 
 // Removed: _createOffsetBasedKeyPath
 Removed: _$ss25_createOffsetBasedKeyPath4root5value6offsets03AnydE0CypXp_ypXpSitF
+
+// Depth-limited conformance checks and type lookups
+Added: _swift_conformsToProtocolWithExecutionContextAndMaxDepth
+Added: _swift_getTypeByMangledNameInContextInMetadataStateAndMaxDepth
+Added: _swift_getTypeByMangledNameInEnvironmentInMetadataStateAndMaxDepth

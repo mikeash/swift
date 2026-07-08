@@ -708,27 +708,66 @@ class TypeDecoder {
 
   BuilderType &Builder;
 
+  /// A recursion budget shared with the lookups the builder makes, or null.
+  /// It is the depth allowed, counting the outermost call, and is 0 once it
+  /// has run out. While decoding, it holds what is left below the node most
+  /// recently entered, which is never more than what is left below the node
+  /// the builder is working on.
+  size_t *RemainingDepth;
+
+  /// The value of *RemainingDepth when decoding started.
+  size_t InitialDepth = 0;
+
 public:
-  explicit TypeDecoder(BuilderType &Builder) : Builder(Builder) {}
+  explicit TypeDecoder(BuilderType &Builder, size_t *remainingDepth = nullptr)
+      : Builder(Builder), RemainingDepth(remainingDepth) {}
 
   /// Given a demangle tree, attempt to turn it into a type.
   ///
   /// If a mangling may legitimately denote a bare integer value at the root
   /// level, pass true for allowValue.
+  ///
+  /// If the recursion budget runs out, decoding fails and the budget is left
+  /// at 0. Otherwise it is unchanged on return.
   TypeLookupErrorOr<BuiltType> decodeMangledType(NodePointer Node,
                                                  bool forRequirement = true,
                                                  bool allowValue = true) {
-    return decodeMangledType(Node, 0, forRequirement, allowValue);
+    if (!RemainingDepth)
+      return decodeMangledType(Node, 0, forRequirement, allowValue);
+
+    InitialDepth = *RemainingDepth;
+    auto result = decodeMangledType(Node, 0, forRequirement, allowValue);
+    if (*RemainingDepth != 0)
+      *RemainingDepth = InitialDepth;
+    return result;
   }
 
 protected:
   static const unsigned MaxDepth = 1024;
 
+  /// Whether a node at \p depth is too deep to decode. If it isn't, sets the
+  /// recursion budget to what is left below it.
+  ///
+  /// The budget is stored rather than taken and given back around each
+  /// recursive call so that those calls can stay tail calls.
+  bool isTooDeep(unsigned depth) {
+    if (depth > TypeDecoder::MaxDepth)
+      return true;
+    if (!RemainingDepth)
+      return false;
+    if (*RemainingDepth == 0 || InitialDepth < size_t(depth) + 2) {
+      *RemainingDepth = 0;
+      return true;
+    }
+    *RemainingDepth = InitialDepth - depth - 1;
+    return false;
+  }
+
   TypeLookupErrorOr<BuiltType> decodeMangledType(NodePointer Node,
                                                  unsigned depth,
                                                  bool forRequirement = true,
                                                  bool allowValue = false) {
-    if (depth > TypeDecoder::MaxDepth)
+    if (isTooDeep(depth))
       return TypeLookupError("Mangled type is too complex");
 
     if (!Node)
@@ -2073,7 +2112,7 @@ private:
   decodeMangledTypeDecl(Demangle::NodePointer node, unsigned depth,
                         BuiltTypeDecl &typeDecl, BuiltType &parent,
                         bool &typeAlias) {
-    if (depth > TypeDecoder::MaxDepth)
+    if (isTooDeep(depth))
       return TypeLookupError("Mangled type is too complex");
 
     if (node->getKind() == NodeKind::Type)
@@ -2286,9 +2325,10 @@ private:
 template <typename BuilderType>
 inline TypeLookupErrorOr<typename BuilderType::BuiltType>
 decodeMangledType(BuilderType &Builder, NodePointer Node,
-                  bool forRequirement = false, bool allowValue = true) {
-  return TypeDecoder<BuilderType>(Builder).decodeMangledType(
-      Node, forRequirement, allowValue);
+                  bool forRequirement = false, bool allowValue = true,
+                  size_t *remainingDepth = nullptr) {
+  return TypeDecoder<BuilderType>(Builder, remainingDepth)
+      .decodeMangledType(Node, forRequirement, allowValue);
 }
 
 SWIFT_END_INLINE_NAMESPACE
