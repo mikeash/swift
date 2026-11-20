@@ -544,12 +544,8 @@ bool swift::_conformsToProtocol(
     size_t *remainingDepth) {
   // Look up the witness table for protocols that need them.
   if (protocol.needsWitnessTable()) {
-    auto witness =
-        remainingDepth
-            ? swift_conformsToProtocolWithExecutionContextAndMaxDepth(
-                  type, protocol.getSwiftProtocol(), context, remainingDepth)
-            : swift_conformsToProtocolWithExecutionContext(
-                  type, protocol.getSwiftProtocol(), context);
+    auto witness = swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+        type, protocol.getSwiftProtocol(), context, remainingDepth);
     if (!witness)
       return false;
     if (conformance)

@@ -188,6 +188,20 @@ TEST_F(CompatibilityOverrideRuntimeTest, test_swift_conformsToProtocolCommon) {
   ASSERT_EQ(Result, nullptr);
 }
 
+TEST_F(CompatibilityOverrideRuntimeTest,
+       test_swift_conformsToProtocolWithExecutionContext) {
+  auto Result =
+      swift_conformsToProtocolWithExecutionContext(nullptr, nullptr, nullptr);
+  ASSERT_EQ(Result, nullptr);
+}
+
+TEST_F(CompatibilityOverrideRuntimeTest,
+       test_swift_conformsToProtocolWithExecutionContextAndMaxDepth) {
+  auto Result = swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+      nullptr, nullptr, nullptr, nullptr);
+  ASSERT_EQ(Result, nullptr);
+}
+
 TEST_F(CompatibilityOverrideRuntimeTest, test_swift_getTypeByMangledNode) {
   Demangler demangler;
   auto Result = swift_getTypeByMangledNode(MetadataState::Abstract,
@@ -198,6 +212,22 @@ TEST_F(CompatibilityOverrideRuntimeTest, test_swift_getTypeByMangledNode) {
 TEST_F(CompatibilityOverrideRuntimeTest, test_swift_getTypeByMangledName) {
   auto Result = swift_getTypeByMangledName(MetadataState::Abstract,
                                            "", nullptr, nullptr, nullptr);
+  ASSERT_EQ(Result.getType().getMetadata(), nullptr);
+}
+
+TEST_F(CompatibilityOverrideRuntimeTest,
+       test_swift_getTypeByMangledNodeAndMaxDepth) {
+  Demangler demangler;
+  auto Result = swift_getTypeByMangledNodeAndMaxDepth(
+      MetadataState::Abstract, demangler, nullptr, nullptr, nullptr, nullptr,
+      nullptr);
+  ASSERT_EQ(Result.getType().getMetadata(), nullptr);
+}
+
+TEST_F(CompatibilityOverrideRuntimeTest,
+       test_swift_getTypeByMangledNameAndMaxDepth) {
+  auto Result = swift_getTypeByMangledNameAndMaxDepth(
+      MetadataState::Abstract, "", nullptr, nullptr, nullptr, nullptr);
   ASSERT_EQ(Result.getType().getMetadata(), nullptr);
 }
 

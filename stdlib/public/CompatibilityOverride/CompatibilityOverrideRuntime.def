@@ -192,12 +192,13 @@ OVERRIDE_PROTOCOLCONFORMANCE(conformsToProtocolCommon, const WitnessTable *, , ,
                               const ProtocolDescriptor *protocol),
                              (type, protocol))
 
-OVERRIDE_PROTOCOLCONFORMANCE(conformsToProtocolWithExecutionContext,
+OVERRIDE_PROTOCOLCONFORMANCE(conformsToProtocolWithExecutionContextAndMaxDepth,
                              const WitnessTable *, , , swift::,
                              (const Metadata * const type,
                               const ProtocolDescriptor *protocol,
-                              ConformanceExecutionContext *context),
-                             (type, protocol, context))
+                              ConformanceExecutionContext *context,
+                              size_t *remainingDepth),
+                             (type, protocol, context, remainingDepth))
 
 OVERRIDE_PROTOCOLCONFORMANCE(isInConformanceExecutionContext,
                              bool, , , swift::,
@@ -209,21 +210,23 @@ OVERRIDE_KEYPATH(getKeyPath, const HeapObject *, , , swift::,
                  (const void *pattern, const void *arguments),
                  (pattern, arguments))
 
-OVERRIDE_METADATALOOKUP(getTypeByMangledNode, TypeLookupErrorOr<TypeInfo>, , SWIFT_CC(swift), swift::,
+OVERRIDE_METADATALOOKUP(getTypeByMangledNodeAndMaxDepth, TypeLookupErrorOr<TypeInfo>, , SWIFT_CC(swift), swift::,
                         (MetadataRequest request,
                          Demangler &demangler,
                          Demangle::NodePointer node,
                          const void * const *arguments,
                          SubstGenericParameterFn substGenericParam,
-                         SubstDependentWitnessTableFn substWitnessTable),
-                        (request, demangler, node, arguments, substGenericParam, substWitnessTable))
-OVERRIDE_METADATALOOKUP(getTypeByMangledName, TypeLookupErrorOr<TypeInfo>, , SWIFT_CC(swift), swift::,
+                         SubstDependentWitnessTableFn substWitnessTable,
+                         size_t *remainingDepth),
+                        (request, demangler, node, arguments, substGenericParam, substWitnessTable, remainingDepth))
+OVERRIDE_METADATALOOKUP(getTypeByMangledNameAndMaxDepth, TypeLookupErrorOr<TypeInfo>, , SWIFT_CC(swift), swift::,
                         (MetadataRequest request,
                          StringRef typeName,
                          const void * const *arguments,
                          SubstGenericParameterFn substGenericParam,
-                         SubstDependentWitnessTableFn substWitnessTable),
-                        (request, typeName, arguments, substGenericParam, substWitnessTable))
+                         SubstDependentWitnessTableFn substWitnessTable,
+                         size_t *remainingDepth),
+                        (request, typeName, arguments, substGenericParam, substWitnessTable, remainingDepth))
 
 OVERRIDE_WITNESSTABLE(getAssociatedTypeWitnessSlow, MetadataResponse,
                       SWIFT_RUNTIME_STDLIB_INTERNAL, SWIFT_CC(swift), swift::,

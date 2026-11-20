@@ -1640,9 +1640,8 @@ swift_conformsToProtocolMaybeInstantiateSuperclasses(
   return {foundWitness, hasUninstantiatedSuperclass};
 }
 
-SWIFT_RUNTIME_EXPORT
-const WitnessTable *
-swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+static const WitnessTable *
+swift_conformsToProtocolWithExecutionContextAndMaxDepthImpl(
     const Metadata *const type,
     const ProtocolDescriptor *protocol,
     ConformanceExecutionContext *context,
@@ -1687,12 +1686,11 @@ swift_conformsToProtocolWithExecutionContextAndMaxDepth(
   return found.witnessTable;
 }
 
-static const WitnessTable *
-swift_conformsToProtocolWithExecutionContextImpl(
+const WitnessTable *swift::swift_conformsToProtocolWithExecutionContext(
     const Metadata *const type,
     const ProtocolDescriptor *protocol,
     ConformanceExecutionContext *context) {
-  return swift::swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+  return swift_conformsToProtocolWithExecutionContextAndMaxDepth(
       type, protocol, context, /*remainingDepth=*/nullptr);
 }
 
@@ -1700,8 +1698,8 @@ static const WitnessTable *
 swift_conformsToProtocolCommonImpl(
     const Metadata *const type,
     const ProtocolDescriptor *protocol) {
-  return swift_conformsToProtocolWithExecutionContextImpl(
-      type, protocol, nullptr);
+  return swift_conformsToProtocolWithExecutionContextAndMaxDepthImpl(
+      type, protocol, nullptr, /*remainingDepth=*/nullptr);
 }
 
 static const WitnessTable *
@@ -1897,8 +1895,8 @@ bool swift::_swift_class_isSubclass(const Metadata *subclass,
 /// Resolve a mangled type name for a generic requirement check.
 ///
 /// This is deliberately kept out-of-line: it constructs the `std::function`
-/// adaptors needed to call `getTypeByMangledNameWithMaxDepth` (which takes
-/// them by value) and uses demangler scratch space, none of which is live
+/// adaptors needed to call `swift_getTypeByMangledNameAndMaxDepth` (which
+/// takes them by value) and uses demangler scratch space, none of which is live
 /// across the recursive conformance check that `checkGenericRequirement`
 /// performs afterwards. Keeping it in its own frame prevents that scratch from
 /// being held on the stack across the recursion, which matters on deeply nested
@@ -1909,9 +1907,9 @@ resolveTypeForRequirementCheck(
     SubstGenericParameterRefFn substGenericParam,
     SubstDependentWitnessTableRefFn substWitnessTable,
     size_t *remainingDepth) {
-  return getTypeByMangledNameWithMaxDepth(MetadataState::Abstract, mangledName,
-                                          extraArguments, substGenericParam,
-                                          substWitnessTable, remainingDepth);
+  return swift_getTypeByMangledNameAndMaxDepth(
+      MetadataState::Abstract, mangledName, extraArguments, substGenericParam,
+      substWitnessTable, remainingDepth);
 }
 
 static std::optional<TypeLookupError> checkGenericRequirement(
@@ -2137,7 +2135,7 @@ checkGenericPackRequirement(
 
   case GenericRequirementKind::BaseClass: {
     // Demangle the base type under the given substitutions.
-    auto result = getTypeByMangledNameWithMaxDepth(
+    auto result = swift_getTypeByMangledNameAndMaxDepth(
         MetadataState::Abstract, req.getMangledTypeName(),
         extraArguments.data(), substGenericParam, substWitnessTable,
         remainingDepth);

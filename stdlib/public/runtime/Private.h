@@ -535,6 +535,19 @@ public:
   /// given a particular generic parameter specified by depth/index.
   /// \p substWitnessTable Function that provides witness tables given a
   /// particular dependent conformance index.
+  /// \p remainingDepth The recursion budget for the lookup, or null for no
+  /// limit (see RecursionDepthScope). Exhausting it fails the lookup.
+  SWIFT_RUNTIME_LIBRARY_VISIBILITY SWIFT_CC(swift)
+  TypeLookupErrorOr<TypeInfo> swift_getTypeByMangledNodeAndMaxDepth(
+                               MetadataRequest request,
+                               Demangler &demangler,
+                               Demangle::NodePointer node,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable,
+                               size_t *remainingDepth);
+
+  /// swift_getTypeByMangledNodeAndMaxDepth with no limit on recursion.
   SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
   TypeLookupErrorOr<TypeInfo> swift_getTypeByMangledNode(
                                MetadataRequest request,
@@ -550,6 +563,18 @@ public:
   /// given a particular generic parameter specified by depth/index.
   /// \p substWitnessTable Function that provides witness tables given a
   /// particular dependent conformance index.
+  /// \p remainingDepth The recursion budget for the lookup, or null for no
+  /// limit (see RecursionDepthScope). Exhausting it fails the lookup.
+  SWIFT_RUNTIME_LIBRARY_VISIBILITY SWIFT_CC(swift)
+  TypeLookupErrorOr<TypeInfo> swift_getTypeByMangledNameAndMaxDepth(
+                               MetadataRequest request,
+                               StringRef typeName,
+                               const void * const *arguments,
+                               SubstGenericParameterFn substGenericParam,
+                               SubstDependentWitnessTableFn substWitnessTable,
+                               size_t *remainingDepth);
+
+  /// swift_getTypeByMangledNameAndMaxDepth with no limit on recursion.
   SWIFT_RUNTIME_EXPORT SWIFT_CC(swift)
   TypeLookupErrorOr<TypeInfo> swift_getTypeByMangledName(
                                MetadataRequest request,
@@ -557,31 +582,6 @@ public:
                                const void * const *arguments,
                                SubstGenericParameterFn substGenericParam,
                                SubstDependentWitnessTableFn substWitnessTable);
-
-  /// swift_getTypeByMangledNode, drawing on the recursion budget
-  /// \p remainingDepth (see RecursionDepthScope). Exhausting the budget fails
-  /// the lookup. A null budget calls swift_getTypeByMangledNode.
-  SWIFT_RUNTIME_LIBRARY_VISIBILITY
-  TypeLookupErrorOr<TypeInfo> getTypeByMangledNodeWithMaxDepth(
-                               MetadataRequest request,
-                               Demangler &demangler,
-                               Demangle::NodePointer node,
-                               const void * const *arguments,
-                               SubstGenericParameterFn substGenericParam,
-                               SubstDependentWitnessTableFn substWitnessTable,
-                               size_t *remainingDepth);
-
-  /// swift_getTypeByMangledName, drawing on the recursion budget
-  /// \p remainingDepth (see RecursionDepthScope). Exhausting the budget fails
-  /// the lookup. A null budget calls swift_getTypeByMangledName.
-  SWIFT_RUNTIME_LIBRARY_VISIBILITY
-  TypeLookupErrorOr<TypeInfo> getTypeByMangledNameWithMaxDepth(
-                               MetadataRequest request,
-                               StringRef typeName,
-                               const void * const *arguments,
-                               SubstGenericParameterFn substGenericParam,
-                               SubstDependentWitnessTableFn substWitnessTable,
-                               size_t *remainingDepth);
 
   /// Retrieve the type metadata pack described by the given type name.
   ///

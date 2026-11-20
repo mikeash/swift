@@ -2044,7 +2044,7 @@ public:
     SubstGenericParametersFromMetadata substitutions(descriptor,
                                                      allGenericArgsVec.data());
     return BuiltType(
-        getTypeByMangledNameWithMaxDepth(MetadataState::Complete,
+        swift_getTypeByMangledNameAndMaxDepth(MetadataState::Complete,
                                    mangledName, allGenericArgsVec.data(),
         [&substitutions](unsigned depth, unsigned index) {
           return substitutions.getMetadata(depth, index).Ptr;
@@ -2553,10 +2553,8 @@ public:
 
     auto projectDependentMemberType = [&](const Metadata *baseMetadata) -> const Metadata * {
       auto witnessTable =
-          remainingDepth
-              ? swift_conformsToProtocolWithExecutionContextAndMaxDepth(
-                    baseMetadata, swiftProtocol, nullptr, remainingDepth)
-              : swift_conformsToProtocolCommon(baseMetadata, swiftProtocol);
+          swift_conformsToProtocolWithExecutionContextAndMaxDepth(
+              baseMetadata, swiftProtocol, nullptr, remainingDepth);
       if (!witnessTable)
         return nullptr;
 
@@ -2719,13 +2717,13 @@ public:
 
 }
 
+SWIFT_CC(swift)
 static TypeLookupErrorOr<TypeInfo>
-getTypeByMangledNodeImpl(MetadataRequest request, Demangler &demangler,
-                         Demangle::NodePointer node,
-                         const void *const *origArgumentVector,
-                         SubstGenericParameterFn substGenericParam,
-                         SubstDependentWitnessTableFn substWitnessTable,
-                         size_t *remainingDepth) {
+swift_getTypeByMangledNodeAndMaxDepthImpl(
+    MetadataRequest request, Demangler &demangler, Demangle::NodePointer node,
+    const void *const *origArgumentVector,
+    SubstGenericParameterFn substGenericParam,
+    SubstDependentWitnessTableFn substWitnessTable, size_t *remainingDepth) {
   // Simply call an accessor function if that's all we got.
   if (node->getKind() == Node::Kind::AccessorFunctionReference) {
     // The accessor function is passed the pointer to the original argument
@@ -2765,22 +2763,11 @@ getTypeByMangledNodeImpl(MetadataRequest request, Demangler &demangler,
 
 SWIFT_CC(swift)
 static TypeLookupErrorOr<TypeInfo>
-swift_getTypeByMangledNodeImpl(MetadataRequest request, Demangler &demangler,
-                               Demangle::NodePointer node,
-                               const void *const *origArgumentVector,
-                               SubstGenericParameterFn substGenericParam,
-                               SubstDependentWitnessTableFn substWitnessTable) {
-  return getTypeByMangledNodeImpl(request, demangler, node, origArgumentVector,
-                                  substGenericParam, substWitnessTable,
-                                  /*remainingDepth=*/nullptr);
-}
-
-static TypeLookupErrorOr<TypeInfo>
-getTypeByMangledNameImpl(MetadataRequest request, StringRef typeName,
-                         const void *const *origArgumentVector,
-                         SubstGenericParameterFn substGenericParam,
-                         SubstDependentWitnessTableFn substWitnessTable,
-                         size_t *remainingDepth) {
+swift_getTypeByMangledNameAndMaxDepthImpl(
+    MetadataRequest request, StringRef typeName,
+    const void *const *origArgumentVector,
+    SubstGenericParameterFn substGenericParam,
+    SubstDependentWitnessTableFn substWitnessTable, size_t *remainingDepth) {
   DemanglerForRuntimeTypeResolution<StackAllocatedDemangler<2048>> demangler;
 
   NodePointer node;
@@ -2827,44 +2814,29 @@ getTypeByMangledNameImpl(MetadataRequest request, StringRef typeName,
     }
   }
 
-  return getTypeByMangledNodeWithMaxDepth(request, demangler, node,
-                                          origArgumentVector, substGenericParam,
-                                          substWitnessTable, remainingDepth);
+  return swift_getTypeByMangledNodeAndMaxDepth(
+      request, demangler, node, origArgumentVector, substGenericParam,
+      substWitnessTable, remainingDepth);
 }
 
 SWIFT_CC(swift)
-static TypeLookupErrorOr<TypeInfo>
-swift_getTypeByMangledNameImpl(MetadataRequest request, StringRef typeName,
-                               const void *const *origArgumentVector,
-                               SubstGenericParameterFn substGenericParam,
-                               SubstDependentWitnessTableFn substWitnessTable) {
-  return getTypeByMangledNameImpl(request, typeName, origArgumentVector,
-                                  substGenericParam, substWitnessTable,
-                                  /*remainingDepth=*/nullptr);
-}
-
-TypeLookupErrorOr<TypeInfo> swift::getTypeByMangledNodeWithMaxDepth(
+TypeLookupErrorOr<TypeInfo> swift::swift_getTypeByMangledNode(
     MetadataRequest request, Demangler &demangler, Demangle::NodePointer node,
     const void *const *arguments, SubstGenericParameterFn substGenericParam,
-    SubstDependentWitnessTableFn substWitnessTable, size_t *remainingDepth) {
-  if (!remainingDepth)
-    return swift_getTypeByMangledNode(request, demangler, node, arguments,
-                                      substGenericParam, substWitnessTable);
-  return getTypeByMangledNodeImpl(request, demangler, node, arguments,
-                                  substGenericParam, substWitnessTable,
-                                  remainingDepth);
+    SubstDependentWitnessTableFn substWitnessTable) {
+  return swift_getTypeByMangledNodeAndMaxDepth(
+      request, demangler, node, arguments, substGenericParam,
+      substWitnessTable, /*remainingDepth=*/nullptr);
 }
 
-TypeLookupErrorOr<TypeInfo> swift::getTypeByMangledNameWithMaxDepth(
+SWIFT_CC(swift)
+TypeLookupErrorOr<TypeInfo> swift::swift_getTypeByMangledName(
     MetadataRequest request, StringRef typeName, const void *const *arguments,
     SubstGenericParameterFn substGenericParam,
-    SubstDependentWitnessTableFn substWitnessTable, size_t *remainingDepth) {
-  if (!remainingDepth)
-    return swift_getTypeByMangledName(request, typeName, arguments,
-                                      substGenericParam, substWitnessTable);
-  return getTypeByMangledNameImpl(request, typeName, arguments,
-                                  substGenericParam, substWitnessTable,
-                                  remainingDepth);
+    SubstDependentWitnessTableFn substWitnessTable) {
+  return swift_getTypeByMangledNameAndMaxDepth(
+      request, typeName, arguments, substGenericParam, substWitnessTable,
+      /*remainingDepth=*/nullptr);
 }
 
 /// Emit a warning when a type-by-name lookup failed, if failure logging is
@@ -2940,7 +2912,7 @@ swift_getTypeByMangledNameInEnvironmentInMetadataStateImpl(
                         size_t *remainingDepth) {
   llvm::StringRef typeName(typeNameStart, typeNameLength);
   SubstGenericParametersFromMetadata substitutions(environment, genericArgs);
-  TypeLookupErrorOr<TypeInfo> result = getTypeByMangledNameWithMaxDepth(
+  TypeLookupErrorOr<TypeInfo> result = swift_getTypeByMangledNameAndMaxDepth(
     (MetadataState)metadataState, typeName,
     genericArgs,
     [&substitutions](unsigned depth, unsigned index) {
@@ -3064,7 +3036,7 @@ swift_getTypeByMangledNameInContextInMetadataStateImpl(
                         size_t *remainingDepth = nullptr) {
   llvm::StringRef typeName(typeNameStart, typeNameLength);
   SubstGenericParametersFromMetadata substitutions(context, genericArgs);
-  TypeLookupErrorOr<TypeInfo> result = getTypeByMangledNameWithMaxDepth(
+  TypeLookupErrorOr<TypeInfo> result = swift_getTypeByMangledNameAndMaxDepth(
     (MetadataState)metadataState, typeName,
     genericArgs,
     [&substitutions](unsigned depth, unsigned index) {
