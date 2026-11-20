@@ -144,6 +144,14 @@ suite.test("type lookup by name") {
   expectEqual(ample, depth)
 }
 
+suite.test("type lookup through wrapper nodes") {
+  let name = "Si" + String(repeating: "lu", count: nesting)
+
+  var depth = shallow
+  expectEqual(metadata(Int.self), lookUp(name, depth: &depth))
+  expectEqual(shallow, depth)
+}
+
 // Reading the type descriptor out of the metadata needs a ptrauth strip on
 // arm64e.
 #if !_ptrauth(_arm64e)

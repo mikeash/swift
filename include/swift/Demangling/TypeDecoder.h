@@ -710,13 +710,8 @@ class TypeDecoder {
 
   /// A recursion budget shared with the lookups the builder makes, or null.
   /// It is the depth allowed, counting the outermost call, and is 0 once it
-  /// has run out. While decoding, it holds what is left below the node most
-  /// recently entered, which is never more than what is left below the node
-  /// the builder is working on.
+  /// has run out.
   size_t *RemainingDepth;
-
-  /// The value of *RemainingDepth when decoding started.
-  size_t InitialDepth = 0;
 
 public:
   explicit TypeDecoder(BuilderType &Builder, size_t *remainingDepth = nullptr)
@@ -732,42 +727,54 @@ public:
   TypeLookupErrorOr<BuiltType> decodeMangledType(NodePointer Node,
                                                  bool forRequirement = true,
                                                  bool allowValue = true) {
-    if (!RemainingDepth)
-      return decodeMangledType(Node, 0, forRequirement, allowValue);
-
-    InitialDepth = *RemainingDepth;
-    auto result = decodeMangledType(Node, 0, forRequirement, allowValue);
-    if (*RemainingDepth != 0)
-      *RemainingDepth = InitialDepth;
-    return result;
+    return decodeMangledType(Node, 0, forRequirement, allowValue);
   }
 
 protected:
   static const unsigned MaxDepth = 1024;
 
-  /// Whether a node at \p depth is too deep to decode. If it isn't, sets the
-  /// recursion budget to what is left below it.
-  ///
-  /// The budget is stored rather than taken and given back around each
-  /// recursive call so that those calls can stay tail calls.
-  bool isTooDeep(unsigned depth) {
-    if (depth > TypeDecoder::MaxDepth)
-      return true;
-    if (!RemainingDepth)
-      return false;
-    if (*RemainingDepth == 0 || InitialDepth < size_t(depth) + 2) {
-      *RemainingDepth = 0;
-      return true;
+  /// One level taken from the recursion budget for as long as it exists.
+  class DepthScope {
+    size_t *RemainingDepth;
+
+  public:
+    explicit DepthScope(size_t *remainingDepth)
+        : RemainingDepth(remainingDepth) {
+      if (!RemainingDepth)
+        return;
+      if (*RemainingDepth <= 1)
+        *RemainingDepth = 0;
+      else
+        --*RemainingDepth;
     }
-    *RemainingDepth = InitialDepth - depth - 1;
-    return false;
-  }
+
+    ~DepthScope() {
+      if (RemainingDepth && *RemainingDepth != 0)
+        ++*RemainingDepth;
+    }
+
+    DepthScope(const DepthScope &) = delete;
+    DepthScope &operator=(const DepthScope &) = delete;
+
+    bool isExhausted() const { return RemainingDepth && *RemainingDepth == 0; }
+
+    /// Give the level back early, so that a recursive call that follows is not
+    /// charged for it and stays a tail call.
+    void release() {
+      if (RemainingDepth && *RemainingDepth != 0)
+        ++*RemainingDepth;
+      RemainingDepth = nullptr;
+    }
+  };
 
   TypeLookupErrorOr<BuiltType> decodeMangledType(NodePointer Node,
                                                  unsigned depth,
                                                  bool forRequirement = true,
                                                  bool allowValue = false) {
-    if (isTooDeep(depth))
+    if (depth > TypeDecoder::MaxDepth)
+      return TypeLookupError("Mangled type is too complex");
+    DepthScope scope(RemainingDepth);
+    if (scope.isExhausted())
       return TypeLookupError("Mangled type is too complex");
 
     if (!Node)
@@ -779,18 +786,21 @@ protected:
       if (Node->getNumChildren() < 1)
         return MAKE_NODE_TYPE_ERROR0(Node, "no children.");
 
+      scope.release();
       return decodeMangledType(Node->getChild(0), depth + 1, forRequirement,
                                allowValue);
     case NodeKind::TypeMangling:
       if (Node->getNumChildren() < 1)
         return MAKE_NODE_TYPE_ERROR0(Node, "no children.");
 
+      scope.release();
       return decodeMangledType(Node->getChild(0), depth + 1, forRequirement,
                                allowValue);
     case NodeKind::Type:
       if (Node->getNumChildren() < 1)
         return MAKE_NODE_TYPE_ERROR0(Node, "no children.");
 
+      scope.release();
       return decodeMangledType(Node->getChild(0), depth + 1, forRequirement,
                                allowValue);
     case NodeKind::Class:
@@ -912,6 +922,7 @@ protected:
                                     "expected 1 generic argument, saw %zu",
                                     genericArgs->getNumChildren());
 
+      scope.release();
       return decodeMangledType(genericArgs->getChild(0), depth + 1);
     }
     case NodeKind::BuiltinTypeName: {
@@ -1433,12 +1444,14 @@ protected:
       if (Node->getNumChildren() < 1)
         return MAKE_NODE_TYPE_ERROR0(Node, "no children");
 
+      scope.release();
       return decodeMangledType(Node->getChild(0), depth + 1);
 
     case NodeKind::ReturnType:
       if (Node->getNumChildren() < 1)
         return MAKE_NODE_TYPE_ERROR0(Node, "no children");
 
+      scope.release();
       return decodeMangledType(Node->getChild(0), depth + 1,
                                /*forRequirement=*/false);
 
@@ -1486,9 +1499,11 @@ protected:
                                       "fewer children (%zu) than required (2)",
                                       Node->getNumChildren());
 
+        scope.release();
         return decodeMangledType(Node->getChild(1), depth + 1,
                                  /*forRequirement=*/false);
       }
+      scope.release();
       return decodeMangledType(Node->getChild(0), depth + 1,
                                /*forRequirement=*/false);
 
@@ -1531,6 +1546,7 @@ protected:
                                     "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
+      scope.release();
       return decodeMangledType(Node->getChild(1), depth + 1);
     }
     case NodeKind::DependentMemberType: {
@@ -1560,6 +1576,7 @@ protected:
                                     "fewer children (%zu) than required (2)",
                                     Node->getNumChildren());
 
+      scope.release();
       return decodeMangledType(Node->getChild(1), depth + 1);
     }
     case NodeKind::Unowned: {
@@ -2112,12 +2129,17 @@ private:
   decodeMangledTypeDecl(Demangle::NodePointer node, unsigned depth,
                         BuiltTypeDecl &typeDecl, BuiltType &parent,
                         bool &typeAlias) {
-    if (isTooDeep(depth))
+    if (depth > TypeDecoder::MaxDepth)
+      return TypeLookupError("Mangled type is too complex");
+    DepthScope scope(RemainingDepth);
+    if (scope.isExhausted())
       return TypeLookupError("Mangled type is too complex");
 
-    if (node->getKind() == NodeKind::Type)
+    if (node->getKind() == NodeKind::Type) {
+      scope.release();
       return decodeMangledTypeDecl(node->getChild(0), depth + 1, typeDecl,
                                    parent, typeAlias);
+    }
 
     Demangle::NodePointer declNode;
     if (node->getKind() == NodeKind::TypeSymbolicReference) {
